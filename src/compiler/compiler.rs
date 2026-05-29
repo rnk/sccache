@@ -2264,12 +2264,11 @@ where
 ArgData! {
     PassThroughFlag,
     PassThrough(OsString),
-
 }
 
 // Establish a set of compiler flags that are required for
 // valid execution of the compiler even in preprocessor mode.
-// If the requested compiler invocatiomn has any of these arguments
+// If the requested compiler invocation has any of these arguments,
 // propagate them when doing our compiler vendor detection
 //
 // Current known required flags:
@@ -2282,8 +2281,12 @@ counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("--cuda-gpu-arch", OsString, CanBeConcatenated(b'='), ArgData::PassThrough),
     take_arg!("--cuda-path", OsString, CanBeConcatenated(b'='), ArgData::PassThrough),
     flag!("--cuda-path-ignore-env", ArgData::PassThroughFlag),
+    flag!("--force-cl-env-setup", ArgData::PassThroughFlag),
     flag!("--no-cuda-version-check", ArgData::PassThroughFlag),
+    flag!("--use-local-env", ArgData::PassThroughFlag),
     take_arg!("-ccbin", OsString, CanBeConcatenated(b'='), ArgData::PassThrough),
+    flag!("-force-cl-env-setup", ArgData::PassThroughFlag),
+    flag!("-use-local-env", ArgData::PassThroughFlag),
 ]);
 
 pub fn compiler_info_args(arguments: &[OsString]) -> Vec<OsString> {
