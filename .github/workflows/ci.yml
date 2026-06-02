@@ -87,8 +87,8 @@ jobs:
           - os: ubuntu-22.04
             # Oldest supported version, keep in sync with README.md
             rustc: "1.88.0"
-            cuda: "13.2"
-            extra_desc: cuda13.2 dist-tests
+            cuda: "13.3"
+            extra_desc: cuda13.3 dist-tests
             extra_args: --no-default-features --features=dist-tests test_dist_cuda_
           - os: ubuntu-22.04
             # Oldest supported version, keep in sync with README.md
@@ -151,25 +151,25 @@ jobs:
             rustc: beta
             notest_cuda_compilers: clang++
             extra_desc: cuda12.4
-          - os: windows-2025
-            cuda: "12.9"
+          - os: windows-2025-vs2026
+            cuda: "13.3"
             # Oldest supported version, keep in sync with README.md
             rustc: "1.88.0"
             extra_args: --no-fail-fast
             notest_cuda_compilers: clang++
-            extra_desc: cuda12.9
-          - os: windows-2025
-            cuda: "12.9"
+            extra_desc: cuda13.3
+          - os: windows-2025-vs2026
+            cuda: "13.3"
             rustc: nightly
             allow_failure: true
             extra_args: --features=unstable
             notest_cuda_compilers: clang++
-            extra_desc: cuda12.9
-          - os: windows-2025
-            cuda: "12.9"
+            extra_desc: cuda13.3
+          - os: windows-2025-vs2026
+            cuda: "13.3"
             rustc: beta
             notest_cuda_compilers: clang++
-            extra_desc: cuda12.9
+            extra_desc: cuda13.3
             no_coverage: true
     env:
       RUST_BACKTRACE: 1
