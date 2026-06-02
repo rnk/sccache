@@ -1848,6 +1848,87 @@ int main(int argc, char** argv) {
             },
         );
     }
+
+    // Test Blackwell arch modifiers (CUDA 13.1+)
+    if compiler
+        .version()
+        .and_then(|nvcc_v| {
+            version_compare::compare_to(nvcc_v, "13.1.0", version_compare::Cmp::Ge)
+                .map_err(|_| sccache::errors::anyhow!("nvcc too old"))
+        })
+        .unwrap_or_default()
+    {
+        trace!("compile A sm_120f+uumn");
+        run_cuda_test(
+            "-c",
+            Path::new(INPUT_FOR_CUDA_A), // relative path for input
+            &build_dir.join(OUTPUT),     // relative path for output
+            &[
+                extra_args.as_slice(),
+                &["-gencode=arch=compute_120f+uumn,code=[compute_120f+uumn,sm_120f+uumn]".into()],
+            ]
+            .concat(),
+            AdditionalStats {
+                preprocessed: Some(1),
+                cache_writes: Some(4),
+                compilations: Some(5),
+                compile_requests: Some(1),
+                requests_executed: Some(5),
+                cache_misses: Some(vec![
+                    (CCompilerKind::CudaFE, Language::CudaFE, 1),
+                    (CCompilerKind::Cicc, Language::Ptx, 1),
+                    (CCompilerKind::Ptxas, Language::Cubin, 1),
+                    (CCompilerKind::Nvcc, Language::Cuda, 1),
+                ]),
+                preprocessor_cache_misses: Some(vec![(CCompilerKind::Nvcc, Language::Cuda, 1)])
+                    .filter(|_| preprocessor_cache_mode),
+                ..Default::default()
+            },
+        );
+
+        trace!("compile A sm_80,sm_120f+uumn");
+        run_cuda_test(
+            "-c",
+            Path::new(INPUT_FOR_CUDA_A), // relative path for input
+            &build_dir.join(OUTPUT),     // relative path for output
+            &[
+                extra_args.as_slice(),
+                &[
+                    "-gencode=arch=compute_80,code=[sm_80]".into(),
+                    "-gencode=arch=compute_120f+uumn,code=[compute_120f+uumn,sm_120f+uumn]".into(),
+                ],
+            ]
+            .concat(),
+            AdditionalStats {
+                preprocessed: Some(1),
+                cache_writes: Some(3 + with_debug_flags as u64),
+                compilations: Some(4 + with_debug_flags as u64),
+                compile_requests: Some(1),
+                requests_executed: Some(7),
+                cache_hits: Some(vec![
+                    (CCompilerKind::Cicc, Language::Ptx, 1),
+                    (
+                        CCompilerKind::Ptxas,
+                        Language::Cubin,
+                        1 + !with_debug_flags as u64,
+                    ),
+                ]),
+                cache_misses: Some(vec![
+                    (CCompilerKind::Nvcc, Language::Cuda, 1),
+                    (CCompilerKind::CudaFE, Language::CudaFE, 1),
+                    (CCompilerKind::Cicc, Language::Ptx, 1),
+                    (
+                        CCompilerKind::Ptxas,
+                        Language::Cubin,
+                        with_debug_flags as u64,
+                    ),
+                ]),
+                preprocessor_cache_misses: Some(vec![(CCompilerKind::Nvcc, Language::Cuda, 1)])
+                    .filter(|_| preprocessor_cache_mode),
+                ..Default::default()
+            },
+        );
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]

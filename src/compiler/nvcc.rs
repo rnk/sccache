@@ -2086,6 +2086,18 @@ fn find_last_compute_arch<'a, A: AsRef<[String]> + 'a, I: DoubleEndedIterator<It
 ) -> Option<String> {
     lines.rev().find_map(|args| {
         let args = args.as_ref();
+        if matches!(args.first().map(|s| s.as_str()), Some("ptxas"))
+            && let Some(idx) = args.iter().position(|arg| arg == "-o")
+            && let Some(val) = args.get(idx + 1)
+            && HAS_SM_IN_NAME_RE.is_match(val)
+            && val.ends_with(".cubin")
+            // Split on `sm_`
+            // Ignore everything before `.sm_`
+            // Take everything after `.sm_` i.e. `{arch}.cubin`
+            && let Some(arch) = val.split("sm_").nth(1)
+        {
+            return Some(arch.to_owned());
+        }
         if let Some(idx) = args.iter().position(|arg| arg == "-arch")
             && let Some(val) = args.get(idx + 1)
             && let Some((_, arch)) = val.split_once('_')
@@ -2206,23 +2218,31 @@ fn remap_generated_filenames(
                                             .file_name()
                                             .and_then(|name| name.to_str())
                                             .and_then(|name| {
-                                                let mut pair = if HAS_SM_IN_NAME_RE.is_match(name) {
-                                                    name.split(".sm_")
+                                                // Ignore everything before `.sm_` or `.compute_`
+                                                // Take everything after `.sm_` or `.compute_`, i.e. `{arch}.cubin`
+                                                let arch = if HAS_SM_IN_NAME_RE.is_match(name) {
+                                                    name.split(".sm_").nth(1)
                                                 } else if HAS_COMPUTE_IN_NAME_RE.is_match(name) {
-                                                    name.split(".compute_")
+                                                    name.split(".compute_").nth(1)
                                                 } else {
                                                     return None;
                                                 };
-                                                // Ignore everything before `.sm_` or `.compute_`
-                                                let _ = pair.next().unwrap();
-                                                // Take everything after `.sm_` or `_.compute`, i.e. `{arch}.cubin`
-                                                let s = pair.next().unwrap();
-                                                // This is the arch number
-                                                let (s, _) = s.split_once('.').unwrap();
-                                                Some(s)
+
+                                                arch.and_then(|arch| {
+                                                    // Reverse chars so we split on the last dot
+                                                    arch.chars()
+                                                        .rev()
+                                                        .collect::<String>()
+                                                        .split_once('.')
+                                                        // Now everything after the first dot is the
+                                                        // arch number (but still reversed)
+                                                        .map(|(_, arch)| {
+                                                            // Reverse chars again to original order
+                                                            arch.chars().rev().collect::<String>()
+                                                        })
+                                                })
                                             })
-                                            .unwrap_or(last_arch)
-                                            .to_owned();
+                                            .unwrap_or_else(|| last_arch.to_owned());
 
                                         // Add the `sm_{arch}` component if necessary
                                         if let Some(name) = path
