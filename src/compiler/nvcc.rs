@@ -18,7 +18,7 @@ use crate::{
         Cacheable, CompileCommandImpl, CompilerArguments,
         args::*,
         c::{
-            ArtifactDescriptor, CCompilerImpl, CCompilerKind, DepfilePath, ParsedArguments,
+            ArtifactDescriptor, CCompilerImpl, CCompilerKind, DepfilePath, OutDir, ParsedArguments,
             PreprocessorOutput,
         },
         gcc::{self, ArgData::*},
@@ -44,7 +44,6 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
-use tempfile::TempDir;
 use which::which_in;
 
 static HAS_SM_IN_NAME_RE: LazyLock<Regex> =
@@ -311,25 +310,22 @@ impl CCompilerImpl for Nvcc {
 
                 let compile_flag = parsed_args.compilation_flag.as_os_str().into();
 
-                match compile_flag {
-                    NvccCompileFlag::Executable => { /* no compile flag is valid */ }
-                    _ => {
-                        // Add the compilation flag to `parsed_args.common_args` so
-                        // it's considered when computing the hash.
-                        //
-                        // Consider the following cases:
-                        //  $ sccache nvcc x.cu -o x.bin
-                        //  $ sccache nvcc x.cu -o x.cu.o -c
-                        //  $ sccache nvcc x.cu -o x.ptx -ptx
-                        //  $ sccache nvcc x.cu -o x.cubin -cubin
-                        //
-                        // The preprocessor output for all four are identical, so
-                        // without including the compilation flag in the hasher's
-                        // inputs, the same hash would be generated for all four.
-                        parsed_args
-                            .common_args
-                            .push(parsed_args.compilation_flag.clone());
-                    }
+                if !matches!(compile_flag, NvccCompileFlag::Executable) {
+                    // Add the compilation flag to `parsed_args.common_args` so
+                    // it's considered when computing the hash.
+                    //
+                    // Consider the following cases:
+                    //  $ sccache nvcc x.cu -o x.bin
+                    //  $ sccache nvcc x.cu -o x.cu.o -c
+                    //  $ sccache nvcc x.cu -o x.ptx -ptx
+                    //  $ sccache nvcc x.cu -o x.cubin -cubin
+                    //
+                    // The preprocessor output for all four are identical, so
+                    // without including the compilation flag in the hasher's
+                    // inputs, the same hash would be generated for all four.
+                    parsed_args
+                        .common_args
+                        .push(parsed_args.compilation_flag.clone());
                 }
 
                 // Canonicalize here so the absolute path to the input is in the
@@ -350,17 +346,51 @@ impl CCompilerImpl for Nvcc {
                     .extra_hash_files
                     .extend(self.specfiles.iter().cloned());
 
-                // Don't make the tempdir if just running unit tests for parse_arguments
-                if !cfg!(test) {
-                    parsed_args.tmpdir = Some(Arc::new(
-                        NVCC_TMPDIR
-                            .as_ref()
-                            .map_err(anyhow::Error::new)
-                            .and_then(tempdir_in)
-                            .context("Failed to create tempdir")
-                            .unwrap(),
-                    ));
-                }
+                // Use the object dir as the `out_dir` if the compile flags include `-c` and `-objtemp`
+                parsed_args.out_dir = matches!(compile_flag, NvccCompileFlag::Device)
+                    .then(|| {
+                        // Search for `-objtemp` and `--objdir-as-tempdir`
+                        ["-objtemp", "--objdir-as-tempdir"]
+                            .iter()
+                            .filter_map(|flag| {
+                                parsed_args
+                                    .unhashed_args
+                                    .iter()
+                                    .position(|x| x == flag)
+                                    .inspect(|&idx| {
+                                        // Remove the flag from unhashed args
+                                        parsed_args.unhashed_args.splice(idx..(idx + 1), []);
+                                    })
+                            })
+                            .last()
+                    })
+                    .flatten()
+                    .and_then(|_| {
+                        // Get an absolute path to the output object's parent dir
+                        parsed_args
+                            .outputs
+                            .get("obj")
+                            .map(|o| cwd.join(&o.path))
+                            .and_then(|mut o| o.pop().then_some(o))
+                            // Set out_dir to the directory of the object file
+                            .map(|dir| Arc::new(OutDir::Dir(dir)))
+                    })
+                    // Otherwise if `-c` or `-objtemp` weren't passed, set `out_dir` to a tmpdir
+                    .or_else(|| {
+                        // Don't needlessly create the tempdir if running `parse_arguments()` unit tests
+                        if cfg!(test) {
+                            None
+                        } else {
+                            Some(Arc::new(OutDir::Tmp(
+                                NVCC_TMPDIR
+                                    .as_ref()
+                                    .map_err(anyhow::Error::new)
+                                    .and_then(tempdir_in)
+                                    .context("Failed to create tempdir")
+                                    .unwrap(),
+                            )))
+                        }
+                    });
 
                 CompilerArguments::Ok(parsed_args)
             }
@@ -460,7 +490,7 @@ impl CCompilerImpl for Nvcc {
                     &arguments,
                     &[
                         "--keep-dir".into(),
-                        parsed_args.tmpdir.as_ref().as_ref().unwrap().path().into(),
+                        parsed_args.out_dir.as_ref().as_ref().unwrap().path().into(),
                     ][..],
                 ]
                 .concat(),
@@ -865,7 +895,7 @@ fn generate_compile_commands(
 
     let (arguments, output_path, keep_dir, num_parallel) = parsed_to_nvcc_args(cwd, parsed_args);
     let compile_flag = parsed_args.compilation_flag.as_os_str().into();
-    let out_dir = parsed_args.tmpdir.as_ref().unwrap().clone();
+    let out_dir = parsed_args.out_dir.as_ref().unwrap().clone();
 
     // Don't cache compilations that produce executables.
     let cacheable = if compile_flag != NvccCompileFlag::Executable {
@@ -1057,7 +1087,7 @@ impl From<&OsStr> for NvccCompileFlag {
 
 #[derive(Clone, Debug)]
 struct NvccCompileCommand {
-    out_dir: Arc<TempDir>,
+    out_dir: Arc<OutDir>,
     keep_dir: Option<PathBuf>,
     num_parallel: usize,
     executable: PathBuf,
@@ -1311,13 +1341,13 @@ where
     // relative to the directory where they're run.
     //
     // All the "nvcc" commands (cudafe++, cicc, ptxas, nvlink, fatbinary)
-    // are run in the temp dir, so their arguments should be relative to
-    // the temp dir, e.g. `cudafe++ [...] "x.cpp4.ii"`
+    // are run in the out dir, so their arguments should be relative to
+    // the out dir, e.g. `cudafe++ [...] "x.cpp4.ii"`
     //
     // All the host compiler invocations are run in the original `cwd` where
     // sccache was invoked. Arguments will be relative to the cwd, except
     // any arguments that reference nvcc-generated files should be absolute
-    // to the temp dir, e.g. `gcc -E [...] x.cu -o /out/dir/x.cpp4.ii`
+    // to the out dir, e.g. `gcc -E [...] x.cu -o /out/dir/x.cpp4.ii`
 
     // Roughly equivalent to:
     // ```shell
@@ -2574,6 +2604,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     flag!("--no-compress", PassThroughFlag),
     flag!("--no-host-device-initializer-list", PreprocessorArgumentFlag),
     take_arg!("--nvlink-options", OsString, CanBeSeparated(b'='), PassThrough),
+    flag!("--objdir-as-tempdir", UnhashedFlag),
     take_arg!("--options-file", PathBuf, CanBeSeparated(b'='), ExtraHashFile),
     flag!("--optix-ir", DoCompilation),
     flag!("--profile", PassThroughFlag),
@@ -2636,6 +2667,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("-maxrregcount", OsString, CanBeSeparated(b'='), PassThrough),
     flag!("-no-compress", PassThroughFlag),
     flag!("-nohdinitlist", PreprocessorArgumentFlag),
+    flag!("-objtemp", UnhashedFlag),
     flag!("-optix-ir", DoCompilation),
     flag!("-pg", PassThroughFlag),
     flag!("-ptx", DoCompilation),
@@ -2741,7 +2773,30 @@ mod test {
             )
         );
         assert!(a.preprocessor_args.is_empty());
+        assert!(a.unhashed_args.is_empty());
         assert_eq!(ovec!["-c"], a.common_args);
+        assert_eq!(None, a.out_dir);
+    }
+
+    #[test]
+    fn test_parse_arguments_simple_c_objtemp() {
+        let a = parses!("-c", "foo.c", "-o", "foo.o", "-objtemp");
+        assert_eq!(Some("foo.c"), a.input.to_str());
+        assert_eq!(Language::C, a.language);
+        assert_map_contains!(
+            a.outputs,
+            (
+                "obj",
+                ArtifactDescriptor {
+                    path: "foo.o".into(),
+                    optional: false,
+                }
+            )
+        );
+        assert!(a.preprocessor_args.is_empty());
+        assert!(a.unhashed_args.is_empty());
+        assert_eq!(ovec!["-c"], a.common_args);
+        assert_eq!(Some(Path::new(".")), a.out_dir.as_deref().map(|o| o.path()));
     }
 
     #[test]

@@ -94,6 +94,29 @@ pub struct ArtifactDescriptor {
     pub optional: bool,
 }
 
+#[derive(Debug)]
+pub enum OutDir {
+    Dir(PathBuf),
+    Tmp(tempfile::TempDir),
+}
+
+impl OutDir {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Dir(dir) => dir.as_path(),
+            Self::Tmp(dir) => dir.path(),
+        }
+    }
+}
+
+impl Eq for OutDir {}
+
+impl PartialEq for OutDir {
+    fn eq(&self, other: &Self) -> bool {
+        self.path() == other.path()
+    }
+}
+
 /// The results of parsing a compiler commandline.
 #[allow(dead_code)]
 #[derive(Default, Debug, Clone)]
@@ -136,8 +159,8 @@ pub struct ParsedArguments {
     pub suppress_rewrite_includes_only: bool,
     /// Arguments are incompatible with preprocessor cache mode
     pub too_hard_for_preprocessor_cache_mode: Vec<OsString>,
-    /// Path to a tempdir to use for this compilation
-    pub tmpdir: Option<Arc<tempfile::TempDir>>,
+    /// Path to the scratch directory to use for this compilation (nvcc)
+    pub out_dir: Option<Arc<OutDir>>,
 }
 
 impl std::cmp::Eq for ParsedArguments {}
@@ -164,7 +187,7 @@ impl std::cmp::PartialEq for ParsedArguments {
             color_mode,
             suppress_rewrite_includes_only,
             too_hard_for_preprocessor_cache_mode,
-            tmpdir,
+            out_dir,
         } = self;
         input == &other.input
             && double_dash_input == &other.double_dash_input
@@ -185,17 +208,7 @@ impl std::cmp::PartialEq for ParsedArguments {
             && color_mode == &other.color_mode
             && suppress_rewrite_includes_only == &other.suppress_rewrite_includes_only
             && too_hard_for_preprocessor_cache_mode == &other.too_hard_for_preprocessor_cache_mode
-            && tmpdir
-                .as_ref()
-                .as_ref()
-                .and_then(|lhs| {
-                    other
-                        .tmpdir
-                        .as_ref()
-                        .as_ref()
-                        .map(|rhs| lhs.path() == rhs.path())
-                })
-                .unwrap_or_default()
+            && out_dir == &other.out_dir
     }
 }
 
