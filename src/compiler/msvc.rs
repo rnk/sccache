@@ -278,6 +278,8 @@ ArgData! {
     TooHardFlag,
     TooHard(OsString),
     TooHardPath(PathBuf),
+    TooHardIfFdIsPresent, // Bail with CannotCache if -Fd is present
+    TooHardIfFdIsPresentWithSuffix(OsString), // As above, recognized by prefix.
     PreprocessorArgument(OsString),
     PreprocessorArgumentPath(PathBuf),
     SuppressCompilation,
@@ -290,8 +292,6 @@ ArgData! {
     PassThrough, // Miscellaneous flags that don't prevent caching.
     PassThroughWithPath(PathBuf), // As above, recognised by prefix.
     PassThroughWithSuffix(OsString), // As above, recognised by prefix.
-    Ignore, // The flag is not passed to the compiler.
-    IgnoreWithSuffix(OsString), // As above, recognized by prefix.
     ExtraHashFile(PathBuf),
     XClang(OsString), // -Xclang ...
     Clang(OsString), // -clang:...
@@ -329,7 +329,7 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_flag!("FC", PassThrough), // Use absolute paths in error messages, does not affect caching, only the debug output of the build
     msvc_take_arg!("FI", PathBuf, CanBeSeparated, PreprocessorArgumentPath),
     msvc_take_arg!("FR", PathBuf, Concatenated, TooHardPath),
-    msvc_flag!("FS", Ignore),
+    msvc_flag!("FS", TooHardIfFdIsPresent),
     msvc_take_arg!("FU", PathBuf, CanBeSeparated, TooHardPath),
     msvc_take_arg!("Fa", PathBuf, Concatenated, TooHardPath),
     msvc_take_arg!("Fd", PathBuf, Concatenated, ProgramDatabase),
@@ -375,7 +375,7 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_flag!("LDd", PassThrough),
     msvc_flag!("MD", PassThrough),
     msvc_flag!("MDd", PassThrough),
-    msvc_take_arg!("MP", OsString, Concatenated, IgnoreWithSuffix),
+    msvc_take_arg!("MP", OsString, Concatenated, TooHardIfFdIsPresentWithSuffix),
     msvc_flag!("MT", PassThrough),
     msvc_flag!("MTd", PassThrough),
     msvc_flag!("O1", PassThrough),
@@ -566,6 +566,7 @@ pub fn parse_arguments(
     let mut profile_generate = false;
     let mut multiple_input = false;
     let mut multiple_input_files = Vec::new();
+    let mut too_hard_if_fd_is_present = None;
 
     // Custom iterator to expand `@` arguments which stand for reading a file
     // and interpreting it as a list of more arguments.
@@ -607,8 +608,8 @@ pub fn parse_arguments(
             Some(PreprocessorArgument(_))
             | Some(PreprocessorArgumentPath(_))
             | Some(ExtraHashFile(_))
-            | Some(Ignore)
-            | Some(IgnoreWithSuffix(_))
+            | Some(TooHardIfFdIsPresent)
+            | Some(TooHardIfFdIsPresentWithSuffix(_))
             | Some(ExternalIncludePath(_)) => {}
             Some(SuppressCompilation) => {
                 return CompilerArguments::NotCompilation;
@@ -679,7 +680,15 @@ pub fn parse_arguments(
             // so we just skip them entirely. -FS may also have a side effect of creating
             // race conditions in which we may try to read the PDB before MSPDBSRC is done
             // writing it, so we're better off ignoring the flags.
-            Some(Ignore) | Some(IgnoreWithSuffix(_)) => {}
+            Some(TooHardIfFdIsPresent) | Some(TooHardIfFdIsPresentWithSuffix(_)) => {
+                too_hard_if_fd_is_present = arg
+                    .normalize(NormalizedDisposition::Concatenated)
+                    .iter_os_strings()
+                    .reduce(|mut lhs, rhs| {
+                        lhs.push(&rhs);
+                        lhs
+                    });
+            }
             _ => {}
         }
     }
@@ -784,10 +793,7 @@ pub fn parse_arguments(
 
     // Can't cache compilations with multiple inputs.
     if multiple_input {
-        cannot_cache!(
-            "multiple input files",
-            format!("{:?}", multiple_input_files)
-        );
+        cannot_cache!("multiple input files", format!("{multiple_input_files:?}"));
     }
 
     let (input, language) = match input_arg {
@@ -887,6 +893,15 @@ pub fn parse_arguments(
     if debug_info && !is_clang {
         match pdb {
             Some(p) => {
+                // Can't cache compilations that share a program database,
+                // which we assume when -FS or -MP are specified with -Fd
+                if let Some(arg) = too_hard_if_fd_is_present {
+                    cannot_cache!(
+                        "shared pdb",
+                        format!("Assuming program database is shared due to inclusion of {arg:?}")
+                    );
+                }
+
                 // Append the default .pdb prefix if none was given, like how MSVC does.
                 let path = if p.extension().is_none() {
                     let mut path = p;
