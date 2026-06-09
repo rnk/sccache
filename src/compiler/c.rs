@@ -117,6 +117,12 @@ impl PartialEq for OutDir {
     }
 }
 
+impl AsRef<Path> for OutDir {
+    fn as_ref(&self) -> &Path {
+        self.path()
+    }
+}
+
 /// The results of parsing a compiler commandline.
 #[allow(dead_code)]
 #[derive(Default, Debug, Clone)]

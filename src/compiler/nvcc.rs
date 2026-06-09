@@ -34,7 +34,6 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use fs_err as fs;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt};
 use itertools::Itertools;
 use regex::Regex;
@@ -347,50 +346,35 @@ impl CCompilerImpl for Nvcc {
                     .extend(self.specfiles.iter().cloned());
 
                 // Use the object dir as the `out_dir` if the compile flags include `-c` and `-objtemp`
-                parsed_args.out_dir = matches!(compile_flag, NvccCompileFlag::Device)
-                    .then(|| {
-                        // Search for `-objtemp` and `--objdir-as-tempdir`
-                        ["-objtemp", "--objdir-as-tempdir"]
-                            .iter()
-                            .filter_map(|flag| {
-                                parsed_args
-                                    .unhashed_args
-                                    .iter()
-                                    .position(|x| x == flag)
-                                    .inspect(|&idx| {
-                                        // Remove the flag from unhashed args
-                                        parsed_args.unhashed_args.splice(idx..(idx + 1), []);
-                                    })
-                            })
-                            .last()
-                    })
-                    .flatten()
-                    .and_then(|_| {
-                        // Get an absolute path to the output object's parent dir
-                        parsed_args
+                if matches!(compile_flag, NvccCompileFlag::Device)
+                    && parsed_args
+                        .unhashed_args
+                        .iter()
+                        // Search for `-objtemp` or `--objdir-as-tempdir`
+                        .any(|arg| arg == "-objtemp" || arg == "--objdir-as-tempdir") &&
+                    // Get the output object's parent dir
+                    let Some(dir) = parsed_args
                             .outputs
                             .get("obj")
-                            .map(|o| cwd.join(&o.path))
-                            .and_then(|mut o| o.pop().then_some(o))
-                            // Set out_dir to the directory of the object file
-                            .map(|dir| Arc::new(OutDir::Dir(dir)))
-                    })
-                    // Otherwise if `-c` or `-objtemp` weren't passed, set `out_dir` to a tmpdir
-                    .or_else(|| {
-                        // Don't needlessly create the tempdir if running `parse_arguments()` unit tests
-                        if cfg!(test) {
-                            None
-                        } else {
-                            Some(Arc::new(OutDir::Tmp(
-                                NVCC_TMPDIR
-                                    .as_ref()
-                                    .map_err(anyhow::Error::new)
-                                    .and_then(tempdir_in)
-                                    .context("Failed to create tempdir")
-                                    .unwrap(),
-                            )))
-                        }
-                    });
+                            .map(|obj| cwd.join(&obj.path))
+                            .and_then(|mut p| p.pop().then_some(p))
+                            .or_else(|| Some(cwd.to_owned()))
+                {
+                    // Set out_dir to the parent of the object file
+                    parsed_args.out_dir = Some(Arc::new(OutDir::Dir(dir)));
+                }
+                // Otherwise if `-c` or `-objtemp` weren't passed, set `out_dir` to a tmpdir
+                // Don't needlessly create the tempdir if running `parse_arguments()` unit tests
+                else if !cfg!(test) {
+                    parsed_args.out_dir = Some(Arc::new(OutDir::Tmp(
+                        NVCC_TMPDIR
+                            .as_ref()
+                            .map_err(anyhow::Error::new)
+                            .and_then(tempdir_in)
+                            .context("Failed to create tempdir")
+                            .unwrap(),
+                    )));
+                }
 
                 CompilerArguments::Ok(parsed_args)
             }
@@ -916,6 +900,11 @@ fn generate_compile_commands(
         host_compiler: host_compiler.clone(),
         // Only here so we can include it in logs
         output_path,
+        outputs: parsed_args
+            .outputs
+            .values()
+            .map(|o| cwd.join(&o.path))
+            .collect(),
     };
 
     Ok((command, None, cacheable))
@@ -934,8 +923,10 @@ fn parsed_to_nvcc_args(
 
     let keep_dir = {
         let mut keep = false;
+        let mut out_dir = None;
         let mut keep_dir = None;
-        // Remove all occurrences of `-keep` and `-keep-dir`, but save the keep dir for copying to later
+        // Remove all occurrences of `-keep|-keep-dir|-objtemp`, but
+        // remember `--keep-dir` so we can copy the files to it later
         loop {
             if let Some(idx) = unhashed_args
                 .iter()
@@ -946,23 +937,32 @@ fn parsed_to_nvcc_args(
                 unhashed_args.splice(idx..(idx + 2), []);
                 keep_dir = Some(dir);
                 continue;
+            } else if let Some(idx) = unhashed_args
+                .iter()
+                .position(|x| x == "-objtemp" || x == "--objdir-as-tempdir")
+            {
+                out_dir = parsed_args.out_dir.as_deref();
+                unhashed_args.splice(idx..(idx + 1), []);
+                continue;
             } else if let Some(idx) = unhashed_args.iter().position(|x| {
                 x == "-keep" || x == "--keep" || x == "-save-temps" || x == "--save-temps"
             }) {
                 keep = true;
                 unhashed_args.splice(idx..(idx + 1), []);
-                if keep_dir.is_none() {
-                    keep_dir = Some(cwd.to_path_buf());
-                }
                 continue;
             }
             break;
         }
         // Match nvcc behavior where intermediate files are kept if:
-        // * Only `-keep` is specified (files copied to cwd)
+        // * Only `-keep` is specified (files copied to cwd or `-objtemp`)
         // * Both `-keep -keep-dir=<dir>` are specified (files copied to <dir>)
         // nvcc does _not_ keep intermediate files if `-keep-dir=` is specified without `-keep`
-        keep.then_some(()).and(keep_dir)
+        keep.then(|| {
+            keep_dir
+                .or_else(|| out_dir.map(|dir| dir.path().to_owned()))
+                .or_else(|| Some(cwd.to_path_buf()))
+        })
+        .flatten()
     };
 
     let num_parallel = {
@@ -1097,6 +1097,7 @@ struct NvccCompileCommand {
     cwd: PathBuf,
     host_compiler: NvccHostCompiler,
     output_path: PathBuf,
+    outputs: Vec<PathBuf>,
 }
 
 #[async_trait]
@@ -1129,6 +1130,7 @@ impl CompileCommandImpl for NvccCompileCommand {
             host_compiler,
             num_parallel,
             output_path,
+            outputs,
             ..
         } = self;
 
@@ -1153,6 +1155,7 @@ impl CompileCommandImpl for NvccCompileCommand {
 
         let maybe_keep_temps_then_clean = || async move {
             let _active = service.increment_active_compilations();
+
             // Move and/or delete nvcc's internal files.
             //
             // If the caller passed `-keep` or `-keep-dir`, copy the internal
@@ -1160,7 +1163,10 @@ impl CompileCommandImpl for NvccCompileCommand {
             // `-keep` and `-keep-dir` in our `nvcc --dryrun` call.
             //
             // Renames the files back to the original names nvcc gave them.
-            if let Some(keep_dir) = keep_dir.as_ref() {
+
+            if let Some(keep_dir) = keep_dir.as_deref() {
+                let out_dir = out_dir.as_ref();
+
                 // Ensure `--keep-dir` exists
                 tokio::fs::create_dir_all(keep_dir).await?;
 
@@ -1168,30 +1174,7 @@ impl CompileCommandImpl for NvccCompileCommand {
                 for (curr, prev) in nvcc_internal_files.drain() {
                     let src = out_dir.path().join(curr);
                     let dst = out_dir.path().join(prev);
-                    if dst == src || !src.exists() {
-                        continue;
-                    }
-                    match tokio::fs::rename(&src, &dst).await {
-                        Ok(_) => {}
-                        Err(err) => match err.kind() {
-                            std::io::ErrorKind::CrossesDevices => {
-                                tokio::fs::copy(&src, &dst).await?;
-                                tokio::fs::remove_file(&src).await?;
-                            }
-                            _ => bail!(err),
-                        },
-                    }
-                }
-
-                // Move intermediate files to `--keep-dir`
-                if let Ok(entries) = fs::read_dir(out_dir.path()) {
-                    for entry in entries {
-                        let entry = entry?;
-                        let src = entry.path();
-                        let dst = keep_dir.join(entry.file_name());
-                        if dst == src || !src.exists() {
-                            continue;
-                        }
+                    if dst != src && src.exists() {
                         match tokio::fs::rename(&src, &dst).await {
                             Ok(_) => {}
                             Err(err) => match err.kind() {
@@ -1204,7 +1187,49 @@ impl CompileCommandImpl for NvccCompileCommand {
                         }
                     }
                 }
+
+                // Move nvcc internal files to `--keep-dir`, but only if it isn't the same as `out_dir`
+                if keep_dir != out_dir.path()
+                    && let Ok(mut entries) = tokio::fs::read_dir(out_dir).await
+                {
+                    while let Some(entry) = entries.next_entry().await? {
+                        let src = entry.path();
+                        let dst = keep_dir.join(entry.file_name());
+                        if dst != src && src.exists() {
+                            if outputs.contains(&src) {
+                                tokio::fs::copy(&src, &dst).await?;
+                            } else {
+                                match tokio::fs::rename(&src, &dst).await {
+                                    Ok(_) => {}
+                                    Err(err) => match err.kind() {
+                                        std::io::ErrorKind::CrossesDevices => {
+                                            tokio::fs::copy(&src, &dst).await?;
+                                            tokio::fs::remove_file(&src).await?;
+                                        }
+                                        _ => bail!(err),
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+
+                return Ok(());
             }
+
+            // If `-objtemp` was passed without `-keep`, remove the nvcc internal files from `out_dir`
+            if let OutDir::Dir(out_dir) = out_dir.as_ref()
+                && let Ok(mut entries) = tokio::fs::read_dir(out_dir).await
+            {
+                // Remove nvcc internal files that aren't expected outputs
+                while let Some(entry) = entries.next_entry().await? {
+                    let path = entry.path();
+                    if !outputs.contains(&path) && path.exists() {
+                        tokio::fs::remove_file(path).await?;
+                    }
+                }
+            }
+
             Ok(())
         };
 
@@ -1721,12 +1746,12 @@ fn parse_args_simple<I: IntoIterator<Item = OsString>>(args: I, cwd: &Path) -> P
 }
 
 fn fixup_cicc_args(
-    mut pa: ParsedArguments,
+    mut parsed_args: ParsedArguments,
     keep_dir: Option<&Path>,
     compile_flag: &NvccCompileFlag,
     cudafe_has_gen_module_id_file_flag: bool,
 ) -> ParsedArguments {
-    let args = &mut pa.common_args;
+    let args = &mut parsed_args.common_args;
 
     // Fix for CTK < 12.0:
     if let Some(idx) = args.iter().position(|x| x == "--module_id_file_name") {
@@ -1750,7 +1775,7 @@ fn fixup_cicc_args(
     // of whether the compilation flag is `-c`, `-ptx`, or `-cubin`
 
     // pa.input is absolute, so use the original form here instead
-    let input = pa
+    let input = parsed_args
         .input
         .file_name()
         .and_then(|name| name.to_str())
@@ -1822,7 +1847,7 @@ fn fixup_cicc_args(
         }
     }
 
-    pa
+    parsed_args
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2794,7 +2819,7 @@ mod test {
             )
         );
         assert!(a.preprocessor_args.is_empty());
-        assert!(a.unhashed_args.is_empty());
+        assert_eq!(ovec!["-objtemp"], a.unhashed_args);
         assert_eq!(ovec!["-c"], a.common_args);
         assert_eq!(Some(Path::new(".")), a.out_dir.as_deref().map(|o| o.path()));
     }
