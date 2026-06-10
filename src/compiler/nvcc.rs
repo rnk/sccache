@@ -2519,17 +2519,6 @@ where
                 match service.compiler_info(exe, cwd, args, env_vars).await {
                     Err(err) => error_to_output(err),
                     Ok(compiler) => match compiler.parse_arguments(args, cwd, env_vars) {
-                        CompilerArguments::NotCompilation => {
-                            run_nvcc_subcommand(creator, output_path, cmd)
-                                .await
-                                .unwrap_or_else(error_to_output)
-                        }
-                        CompilerArguments::CannotCache(why, extra_info) => {
-                            error_to_output(extra_info.map_or_else(
-                                || anyhow!("Cannot cache({why}): {exe:?} {args:?}"),
-                                |desc| anyhow!("Cannot cache({why}, {desc}): {exe:?} {args:?}"),
-                            ))
-                        }
                         CompilerArguments::Ok(hasher) => service
                             .clone()
                             .start_compile_task(
@@ -2542,6 +2531,9 @@ where
                             )
                             .await
                             .map_or_else(error_to_output, |res| res.output),
+                        _ => run_nvcc_subcommand(creator, output_path, cmd)
+                            .await
+                            .unwrap_or_else(error_to_output),
                     },
                 }
             }
