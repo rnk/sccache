@@ -670,6 +670,8 @@ where
                 _ => {}
             }
         }
+        // Remove /FS
+        args.retain(|arg| arg != "/FS" && arg != "-FS");
     } else {
         for arg in args.iter_mut() {
             if arg == "-E" {
