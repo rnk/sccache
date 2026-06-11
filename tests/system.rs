@@ -1901,28 +1901,16 @@ int main(int argc, char** argv) {
             .concat(),
             AdditionalStats {
                 preprocessed: Some(1),
-                cache_writes: Some(3 + with_debug_flags as u64),
-                compilations: Some(4 + with_debug_flags as u64),
+                cache_writes: Some(1),
+                compilations: Some(2),
                 compile_requests: Some(1),
                 requests_executed: Some(7),
                 cache_hits: Some(vec![
-                    (CCompilerKind::Cicc, Language::Ptx, 1),
-                    (
-                        CCompilerKind::Ptxas,
-                        Language::Cubin,
-                        1 + !with_debug_flags as u64,
-                    ),
-                ]),
-                cache_misses: Some(vec![
-                    (CCompilerKind::Nvcc, Language::Cuda, 1),
                     (CCompilerKind::CudaFE, Language::CudaFE, 1),
-                    (CCompilerKind::Cicc, Language::Ptx, 1),
-                    (
-                        CCompilerKind::Ptxas,
-                        Language::Cubin,
-                        with_debug_flags as u64,
-                    ),
+                    (CCompilerKind::Cicc, Language::Ptx, 2),
+                    (CCompilerKind::Ptxas, Language::Cubin, 2),
                 ]),
+                cache_misses: Some(vec![(CCompilerKind::Nvcc, Language::Cuda, 1)]),
                 preprocessor_cache_misses: Some(vec![(CCompilerKind::Nvcc, Language::Cuda, 1)])
                     .filter(|_| preprocessor_cache_mode),
                 ..Default::default()

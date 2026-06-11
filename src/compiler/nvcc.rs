@@ -900,11 +900,6 @@ fn generate_compile_commands(
         host_compiler: host_compiler.clone(),
         // Only here so we can include it in logs
         output_path,
-        outputs: parsed_args
-            .outputs
-            .values()
-            .map(|o| cwd.join(&o.path))
-            .collect(),
     };
 
     Ok((command, None, cacheable))
@@ -1097,7 +1092,6 @@ struct NvccCompileCommand {
     cwd: PathBuf,
     host_compiler: NvccHostCompiler,
     output_path: PathBuf,
-    outputs: Vec<PathBuf>,
 }
 
 #[async_trait]
@@ -1130,7 +1124,6 @@ impl CompileCommandImpl for NvccCompileCommand {
             host_compiler,
             num_parallel,
             output_path,
-            outputs,
             ..
         } = self;
 
@@ -1164,16 +1157,17 @@ impl CompileCommandImpl for NvccCompileCommand {
             //
             // Renames the files back to the original names nvcc gave them.
 
-            if let Some(keep_dir) = keep_dir.as_deref() {
-                let out_dir = out_dir.as_ref();
+            // Move nvcc internal files to `--keep-dir`, but only if it isn't the same as `out_dir`
+            if let Some(dst_dir) = keep_dir.as_deref() {
+                let src_dir = out_dir.as_ref().path();
 
                 // Ensure `--keep-dir` exists
-                tokio::fs::create_dir_all(keep_dir).await?;
+                tokio::fs::create_dir_all(dst_dir).await?;
 
                 // Rename files back to original nvcc names
-                for (curr, prev) in nvcc_internal_files.drain() {
-                    let src = out_dir.path().join(curr);
-                    let dst = out_dir.path().join(prev);
+                for (old, new) in nvcc_internal_files.drain() {
+                    let src = src_dir.join(new);
+                    let dst = dst_dir.join(old);
                     if dst != src && src.exists() {
                         match tokio::fs::rename(&src, &dst).await {
                             Ok(_) => {}
@@ -1188,45 +1182,17 @@ impl CompileCommandImpl for NvccCompileCommand {
                     }
                 }
 
-                // Move nvcc internal files to `--keep-dir`, but only if it isn't the same as `out_dir`
-                if keep_dir != out_dir.path()
-                    && let Ok(mut entries) = tokio::fs::read_dir(out_dir).await
-                {
-                    while let Some(entry) = entries.next_entry().await? {
-                        let src = entry.path();
-                        let dst = keep_dir.join(entry.file_name());
-                        if dst != src && src.exists() {
-                            if outputs.contains(&src) {
-                                tokio::fs::copy(&src, &dst).await?;
-                            } else {
-                                match tokio::fs::rename(&src, &dst).await {
-                                    Ok(_) => {}
-                                    Err(err) => match err.kind() {
-                                        std::io::ErrorKind::CrossesDevices => {
-                                            tokio::fs::copy(&src, &dst).await?;
-                                            tokio::fs::remove_file(&src).await?;
-                                        }
-                                        _ => bail!(err),
-                                    },
-                                }
-                            }
-                        }
-                    }
-                }
-
                 return Ok(());
             }
 
             // If `-objtemp` was passed without `-keep`, remove the nvcc internal files from `out_dir`
-            if let OutDir::Dir(out_dir) = out_dir.as_ref()
-                && let Ok(mut entries) = tokio::fs::read_dir(out_dir).await
-            {
-                // Remove nvcc internal files that aren't expected outputs
-                while let Some(entry) = entries.next_entry().await? {
-                    let path = entry.path();
-                    if !outputs.contains(&path) && path.exists() {
-                        tokio::fs::remove_file(path).await?;
-                    }
+            if let OutDir::Dir(obj_dir) = out_dir.as_ref() {
+                for path in nvcc_internal_files
+                    .drain()
+                    .flat_map(|(old, new)| [obj_dir.join(old), obj_dir.join(new)])
+                    .filter(|path| path.exists())
+                {
+                    tokio::fs::remove_file(path).await?;
                 }
             }
 
@@ -1994,17 +1960,55 @@ where
     // So to avoid this, we detect these "single-arch" compilations and rewrite the names to
     // match what nvcc generates for "many-arch" compilations.
     //
-    let nvcc_command_args = lines.iter().filter_map(|(exe, args)| {
-        if let Some(exe_name) = exe.file_stem().and_then(|s| s.to_str())
-            && is_nvcc_exe(exe_name, args)
-        {
-            return Some(args);
-        }
-        None
-    });
+    let last_arch = lines
+        .iter()
+        // Reverse so we search from the end and work backwards
+        .rev()
+        .filter_map(|(exe, args)| {
+            if let Some(exe_name) = exe.file_stem().and_then(|s| s.to_str())
+                && is_nvcc_exe(exe_name, args)
+            {
+                return Some((exe_name, args));
+            }
+            None
+        })
+        .find_map(|(exe, args)| {
+            if exe == "ptxas"
+                && let Some(arch) = args
+                    .iter()
+                    .position(|arg| arg == "-o")
+                    // Get the output file name
+                    .and_then(|idx| args.get(idx + 1))
+                    // Only if it ends with `.cubin`
+                    .and_then(|val| val.strip_suffix(".cubin"))
+                    // And has the string `sm_` in the name
+                    .filter(|val| HAS_SM_IN_NAME_RE.is_match(val))
+                    // * Split on `sm_`
+                    // * Ignore everything before `.sm_`
+                    // * Everything after `.sm_` is the arch
+                    .and_then(|val| val.split("sm_").nth(1))
+            {
+                return Some(arch);
+            }
 
-    let lines = if let Some(arch) = find_last_compute_arch(nvcc_command_args) {
-        remap_generated_filenames(&arch, compile_flag, &lines, nvcc_internal_files)
+            if let Some(arch) = args
+                .iter()
+                .position(|arg| arg == "-arch")
+                // Get the -arch value
+                .and_then(|idx| args.get(idx + 1))
+                // Split on the first underscore
+                .and_then(|val| val.split_once('_'))
+                // Everything after the first underscore is the arch
+                .map(|(_, arch)| arch)
+            {
+                return Some(arch);
+            }
+
+            None
+        });
+
+    let lines = if let Some(arch) = last_arch {
+        remap_generated_filenames(arch, compile_flag, &lines, nvcc_internal_files)
     } else {
         lines
     };
@@ -2134,33 +2138,6 @@ fn fold_env_vars_or_split_into_exe_and_args(
         });
 
     Some(Ok((exe, args)))
-}
-
-fn find_last_compute_arch<'a, A: AsRef<[String]> + 'a, I: DoubleEndedIterator<Item = A>>(
-    lines: I,
-) -> Option<String> {
-    lines.rev().find_map(|args| {
-        let args = args.as_ref();
-        if matches!(args.first().map(|s| s.as_str()), Some("ptxas"))
-            && let Some(idx) = args.iter().position(|arg| arg == "-o")
-            && let Some(val) = args.get(idx + 1)
-            && HAS_SM_IN_NAME_RE.is_match(val)
-            && val.ends_with(".cubin")
-            // Split on `sm_`
-            // Ignore everything before `.sm_`
-            // Take everything after `.sm_` i.e. `{arch}.cubin`
-            && let Some(arch) = val.split("sm_").nth(1)
-        {
-            return Some(arch.to_owned());
-        }
-        if let Some(idx) = args.iter().position(|arg| arg == "-arch")
-            && let Some(val) = args.get(idx + 1)
-            && let Some((_, arch)) = val.split_once('_')
-        {
-            return Some(arch.to_owned());
-        }
-        None
-    })
 }
 
 fn remap_generated_filenames(
@@ -2337,7 +2314,7 @@ fn remap_generated_filenames(
                                     .to_owned()
                             }
                             Some(ext) => {
-                                nvcc_internal_files
+                                let arg = nvcc_internal_files
                                     .entry(arg)
                                     .or_insert_with_key(|arg| {
                                         if !extensions_to_rename
@@ -2364,7 +2341,23 @@ fn remap_generated_filenames(
                                         }
                                         path.into_os_string().into_string().unwrap()
                                     })
-                                    .to_owned()
+                                    .to_owned();
+
+                                // cicc generates additional "test_a.compute_XX.cpp1.int.c"
+                                // and "test_a.compute_XX.cpp1.int.device.c" files that we
+                                // should clean up at the end.
+                                if ext == ".cpp1.ii"
+                                    && let Some(name) = arg.strip_suffix(ext)
+                                {
+                                    for suf in ["cpp1.int.c", "cpp1.int.device.c"] {
+                                        nvcc_internal_files.insert(
+                                            format!("{name}.{suf}"),
+                                            format!("{name}.{suf}"),
+                                        );
+                                    }
+                                }
+
+                                arg
                             }
                             None => {
                                 // If the argument isn't a file name with one of our extensions,
