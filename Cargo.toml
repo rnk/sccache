@@ -107,7 +107,7 @@ mime = "0.3"
 notify-debouncer-full = { version = "0.7", optional = true }
 object = "0.37"
 opendal = { version = "0.55.0", default-features = false }
-openssl = { version = "0.10.75", optional = true }
+openssl = { version = "0.10.81", optional = true }
 rand = "0.8.4"
 regex = "1.10.3"
 regex_static = "0.1.1"
@@ -163,6 +163,8 @@ axum-server = { version = "0.8", default-features = false, optional = true }
 celery = { git = "https://github.com/trxcllnt/rusty-celery.git", branch = "fea/update-dependencies", optional = true, default-features = false, features = [
   "codegen",
   "extra_content_types",
+  "rustls-native-certs",
+  "hickory-dns",
   "rustls--ring",
 ] }
 nix = { version = "0.30.0", optional = true, features = [
@@ -249,7 +251,6 @@ vendored-openssl = [
   "openssl?/vendored",
   "reqwest?/native-tls-alpn",
   "reqwest?/native-tls-vendored",
-  "celery?/vendored-openssl",
 ]
 # Enable features that require unstable features of Nightly Rust.
 unstable = []
