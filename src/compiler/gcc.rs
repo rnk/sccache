@@ -996,6 +996,15 @@ where
     }
 
     cmd.args(&parsed_args.preprocessor_args)
+        //
+        // Define the __PREPROCESS_ONLY__ macro when preprocessing so users can work
+        // around clang __has_builtin() bugs when using distributed compilation.
+        //
+        // If an identifier with the same name as a builtin exists:
+        // * __has_builtin() is true when preprocessing: https://godbolt.org/z/dsPbWGs5o
+        // * __has_builtin() is false when compiling: https://godbolt.org/z/47azYd8so
+        //
+        .arg("-D__PREPROCESS_ONLY__")
         .args(&parsed_args.dependency_args)
         .args(&parsed_args.common_args)
         .args(
@@ -2375,6 +2384,7 @@ mod test {
                 "-x",
                 "c++",
                 "-frewrite-includes",
+                "-D__PREPROCESS_ONLY__",
                 "-D__arm64__=1",
                 "-D__i386__=1",
                 "-E",
@@ -2408,6 +2418,7 @@ mod test {
             "-x",
             "c++",
             "-fdirectives-only",
+            "-D__PREPROCESS_ONLY__",
             "-arch",
             "arm64",
             "-E",
@@ -2435,7 +2446,15 @@ mod test {
             true,
             &[],
         );
-        let expected_args = ovec!["-x", "c", "-frewrite-includes", "-E", "--", "foo.c"];
+        let expected_args = ovec![
+            "-x",
+            "c",
+            "-frewrite-includes",
+            "-D__PREPROCESS_ONLY__",
+            "-E",
+            "--",
+            "foo.c"
+        ];
         assert_eq!(cmd.args, expected_args);
     }
 
