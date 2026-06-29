@@ -1,0 +1,133 @@
+{
+  "dockerFile": "${localWorkspaceFolder}/.devcontainer/Dockerfile",
+  "build": {
+    "args": {
+      "BASE": "messense/rust-musl-cross:x86_64-musl",
+      "CARGO_BUILD_TARGET": "x86_64-unknown-linux-musl",
+      "LOCAL_WORKSPACE_FOLDER": "${localWorkspaceFolder}",
+      "RUST_VERSION": "1.88.0"
+    },
+    "options": [
+      "--platform",
+      "linux/amd64"
+    ]
+  },
+  "capAdd": ["SYS_ADMIN", "SYS_PTRACE"],
+  "hostRequirements": { "gpu": "optional" },
+  "securityOpt": ["apparmor=unconfined", "seccomp=unconfined"],
+  "runArgs": [
+    "--rm",
+    "--name",
+    "${localEnv:USER:anon}-${localWorkspaceFolderBasename}-nvhpc26.5-amd64",
+    "--network",
+    "host",
+    "--platform",
+    "linux/amd64",
+    "--privileged",
+    "--ulimit",
+    "nofile=1048576:1048576"
+  ],
+  "remoteUser": "${localEnv:USER:anon}",
+  "containerUser": "root",
+  "initializeCommand": [
+    "/bin/bash",
+    "-c",
+    "if test amd64 != $(dpkg --print-architecture | awk -F'-' '{print $NF}'); then docker run --privileged --rm tonistiigi/binfmt --install amd64; fi; mkdir -m 0755 -p ${localWorkspaceFolder}/.devcontainer/{bin,.cache,.config}"
+  ],
+  "postCreateCommand": [
+    "/bin/bash",
+    "-c",
+    "sudo chown -R $(id -u):$(id -g) \"$RUSTUP_HOME\" \"$CARGO_HOME\""
+  ],
+  "workspaceFolder": "/opt/sccache",
+  "workspaceMount": "type=bind,src=${localWorkspaceFolder},dst=${localWorkspaceFolder}",
+  "mounts": [
+    "type=bind,src=/tmp,dst=/tmp"
+  ],
+  "containerEnv": {
+    "CC": "nvc",
+    "CXX": "nvc++",
+    "CUDAHOSTCXX": "nvc++"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2.5.6": {
+      "userUid": "1001",
+      "userGid": "1001",
+      "username": "${localEnv:USER:anon}",
+      "installZsh": "false",
+      "upgradePackages": "true"
+    },
+    "ghcr.io/devcontainers/features/git:1.3.5": {
+      "ppa": "true",
+      "version": "latest"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1.1.0": {},
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1.6.5": {
+      "moby": "false"
+    },
+    "ghcr.io/rapidsai/devcontainers/features/gcc:latest": {},
+    "ghcr.io/rapidsai/devcontainers/features/llvm:latest": {
+      "version": "22"
+    },
+    "ghcr.io/rapidsai/devcontainers/features/nvhpc:latest": {
+      "version": "26.5"
+    }
+  },
+  "overrideFeatureInstallOrder": [
+    "ghcr.io/devcontainers/features/common-utils",
+    "ghcr.io/devcontainers/features/git",
+    "ghcr.io/devcontainers/features/github-cli",
+    "ghcr.io/devcontainers/features/docker-outside-of-docker",
+    "ghcr.io/rapidsai/devcontainers/features/gcc",
+    "ghcr.io/rapidsai/devcontainers/features/llvm",
+    "ghcr.io/rapidsai/devcontainers/features/nvhpc"
+  ],
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "augustocdias.tasks-shell-input",
+        "bierner.markdown-mermaid",
+        "mutantdino.resourcemonitor",
+        "rust-lang.rust-analyzer",
+        "fill-labs.dependi",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb"
+      ],
+      "settings": {
+        "debug.toolBarLocation": "docked",
+        "extensions.ignoreRecommendations": true,
+        "files.watcherExclude": {
+          "**/build/**": true,
+          "**/target/**": true,
+          "${localEnv:HOME}/.cache/**/*": true,
+          "${localEnv:HOME}/.local/share/**/*": true,
+          "${localEnv:HOME}/.vscode-server/**/*": true
+        },
+        "[rust]": {
+            "editor.formatOnSave": true,
+            "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        },
+        "rust-analyzer.cargo.allTargets": true,
+        "rust-analyzer.cargo.features": "all",
+        "rust-analyzer.checkOnSave": true,
+        "rust-analyzer.check.command": "clippy",
+        "search.exclude": {
+          "**/build/**": true,
+          "**/target/**": true,
+          "**/*.code-search": true,
+          "${localEnv:HOME}/.cache/**/*": true,
+          "${localEnv:HOME}/.local/share/**/*": true,
+          "${localEnv:HOME}/.vscode-server/**/*": true
+        },
+        "terminal.integrated.profiles.linux": {
+          "bash": {
+            "path": "bash",
+            "icon": "terminal-bash",
+            "args": ["-l"]
+          }
+        }
+      }
+    }
+  }
+}
