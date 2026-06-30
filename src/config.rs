@@ -259,6 +259,8 @@ pub struct AzureCacheConfig {
     pub preprocessor_cache_mode: Option<PreprocessorCacheModeConfig>,
     #[serde(default = "AzureCacheConfig::default_order")]
     pub order: u64,
+    #[serde(default)]
+    pub rw_mode: CacheModeConfig,
 }
 
 impl Default for AzureCacheConfig {
@@ -318,9 +320,10 @@ pub struct DiskCacheConfig {
     #[serde(deserialize_with = "deserialize_size_from_str")]
     pub size: u64,
     pub preprocessor_cache_mode: PreprocessorCacheModeConfig,
-    pub rw_mode: CacheModeConfig,
     #[serde(default = "DiskCacheConfig::default_order")]
     pub order: u64,
+    #[serde(default)]
+    pub rw_mode: CacheModeConfig,
 }
 
 impl DiskCacheConfig {
@@ -346,8 +349,8 @@ impl Default for DiskCacheConfig {
 pub enum CacheModeConfig {
     #[serde(rename = "READ_ONLY")]
     ReadOnly,
-    #[default]
     #[serde(rename = "READ_WRITE")]
+    #[default]
     ReadWrite,
 }
 
@@ -369,12 +372,12 @@ pub struct GCSCacheConfig {
     pub key_prefix: String,
     pub cred_path: Option<String>,
     pub service_account: Option<String>,
-    #[serde(default)]
-    pub rw_mode: CacheModeConfig,
     pub credential_url: Option<String>,
     pub preprocessor_cache_mode: Option<PreprocessorCacheModeConfig>,
     #[serde(default = "GCSCacheConfig::default_order")]
     pub order: u64,
+    #[serde(default)]
+    pub rw_mode: CacheModeConfig,
 }
 
 impl Default for GCSCacheConfig {
@@ -403,6 +406,8 @@ pub struct GHACacheConfig {
     pub preprocessor_cache_mode: Option<PreprocessorCacheModeConfig>,
     #[serde(default = "GHACacheConfig::default_order")]
     pub order: u64,
+    #[serde(default)]
+    pub rw_mode: CacheModeConfig,
 }
 
 impl Default for GHACacheConfig {
@@ -462,6 +467,8 @@ pub struct MemcachedCacheConfig {
 
     #[serde(default = "MemcachedCacheConfig::default_order")]
     pub order: u64,
+    #[serde(default)]
+    pub rw_mode: CacheModeConfig,
 }
 
 impl Default for MemcachedCacheConfig {
@@ -531,6 +538,8 @@ pub struct RedisCacheConfig {
 
     #[serde(default = "RedisCacheConfig::default_order")]
     pub order: u64,
+    #[serde(default)]
+    pub rw_mode: CacheModeConfig,
 }
 
 impl Default for RedisCacheConfig {
@@ -558,6 +567,8 @@ pub struct WebdavCacheConfig {
     pub preprocessor_cache_mode: Option<PreprocessorCacheModeConfig>,
     #[serde(default = "WebdavCacheConfig::default_order")]
     pub order: u64,
+    #[serde(default)]
+    pub rw_mode: CacheModeConfig,
 }
 
 impl Default for WebdavCacheConfig {
@@ -589,6 +600,8 @@ pub struct S3CacheConfig {
     pub preprocessor_cache_mode: Option<PreprocessorCacheModeConfig>,
     #[serde(default = "S3CacheConfig::default_order")]
     pub order: u64,
+    #[serde(default)]
+    pub rw_mode: CacheModeConfig,
 }
 
 impl Default for S3CacheConfig {
@@ -616,6 +629,8 @@ pub struct OSSCacheConfig {
     pub preprocessor_cache_mode: Option<PreprocessorCacheModeConfig>,
     #[serde(default = "OSSCacheConfig::default_order")]
     pub order: u64,
+    #[serde(default)]
+    pub rw_mode: CacheModeConfig,
 }
 
 impl Default for OSSCacheConfig {
@@ -641,6 +656,8 @@ pub struct COSCacheConfig {
     pub preprocessor_cache_mode: Option<PreprocessorCacheModeConfig>,
     #[serde(default = "COSCacheConfig::default_order")]
     pub order: u64,
+    #[serde(default)]
+    pub rw_mode: CacheModeConfig,
 }
 
 impl Default for COSCacheConfig {
@@ -1272,6 +1289,19 @@ fn key_prefix_from_env_var(env_var_name: &str) -> Option<String> {
         .map(|s| s.to_owned())
 }
 
+fn cache_mode_from_env_var(env_var_name: &str) -> Option<CacheModeConfig> {
+    env::var(env_var_name)
+        .ok()
+        .and_then(|value| match value.to_uppercase().as_str() {
+            "READ_ONLY" => Some(CacheModeConfig::ReadOnly),
+            "READ_WRITE" => Some(CacheModeConfig::ReadWrite),
+            _ => {
+                warn!("{} must be 'READ_ONLY' or 'READ_WRITE'", env_var_name);
+                None
+            }
+        })
+}
+
 pub fn number_from_env_var<A: std::str::FromStr>(env_var_name: &str) -> Option<Result<A>>
 where
     <A as FromStr>::Err: fmt::Debug,
@@ -1311,6 +1341,8 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
         let endpoint = env::var(envvar("ENDPOINT")).ok();
         let key_prefix = key_prefix_from_env_var(&envvar("S3_KEY_PREFIX")).unwrap_or_default();
         let enable_virtual_host_style = bool_from_env_var(&envvar("S3_ENABLE_VIRTUAL_HOST_STYLE"))?;
+        let rw_mode =
+            cache_mode_from_env_var(&envvar("S3_RW_MODE")).unwrap_or(CacheModeConfig::ReadWrite);
 
         Some(S3CacheConfig {
             bucket,
@@ -1332,6 +1364,7 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
             order: number_from_env_var(&envvar("S3_CACHE_ORDER"))
                 .unwrap_or(Ok(S3CacheConfig::default_order()))
                 .unwrap_or(S3CacheConfig::default_order()),
+            rw_mode,
         })
     } else {
         None
@@ -1376,6 +1409,9 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
             let key_prefix =
                 key_prefix_from_env_var(&envvar("REDIS_KEY_PREFIX")).unwrap_or_default();
 
+            let rw_mode = cache_mode_from_env_var(&envvar("REDIS_RW_MODE"))
+                .unwrap_or(CacheModeConfig::ReadWrite);
+
             Some(RedisCacheConfig {
                 url,
                 endpoint,
@@ -1400,6 +1436,7 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
                 order: number_from_env_var(&envvar("REDIS_CACHE_ORDER"))
                     .unwrap_or(Ok(RedisCacheConfig::default_order()))
                     .unwrap_or(RedisCacheConfig::default_order()),
+                rw_mode,
             })
         }
     };
@@ -1433,6 +1470,9 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
         let key_prefix =
             key_prefix_from_env_var(&envvar("MEMCACHED_KEY_PREFIX")).unwrap_or_default();
 
+        let rw_mode = cache_mode_from_env_var(&envvar("MEMCACHED_RW_MODE"))
+            .unwrap_or(CacheModeConfig::ReadWrite);
+
         Some(MemcachedCacheConfig {
             url,
             username,
@@ -1453,6 +1493,7 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
             order: number_from_env_var(&envvar("MEMCACHED_CACHE_ORDER"))
                 .unwrap_or(Ok(MemcachedCacheConfig::default_order()))
                 .unwrap_or(MemcachedCacheConfig::default_order()),
+            rw_mode,
         })
     } else {
         None
@@ -1494,21 +1535,10 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
         let cred_path = env::var(envvar("GCS_KEY_PATH")).ok();
         let service_account = env::var(envvar("GCS_SERVICE_ACCOUNT")).ok();
 
-        let rw_mode = match env::var(envvar("GCS_RW_MODE")).as_ref().map(String::as_str) {
-            Ok("READ_ONLY") => CacheModeConfig::ReadOnly,
-            Ok("READ_WRITE") => CacheModeConfig::ReadWrite,
-            // TODO: unsure if these should warn during the configuration loading
-            // or at the time when they're actually used to connect to GCS
-            Ok(_) => {
-                warn!("Invalid {} -- defaulting to READ_ONLY.",
-                envvar("GCS_RW_MODE"));
-                CacheModeConfig::ReadOnly
-            }
-            _ => {
-                warn!("No {} specified -- defaulting to READ_ONLY.", envvar("GCS_RW_MODE"));
-                CacheModeConfig::ReadOnly
-            }
-        };
+        let rw_mode = cache_mode_from_env_var(&envvar("GCS_RW_MODE")).unwrap_or_else(|| {
+            warn!("No valid SCCACHE_GCS_RW_MODE value was found -- defaulting to READ_ONLY.");
+            CacheModeConfig::ReadOnly
+        });
 
         GCSCacheConfig {
             bucket,
@@ -1533,6 +1563,8 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
     });
 
     // ======= GHA =======
+    let gha_rw_mode: CacheModeConfig =
+        cache_mode_from_env_var(&envvar("GHA_RW_MODE")).unwrap_or(CacheModeConfig::ReadWrite);
     let gha = if let Ok(version) = env::var(envvar("GHA_VERSION")) {
         // If SCCACHE_GHA_VERSION has been set, we don't need to check
         // SCCACHE_GHA_ENABLED's value anymore.
@@ -1552,6 +1584,7 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
             order: number_from_env_var(&envvar("GHA_CACHE_ORDER"))
                 .unwrap_or(Ok(GHACacheConfig::default_order()))
                 .unwrap_or(GHACacheConfig::default_order()),
+            rw_mode: gha_rw_mode,
         })
     } else if bool_from_env_var(&envvar("GHA_ENABLED"))?.unwrap_or(false) {
         // If only SCCACHE_GHA_ENABLED has been set to the true value, enable with
@@ -1572,6 +1605,7 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
             order: number_from_env_var(&envvar("GHA_CACHE_ORDER"))
                 .unwrap_or(Ok(GHACacheConfig::default_order()))
                 .unwrap_or(GHACacheConfig::default_order()),
+            rw_mode: gha_rw_mode,
         })
     } else {
         None
@@ -1583,6 +1617,9 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
         env::var(envvar("AZURE_BLOB_CONTAINER")),
     ) {
         let key_prefix = key_prefix_from_env_var(&envvar("AZURE_KEY_PREFIX")).unwrap_or_default();
+        let rw_mode =
+            cache_mode_from_env_var(&envvar("AZURE_RW_MODE")).unwrap_or(CacheModeConfig::ReadWrite);
+
         Some(AzureCacheConfig {
             connection_string,
             container,
@@ -1598,6 +1635,7 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
             order: number_from_env_var(&envvar("AZURE_CACHE_ORDER"))
                 .unwrap_or(Ok(AzureCacheConfig::default_order()))
                 .unwrap_or(AzureCacheConfig::default_order()),
+            rw_mode,
         })
     } else {
         None
@@ -1609,6 +1647,8 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
         let username = env::var(envvar("WEBDAV_USERNAME")).ok();
         let password = env::var(envvar("WEBDAV_PASSWORD")).ok();
         let token = env::var(envvar("WEBDAV_TOKEN")).ok();
+        let rw_mode = cache_mode_from_env_var(&envvar("WEBDAV_RW_MODE"))
+            .unwrap_or(CacheModeConfig::ReadWrite);
 
         Some(WebdavCacheConfig {
             endpoint,
@@ -1629,6 +1669,7 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
             order: number_from_env_var(&envvar("WEBDAV_CACHE_ORDER"))
                 .unwrap_or(Ok(WebdavCacheConfig::default_order()))
                 .unwrap_or(WebdavCacheConfig::default_order()),
+            rw_mode,
         })
     } else {
         None
@@ -1640,6 +1681,9 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
         let key_prefix = key_prefix_from_env_var(&envvar("OSS_KEY_PREFIX")).unwrap_or_default();
 
         let no_credentials = bool_from_env_var(&envvar("OSS_NO_CREDENTIALS"))?.unwrap_or(false);
+
+        let rw_mode =
+            cache_mode_from_env_var(&envvar("OSS_RW_MODE")).unwrap_or(CacheModeConfig::ReadWrite);
 
         Some(OSSCacheConfig {
             bucket,
@@ -1657,6 +1701,7 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
             order: number_from_env_var(&envvar("OSS_CACHE_ORDER"))
                 .unwrap_or(Ok(OSSCacheConfig::default_order()))
                 .unwrap_or(OSSCacheConfig::default_order()),
+            rw_mode,
         })
     } else {
         None
@@ -1680,6 +1725,9 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
         let endpoint = env::var("SCCACHE_COS_ENDPOINT").ok();
         let key_prefix = key_prefix_from_env_var("SCCACHE_COS_KEY_PREFIX").unwrap_or_default();
 
+        let rw_mode =
+            cache_mode_from_env_var(&envvar("COS_RW_MODE")).unwrap_or(CacheModeConfig::ReadWrite);
+
         Some(COSCacheConfig {
             bucket,
             endpoint,
@@ -1695,6 +1743,7 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
             order: number_from_env_var(&envvar("COS_CACHE_ORDER"))
                 .unwrap_or(Ok(COSCacheConfig::default_order()))
                 .unwrap_or(COSCacheConfig::default_order()),
+            rw_mode,
         })
     } else {
         None
@@ -1729,21 +1778,11 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
                 .unwrap_or(preprocessor_cache_mode.key_prefix);
     }
 
-    let (disk_rw_mode, disk_rw_mode_overridden) = match env::var(envvar("LOCAL_RW_MODE"))
-        .as_ref()
-        .map(String::as_str)
-    {
-        Ok("READ_ONLY") => (CacheModeConfig::ReadOnly, true),
-        Ok("READ_WRITE") => (CacheModeConfig::ReadWrite, true),
-        Ok(_) => {
-            warn!(
-                "Invalid {} -- defaulting to READ_WRITE.",
-                envvar("LOCAL_RW_MODE")
-            );
-            (CacheModeConfig::ReadWrite, false)
-        }
-        _ => (CacheModeConfig::ReadWrite, false),
-    };
+    let (disk_rw_mode, disk_rw_mode_overridden) =
+        match cache_mode_from_env_var(&envvar("LOCAL_RW_MODE")) {
+            Some(mode) => (mode, true),
+            _ => (CacheModeConfig::ReadWrite, false),
+        };
 
     let any_overridden = disk_dir.is_some()
         || disk_sz.is_some()
@@ -3350,6 +3389,7 @@ fn config_overrides() {
                 connection_string: String::new(),
                 container: String::new(),
                 key_prefix: String::new(),
+                rw_mode: CacheModeConfig::ReadWrite,
                 ..Default::default()
             }),
             disk: Some(DiskCacheConfig {
@@ -3426,6 +3466,7 @@ fn config_overrides() {
                     connection_string: String::new(),
                     container: String::new(),
                     key_prefix: String::new(),
+                    rw_mode: CacheModeConfig::ReadWrite,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -3623,6 +3664,72 @@ fn test_deserialize_basedirs_missing() {
 
     let config: FileConfig = toml::from_str(toml).unwrap();
     assert!(config.basedirs.is_empty());
+}
+
+#[test]
+fn test_cache_mode_from_env_var() {
+    struct CacheEnvCheckInfo {
+        env_var_value: Option<String>,
+        expected_cache_mode: Option<CacheModeConfig>,
+    }
+
+    let env_check_infos = vec![
+        CacheEnvCheckInfo {
+            env_var_value: None,
+            expected_cache_mode: None,
+        },
+        CacheEnvCheckInfo {
+            env_var_value: Some(String::new()),
+            expected_cache_mode: None,
+        },
+        CacheEnvCheckInfo {
+            env_var_value: Some("read_only".to_string()),
+            expected_cache_mode: Some(CacheModeConfig::ReadOnly),
+        },
+        CacheEnvCheckInfo {
+            env_var_value: Some("read_write".to_string()),
+            expected_cache_mode: Some(CacheModeConfig::ReadWrite),
+        },
+        CacheEnvCheckInfo {
+            env_var_value: Some("ReAd_ONly".to_string()),
+            expected_cache_mode: Some(CacheModeConfig::ReadOnly),
+        },
+        CacheEnvCheckInfo {
+            env_var_value: Some("read_WRITE".to_string()),
+            expected_cache_mode: Some(CacheModeConfig::ReadWrite),
+        },
+        CacheEnvCheckInfo {
+            env_var_value: Some("read_only_typo".to_string()),
+            expected_cache_mode: None,
+        },
+        CacheEnvCheckInfo {
+            env_var_value: Some("foo".to_string()),
+            expected_cache_mode: None,
+        },
+        CacheEnvCheckInfo {
+            env_var_value: Some("any_unsupported_value".to_string()),
+            expected_cache_mode: None,
+        },
+    ];
+
+    let var_name = "SCCACHE_ANY_CACHE_MODE_ENV_VAR";
+
+    for info in env_check_infos {
+        unsafe {
+            if let Some(env_var_value) = &info.env_var_value {
+                std::env::set_var(var_name, env_var_value);
+            } else {
+                std::env::remove_var(var_name);
+            }
+        }
+        let cache_mode = cache_mode_from_env_var(var_name);
+
+        unsafe {
+            std::env::remove_var(var_name);
+        }
+
+        assert_eq!(cache_mode, info.expected_cache_mode);
+    }
 }
 
 #[test]
@@ -4046,6 +4153,7 @@ use_ssl = true
 key_prefix = "s3prefix"
 no_credentials = true
 server_side_encryption = false
+rw_mode = "READ_WRITE"
 
 [cache.webdav]
 endpoint = "http://127.0.0.1:8080"
@@ -4059,6 +4167,7 @@ bucket = "name"
 endpoint = "oss-us-east-1.aliyuncs.com"
 key_prefix = "ossprefix"
 no_credentials = true
+rw_mode = "READ_ONLY"
 
 [cache.cos]
 bucket = "name"
@@ -4096,6 +4205,7 @@ key_prefix = "cosprefix"
                 gha: Some(GHACacheConfig {
                     enabled: true,
                     version: "sccache".to_string(),
+                    rw_mode: CacheModeConfig::ReadWrite,
                     ..Default::default()
                 }),
                 redis: Some(RedisCacheConfig {
@@ -4107,6 +4217,7 @@ key_prefix = "cosprefix"
                     db: 12,
                     ttl: 24 * 3600,
                     key_prefix: "/my/redis/cache".into(),
+                    rw_mode: CacheModeConfig::ReadWrite,
                     ..Default::default()
                 }),
                 memcached: Some(MemcachedCacheConfig {
@@ -4115,6 +4226,7 @@ key_prefix = "cosprefix"
                     password: Some("passwd".to_owned()),
                     expiration: 25 * 3600,
                     key_prefix: "/custom/prefix/if/need".into(),
+                    rw_mode: CacheModeConfig::ReadWrite,
                     ..Default::default()
                 }),
                 s3: Some(S3CacheConfig {
@@ -4126,6 +4238,7 @@ key_prefix = "cosprefix"
                     no_credentials: true,
                     server_side_encryption: Some(false),
                     enable_virtual_host_style: None,
+                    rw_mode: CacheModeConfig::ReadWrite,
                     ..Default::default()
                 }),
                 webdav: Some(WebdavCacheConfig {
@@ -4134,6 +4247,7 @@ key_prefix = "cosprefix"
                     username: Some("webdavusername".to_string()),
                     password: Some("webdavpassword".to_string()),
                     token: Some("webdavtoken".to_string()),
+                    rw_mode: CacheModeConfig::ReadWrite,
                     ..Default::default()
                 }),
                 oss: Some(OSSCacheConfig {
@@ -4141,12 +4255,14 @@ key_prefix = "cosprefix"
                     endpoint: Some("oss-us-east-1.aliyuncs.com".to_owned()),
                     key_prefix: "ossprefix".into(),
                     no_credentials: true,
+                    rw_mode: CacheModeConfig::ReadOnly,
                     ..Default::default()
                 }),
                 cos: Some(COSCacheConfig {
                     bucket: "name".to_owned(),
                     endpoint: Some("cos.na-siliconvalley.myqcloud.com".to_owned()),
                     key_prefix: "cosprefix".into(),
+                    rw_mode: CacheModeConfig::ReadWrite,
                     ..Default::default()
                 }),
                 multilevel: None,
@@ -4724,6 +4840,7 @@ fn test_get_cache_levels_single_cache() {
             use_ssl: None,
             server_side_encryption: None,
             enable_virtual_host_style: None,
+            rw_mode: CacheModeConfig::ReadWrite,
             ..Default::default()
         }),
         ..Default::default()
