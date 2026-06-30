@@ -129,9 +129,9 @@ impl Digest {
     {
         let path = path.as_ref();
         if path.is_dir() {
-            // For directories (e.g., from proc_macro::tracked_path::path()),
-            // recursively hash all file contents in sorted order, with the
-            // relative path mixed in as a delimiter so tree shape matters.
+            // For directories (e.g., from
+            // proc_macro::tracked_path::path()), recursively hash all file
+            // names and contents in sorted order.
             let mut entries = Vec::new();
             Self::collect_dir_entries(path, &mut entries)?;
             entries.sort();
@@ -139,8 +139,7 @@ impl Digest {
             for entry in entries {
                 let entry = entry.as_path();
                 let rel = entry.strip_prefix(path).unwrap_or(entry);
-                digest.update(&path_to_bytes(rel)?);
-                digest.update(b"\0");
+                digest.delimiter(&path_to_bytes(rel)?);
                 digest = digest.with_reader(Self::open_file(entry)?).await?;
             }
             Ok(digest)
