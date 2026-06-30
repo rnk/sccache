@@ -127,7 +127,26 @@ impl Digest {
     where
         T: AsRef<Path>,
     {
-        self.with_reader(Self::open_file(path)?).await
+        let path = path.as_ref();
+        if path.is_dir() {
+            // For directories (e.g., from proc_macro::tracked_path::path()),
+            // recursively hash all file contents in sorted order, with the
+            // relative path mixed in as a delimiter so tree shape matters.
+            let mut entries = Vec::new();
+            Self::collect_dir_entries(path, &mut entries)?;
+            entries.sort();
+            let mut digest = self;
+            for entry in entries {
+                let entry = entry.as_path();
+                let rel = entry.strip_prefix(path).unwrap_or(entry);
+                digest.update(&path_to_bytes(rel)?);
+                digest.update(b"\0");
+                digest = digest.with_reader(Self::open_file(entry)?).await?;
+            }
+            Ok(digest)
+        } else {
+            self.with_reader(Self::open_file(path)?).await
+        }
     }
 
     /// Update the BLAKE3 digest of the contents of `path` into this digest, while
@@ -265,6 +284,22 @@ impl Digest {
             self.inner.update(&buffer[..count]);
         }
         Ok(self)
+    }
+
+    /// Recursively collect all file paths within a directory.
+    fn collect_dir_entries(dir: &Path, entries: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in std::fs::read_dir(dir)
+            .with_context(|| format!("Failed to read directory for hashing: {dir:?}"))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                Self::collect_dir_entries(&path, entries)?;
+            } else {
+                entries.push(path);
+            }
+        }
+        Ok(())
     }
 
     pub fn update(&mut self, bytes: &[u8]) {
@@ -1954,7 +1989,7 @@ pub fn resolve_compiler_avoiding_ccache(
 
 #[cfg(test)]
 mod tests {
-    use super::{OsStrExt, TimeMacroFinder, resolve_compiler_avoiding_ccache};
+    use super::{Digest, OsStrExt, TimeMacroFinder, resolve_compiler_avoiding_ccache};
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
 
@@ -2409,5 +2444,78 @@ mod tests {
         let input = b"";
         let normalized = super::normalize_win_path(input);
         assert_eq!(normalized, b"");
+    }
+
+    #[tokio::test]
+    async fn test_digest_reader_hashes_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("hello.txt");
+        std::fs::write(&path, b"hello, world").unwrap();
+        let hash = Digest::from_file(path).await.unwrap().finish();
+        assert_eq!(hash.len(), 64, "blake3 hex digest is 64 chars");
+    }
+
+    // Regression for https://github.com/mozilla/sccache/issues/2653: rustc's
+    // dep-info may list a directory path (e.g. from a proc macro that calls
+    // `proc_macro::tracked_path::path()` on a directory). The four tests below
+    // exercise Digest::from_file against directories.
+
+    #[tokio::test]
+    async fn test_digest_reader_hashes_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::create_dir_all(dir.join("nested/deeper")).unwrap();
+        std::fs::write(dir.join("root.txt"), b"root").unwrap();
+        std::fs::write(dir.join("nested/inner.txt"), b"inner").unwrap();
+        std::fs::write(dir.join("nested/deeper/deep.txt"), b"deep").unwrap();
+        let hash = Digest::from_file(dir).await.unwrap().finish();
+        assert_eq!(hash.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn test_digest_reader_directory_is_deterministic() {
+        fn populate(dir: &std::path::Path) {
+            std::fs::create_dir_all(dir.join("a/b")).unwrap();
+            std::fs::create_dir_all(dir.join("c")).unwrap();
+            std::fs::write(dir.join("a/b/one.txt"), b"one").unwrap();
+            std::fs::write(dir.join("a/two.txt"), b"two").unwrap();
+            std::fs::write(dir.join("c/three.txt"), b"three").unwrap();
+            std::fs::write(dir.join("four.txt"), b"four").unwrap();
+        }
+        let t1 = tempfile::tempdir().unwrap();
+        let t2 = tempfile::tempdir().unwrap();
+        populate(t1.path());
+        populate(t2.path());
+        let h1 = Digest::from_file(t1.path()).await.unwrap().finish();
+        let h2 = Digest::from_file(t2.path()).await.unwrap().finish();
+        assert_eq!(h1, h2);
+    }
+
+    #[tokio::test]
+    async fn test_digest_reader_directory_detects_content_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/data.txt"), b"before").unwrap();
+        let before = Digest::from_file(dir).await.unwrap().finish();
+        std::fs::write(dir.join("sub/data.txt"), b"after").unwrap();
+        let after = Digest::from_file(dir).await.unwrap().finish();
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_digest_reader_directory_detects_path_change() {
+        // Two dirs with identical file *contents* but different file *names*
+        // must hash to different values, because collect_dir_entries mixes
+        // the relative path into the digest as a delimiter.
+        let t1 = tempfile::tempdir().unwrap();
+        let t2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t1.path().join("sub")).unwrap();
+        std::fs::create_dir_all(t2.path().join("sub")).unwrap();
+        std::fs::write(t1.path().join("sub/a.txt"), b"x").unwrap();
+        std::fs::write(t2.path().join("sub/b.txt"), b"x").unwrap();
+        let h1 = Digest::from_file(t1.path()).await.unwrap().finish();
+        let h2 = Digest::from_file(t2.path()).await.unwrap().finish();
+        assert_ne!(h1, h2);
     }
 }
