@@ -130,27 +130,43 @@ impl DistSystemGlobals {
             .get_or_init(|| {
                 // Make sure the docker image is available, building it if necessary.
                 // This is here (and not below) so that it only happens once.
-                let mut cmd = Command::new("docker")
-                    .arg("build")
-                    .arg("-q")
-                    .args(["-t", DIST_IMAGE])
-                    .arg("-")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
+                let mut last_output = None;
+                for attempt in 1..=3 {
+                    let mut cmd = Command::new("docker")
+                        .arg("build")
+                        .arg("-q")
+                        .args(["-t", DIST_IMAGE])
+                        .arg("-")
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap();
 
-                cmd.stdin
-                    .as_mut()
-                    .unwrap()
-                    .write_all(DIST_DOCKERFILE.as_bytes())
-                    .unwrap();
+                    cmd.stdin
+                        .as_mut()
+                        .unwrap()
+                        .write_all(DIST_DOCKERFILE.as_bytes())
+                        .unwrap();
 
-                cmd.wait_with_output()
-                    .map_err(Into::into)
-                    .and_then(check_output)
-                    .expect("docker build success");
+                    let output = cmd.wait_with_output().unwrap();
+
+                    if output.status.success() {
+                        last_output = Some(output);
+                        break;
+                    }
+
+                    eprintln!(
+                        "docker build attempt {attempt}/3 failed (exit {}), retrying...",
+                        output.status
+                    );
+
+                    last_output = Some(output);
+
+                    std::thread::sleep(Duration::from_secs(5 * attempt as u64));
+                }
+
+                check_output(last_output.unwrap()).expect("docker build success");
 
                 Mutex::new(Some(DistSystemGlobals::new()))
             })
