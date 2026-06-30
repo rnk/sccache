@@ -39,7 +39,7 @@ use crate::{
     mock_command::{CommandChild, CommandCreatorSync, ProcessOutput, RunCommand},
     server,
     util::{
-        fmt_duration_as_secs, resolve_compiler_avoiding_ccache, run_input_output, strip_basedirs,
+        fmt_duration_as_secs, resolve_compiler_avoiding_wrapper, run_input_output, strip_basedirs,
     },
 };
 
@@ -2378,7 +2378,7 @@ compiler_version=__VERSION__
     let (tempdir, src) = write_temp_file(&pool, "testfile.c".as_ref(), test).await?;
 
     // Resolve compiler avoiding ccache wrappers to prevent double-caching.
-    let executable = resolve_compiler_avoiding_ccache(executable.as_ref(), &env);
+    let executable = resolve_compiler_avoiding_wrapper(executable.as_ref(), &env);
 
     let mut cmd = creator.clone().new_command_sync(&executable);
     cmd.stdout(Stdio::piped())

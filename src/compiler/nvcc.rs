@@ -30,7 +30,7 @@ use crate::{
     server::SccacheService,
     util::{
         HASH_BUFFER_SIZE, OsStrExt, SCCACHE_TMPDIR, read_line_batches,
-        resolve_compiler_avoiding_ccache, run_input_output, split_quoted_shell_str, tempdir_in,
+        resolve_compiler_avoiding_wrapper, run_input_output, split_quoted_shell_str, tempdir_in,
     },
 };
 use async_trait::async_trait;
@@ -1629,7 +1629,7 @@ fn create_nvcc_commands_graph(
         } {
             let cmd = NvccGeneratedSubcommand {
                 // Resolve compiler avoiding ccache wrappers to prevent double-caching.
-                exe: resolve_compiler_avoiding_ccache(exe, &env_vars),
+                exe: resolve_compiler_avoiding_wrapper(exe, &env_vars),
                 args: parsed_args.common_args.clone(),
                 cwd: dir.to_owned(),
                 env_vars,
