@@ -1280,9 +1280,12 @@ pub struct EnvConfig {
     basedirs: Option<Vec<String>>,
 }
 
+fn string_from_env_var(env_var_name: &str) -> Option<String> {
+    env::var(env_var_name).ok().filter(|s| !s.is_empty())
+}
+
 fn key_prefix_from_env_var(env_var_name: &str) -> Option<String> {
-    env::var(env_var_name)
-        .ok()
+    string_from_env_var(env_var_name)
         .as_ref()
         .map(|s| s.trim_end_matches('/'))
         .filter(|s| !s.is_empty())
@@ -1290,23 +1293,21 @@ fn key_prefix_from_env_var(env_var_name: &str) -> Option<String> {
 }
 
 fn cache_mode_from_env_var(env_var_name: &str) -> Option<CacheModeConfig> {
-    env::var(env_var_name)
-        .ok()
-        .and_then(|value| match value.to_uppercase().as_str() {
-            "READ_ONLY" => Some(CacheModeConfig::ReadOnly),
-            "READ_WRITE" => Some(CacheModeConfig::ReadWrite),
-            _ => {
-                warn!("{} must be 'READ_ONLY' or 'READ_WRITE'", env_var_name);
-                None
-            }
-        })
+    string_from_env_var(env_var_name).and_then(|value| match value.to_uppercase().as_str() {
+        "READ_ONLY" => Some(CacheModeConfig::ReadOnly),
+        "READ_WRITE" => Some(CacheModeConfig::ReadWrite),
+        _ => {
+            warn!("{} must be 'READ_ONLY' or 'READ_WRITE'", env_var_name);
+            None
+        }
+    })
 }
 
 pub fn number_from_env_var<A: std::str::FromStr>(env_var_name: &str) -> Option<Result<A>>
 where
     <A as FromStr>::Err: fmt::Debug,
 {
-    let value = env::var(env_var_name).ok()?;
+    let value = string_from_env_var(env_var_name)?;
 
     value
         .parse::<A>()
@@ -1315,8 +1316,7 @@ where
 }
 
 pub fn bool_from_env_var(env_var_name: &str) -> Result<Option<bool>> {
-    env::var(env_var_name)
-        .ok()
+    string_from_env_var(env_var_name)
         .map(|value| match value.to_lowercase().as_str() {
             "true" | "on" | "1" => Ok(true),
             "false" | "off" | "0" => Ok(false),
@@ -1330,15 +1330,12 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
     let envvar = |key: &str| envvar_prefix.clone() + key;
 
     // ======= AWS =======
-    let s3 = if let Some(bucket) = env::var(envvar("BUCKET"))
-        .ok()
-        .and_then(|bucket| (!bucket.is_empty()).then_some(bucket))
-    {
-        let region = env::var(envvar("REGION")).ok();
+    let s3 = if let Some(bucket) = string_from_env_var(&envvar("BUCKET")) {
+        let region = string_from_env_var(&envvar("REGION"));
         let no_credentials = bool_from_env_var(&envvar("S3_NO_CREDENTIALS"))?.unwrap_or(false);
         let use_ssl = bool_from_env_var(&envvar("S3_USE_SSL"))?;
         let server_side_encryption = bool_from_env_var(&envvar("S3_SERVER_SIDE_ENCRYPTION"))?;
-        let endpoint = env::var(envvar("ENDPOINT")).ok();
+        let endpoint = string_from_env_var(&envvar("ENDPOINT"));
         let key_prefix = key_prefix_from_env_var(&envvar("S3_KEY_PREFIX")).unwrap_or_default();
         let enable_virtual_host_style = bool_from_env_var(&envvar("S3_ENABLE_VIRTUAL_HOST_STYLE"))?;
         let rw_mode =
@@ -1382,10 +1379,10 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
 
     // ======= redis =======
     let redis = match (
-        env::var(envvar("REDIS")).ok(),
-        env::var(envvar("REDIS_ENDPOINT")).ok(),
-        env::var(envvar("REDIS_CLUSTER_ENDPOINTS")).ok(),
-        env::var(envvar("REDIS_READER_ENDPOINTS")).ok(),
+        string_from_env_var(&envvar("REDIS")),
+        string_from_env_var(&envvar("REDIS_ENDPOINT")),
+        string_from_env_var(&envvar("REDIS_CLUSTER_ENDPOINTS")),
+        string_from_env_var(&envvar("REDIS_READER_ENDPOINTS")),
     ) {
         (None, None, None, None) => None,
         (url, endpoint, cluster_endpoints, reader_endpoints) => {
@@ -1393,8 +1390,8 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
                 .transpose()?
                 .unwrap_or(DEFAULT_REDIS_DB);
 
-            let username = env::var(envvar("REDIS_USERNAME")).ok();
-            let password = env::var(envvar("REDIS_PASSWORD")).ok();
+            let username = string_from_env_var(&envvar("REDIS_USERNAME"));
+            let password = string_from_env_var(&envvar("REDIS_PASSWORD"));
 
             let ttl = number_from_env_var(&envvar("REDIS_EXPIRATION"))
                 .or_else(|| number_from_env_var(&envvar("REDIS_TTL")))
@@ -1452,11 +1449,11 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
     }
 
     // ======= memcached =======
-    let memcached = if let Ok(url) =
-        env::var(envvar("MEMCACHED")).or_else(|_| env::var(envvar("MEMCACHED_ENDPOINT")))
+    let memcached = if let Some(url) = string_from_env_var(&envvar("MEMCACHED"))
+        .or_else(|| string_from_env_var(&envvar("MEMCACHED_ENDPOINT")))
     {
-        let username = env::var(envvar("MEMCACHED_USERNAME")).ok();
-        let password = env::var(envvar("MEMCACHED_PASSWORD")).ok();
+        let username = string_from_env_var(&envvar("MEMCACHED_USERNAME"));
+        let password = string_from_env_var(&envvar("MEMCACHED_PASSWORD"));
 
         let expiration = number_from_env_var(&envvar("MEMCACHED_EXPIRATION"))
             .transpose()?
@@ -1511,10 +1508,10 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
     }
 
     // ======= GCP/GCS =======
-    if (env::var(envvar("GCS_CREDENTIALS_URL")).is_ok()
-        || env::var(envvar("GCS_OAUTH_URL")).is_ok()
-        || env::var(envvar("GCS_KEY_PATH")).is_ok())
-        && env::var(envvar("GCS_BUCKET")).is_err()
+    if (string_from_env_var(&envvar("GCS_CREDENTIALS_URL")).is_some()
+        || string_from_env_var(&envvar("GCS_OAUTH_URL")).is_some()
+        || string_from_env_var(&envvar("GCS_KEY_PATH")).is_some())
+        && string_from_env_var(&envvar("GCS_BUCKET")).is_none()
     {
         bail!(
             "If setting GCS credentials, {} and an auth mechanism need to be set.",
@@ -1522,18 +1519,18 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
         );
     }
 
-    let gcs = env::var(envvar("GCS_BUCKET")).ok().map(|bucket| {
+    let gcs = string_from_env_var(&envvar("GCS_BUCKET")).map(|bucket| {
         let key_prefix = key_prefix_from_env_var(&envvar("GCS_KEY_PREFIX")).unwrap_or_default();
 
-        if env::var(envvar("GCS_OAUTH_URL")).is_ok() {
+        if string_from_env_var(&envvar("GCS_OAUTH_URL")).is_some() {
             eprintln!("{} has been deprecated", envvar("GCS_OAUTH_URL"));
             eprintln!("if you intend to use vm metadata for auth, please set correct service account instead");
         }
 
-        let credential_url = env::var(envvar("GCS_CREDENTIALS_URL")).ok();
+        let credential_url = string_from_env_var(&envvar("GCS_CREDENTIALS_URL"));
 
-        let cred_path = env::var(envvar("GCS_KEY_PATH")).ok();
-        let service_account = env::var(envvar("GCS_SERVICE_ACCOUNT")).ok();
+        let cred_path = string_from_env_var(&envvar("GCS_KEY_PATH"));
+        let service_account = string_from_env_var(&envvar("GCS_SERVICE_ACCOUNT"));
 
         let rw_mode = cache_mode_from_env_var(&envvar("GCS_RW_MODE")).unwrap_or_else(|| {
             warn!("No valid SCCACHE_GCS_RW_MODE value was found -- defaulting to READ_ONLY.");
@@ -1565,7 +1562,7 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
     // ======= GHA =======
     let gha_rw_mode: CacheModeConfig =
         cache_mode_from_env_var(&envvar("GHA_RW_MODE")).unwrap_or(CacheModeConfig::ReadWrite);
-    let gha = if let Ok(version) = env::var(envvar("GHA_VERSION")) {
+    let gha = if let Some(version) = string_from_env_var(&envvar("GHA_VERSION")) {
         // If SCCACHE_GHA_VERSION has been set, we don't need to check
         // SCCACHE_GHA_ENABLED's value anymore.
         Some(GHACacheConfig {
@@ -1612,9 +1609,9 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
     };
 
     // ======= Azure =======
-    let azure = if let (Ok(connection_string), Ok(container)) = (
-        env::var(envvar("AZURE_CONNECTION_STRING")),
-        env::var(envvar("AZURE_BLOB_CONTAINER")),
+    let azure = if let (Some(connection_string), Some(container)) = (
+        string_from_env_var(&envvar("AZURE_CONNECTION_STRING")),
+        string_from_env_var(&envvar("AZURE_BLOB_CONTAINER")),
     ) {
         let key_prefix = key_prefix_from_env_var(&envvar("AZURE_KEY_PREFIX")).unwrap_or_default();
         let rw_mode =
@@ -1642,11 +1639,11 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
     };
 
     // ======= WebDAV =======
-    let webdav = if let Ok(endpoint) = env::var(envvar("WEBDAV_ENDPOINT")) {
+    let webdav = if let Some(endpoint) = string_from_env_var(&envvar("WEBDAV_ENDPOINT")) {
         let key_prefix = key_prefix_from_env_var(&envvar("WEBDAV_KEY_PREFIX")).unwrap_or_default();
-        let username = env::var(envvar("WEBDAV_USERNAME")).ok();
-        let password = env::var(envvar("WEBDAV_PASSWORD")).ok();
-        let token = env::var(envvar("WEBDAV_TOKEN")).ok();
+        let username = string_from_env_var(&envvar("WEBDAV_USERNAME"));
+        let password = string_from_env_var(&envvar("WEBDAV_PASSWORD"));
+        let token = string_from_env_var(&envvar("WEBDAV_TOKEN"));
         let rw_mode = cache_mode_from_env_var(&envvar("WEBDAV_RW_MODE"))
             .unwrap_or(CacheModeConfig::ReadWrite);
 
@@ -1676,8 +1673,8 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
     };
 
     // ======= OSS =======
-    let oss = if let Ok(bucket) = env::var(envvar("OSS_BUCKET")) {
-        let endpoint = env::var(envvar("OSS_ENDPOINT")).ok();
+    let oss = if let Some(bucket) = string_from_env_var(&envvar("OSS_BUCKET")) {
+        let endpoint = string_from_env_var(&envvar("OSS_ENDPOINT"));
         let key_prefix = key_prefix_from_env_var(&envvar("OSS_KEY_PREFIX")).unwrap_or_default();
 
         let no_credentials = bool_from_env_var(&envvar("OSS_NO_CREDENTIALS"))?.unwrap_or(false);
@@ -1721,9 +1718,9 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
     }
 
     // ======= COS =======
-    let cos = if let Ok(bucket) = env::var("SCCACHE_COS_BUCKET") {
-        let endpoint = env::var("SCCACHE_COS_ENDPOINT").ok();
-        let key_prefix = key_prefix_from_env_var("SCCACHE_COS_KEY_PREFIX").unwrap_or_default();
+    let cos = if let Some(bucket) = string_from_env_var(&envvar("COS_BUCKET")) {
+        let endpoint = string_from_env_var(&envvar("COS_ENDPOINT"));
+        let key_prefix = key_prefix_from_env_var(&envvar("COS_KEY_PREFIX")).unwrap_or_default();
 
         let rw_mode =
             cache_mode_from_env_var(&envvar("COS_RW_MODE")).unwrap_or(CacheModeConfig::ReadWrite);
@@ -1753,9 +1750,8 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
     let disk_dir = env::var_os(envvar("DIR"))
         .or(env::var_os(envvar("DISK_CACHE_PATH")))
         .map(PathBuf::from);
-    let disk_sz = env::var(envvar("CACHE_SIZE"))
-        .or(env::var(envvar("DISK_CACHE_SIZE")))
-        .ok()
+    let disk_sz = string_from_env_var(&envvar("CACHE_SIZE"))
+        .or(string_from_env_var(&envvar("DISK_CACHE_SIZE")))
         .and_then(|v| parse_size(&v));
     let disk_order = number_from_env_var(&envvar("DISK_CACHE_ORDER")).and_then(|o| o.ok());
 
@@ -1802,14 +1798,13 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
     };
 
     // Parse multi-level cache configuration
-    let multilevel = if let Ok(chain_str) = env::var("SCCACHE_MULTILEVEL_CHAIN") {
+    let multilevel = if let Some(chain_str) = string_from_env_var(&envvar("MULTILEVEL_CHAIN")) {
         let chain: Vec<String> = chain_str
             .split(',')
             .map(|s| s.trim().to_lowercase())
             .collect();
 
-        let write_error_policy = env::var("SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY")
-            .ok()
+        let write_error_policy = string_from_env_var(&envvar("MULTILEVEL_WRITE_ERROR_POLICY"))
             .and_then(|s| s.parse::<WriteErrorPolicy>().ok())
             .unwrap_or_default();
 
@@ -3360,6 +3355,7 @@ fn test_cache_ordering() {
     let azure = CacheType::Azure(AzureCacheConfig::default());
     let webdav = CacheType::Webdav(WebdavCacheConfig::default());
     let oss = CacheType::OSS(OSSCacheConfig::default());
+    let cos = CacheType::COS(COSCacheConfig::default());
 
     assert_eq!(disk.order(), DiskCacheConfig::default_order());
     assert_eq!(s3.order(), S3CacheConfig::default_order());
@@ -3370,14 +3366,43 @@ fn test_cache_ordering() {
     assert_eq!(azure.order(), AzureCacheConfig::default_order());
     assert_eq!(webdav.order(), WebdavCacheConfig::default_order());
     assert_eq!(oss.order(), OSSCacheConfig::default_order());
+    assert_eq!(cos.order(), COSCacheConfig::default_order());
 
-    let mut caches = vec![oss, redis, gha, memcached, gcs, s3, webdav, disk, azure];
+    let mut caches = vec![
+        oss, redis, gha, cos, memcached, gcs, s3, webdav, disk, azure,
+    ];
     caches.sort();
 
     while let Some(cache) = caches.pop() {
         for other in caches.iter() {
             assert_eq!(cache.cmp(other), std::cmp::Ordering::Greater);
         }
+    }
+}
+
+#[test]
+fn test_string_from_env_var() {
+    let var_name = "TEST_SCCACHE_VAR";
+    for value in [None, Some(""), Some("foo")] {
+        match value {
+            None => unsafe {
+                std::env::remove_var(var_name);
+            },
+            Some(value) => unsafe {
+                std::env::set_var(var_name, value);
+            },
+        }
+        let result = string_from_env_var(var_name);
+        unsafe {
+            std::env::remove_var(var_name);
+        }
+
+        let expected = match value {
+            None | Some("") => None,
+            Some(value) => Some(value.to_string()),
+        };
+
+        assert_eq!(result, expected);
     }
 }
 
