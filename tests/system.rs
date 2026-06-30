@@ -175,6 +175,12 @@ const INPUT_FOR_CUDA_C: &str = "test_c.cu";
 const INPUT_FOR_HIP_A: &str = "test_a.hip";
 const INPUT_FOR_HIP_B: &str = "test_b.hip";
 const OUTPUT: &str = "test.o";
+#[cfg(unix)]
+const NULL_PATH: &str = "/dev/null";
+#[cfg(windows)]
+const NULL_PATH: &str = "NUL";
+#[cfg(unix)]
+const DEV_STDOUT: &str = "/dev/stdout";
 
 // Copy the source files into the tempdir so we can compile with relative paths, since the commandline winds up in the hash key.
 fn copy_to_tempdir(inputs: &[&str], tempdir: &Path) {
@@ -255,6 +261,110 @@ fn test_basic_compile(
     let adv_key = adv_key_kind("c", compiler.name);
     assert_eq!(&1, stats.cache_hits.get_adv(&adv_key).unwrap());
     assert_eq!(&1, stats.cache_misses.get_adv(&adv_key).unwrap());
+}
+
+fn test_basic_compile_into_null(client: &SccacheClient, compiler: &Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_basic_compile_into_dev_null: {}", name);
+    client.zero_stats();
+    // Compile a source file.
+    copy_to_tempdir(&[INPUT, INPUT_ERR], tempdir);
+
+    trace!("compile");
+    client
+        .cmd()
+        .args(compile_cmdline(name, exe, INPUT, NULL_PATH, Vec::new()))
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    trace!("request stats");
+    let stats = client.stats().unwrap();
+    assert_eq!(1, stats.compile_requests);
+    assert_eq!(1, stats.requests_executed);
+    assert_eq!(1, stats.cache_hits.all());
+    assert_eq!(0, stats.cache_misses.all());
+    assert!(stats.cache_misses.get("C/C++").is_none());
+    let adv_key = adv_key_kind("c", compiler.name);
+    assert!(stats.cache_misses.get_adv(&adv_key).is_none());
+    trace!("compile");
+    client
+        .cmd()
+        .args(compile_cmdline(name, exe, INPUT, NULL_PATH, Vec::new()))
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    trace!("request stats");
+    let stats = client.stats().unwrap();
+    assert_eq!(2, stats.compile_requests);
+    assert_eq!(2, stats.requests_executed);
+    assert_eq!(2, stats.cache_hits.all());
+    assert_eq!(0, stats.cache_misses.all());
+    assert_eq!(&2, stats.cache_hits.get("C/C++").unwrap());
+    assert!(stats.cache_misses.get("C/C++").is_none());
+    let adv_key = adv_key_kind("c", compiler.name);
+    assert_eq!(&2, stats.cache_hits.get_adv(&adv_key).unwrap());
+    assert!(stats.cache_misses.get_adv(&adv_key).is_none());
+}
+
+#[cfg(unix)]
+fn test_basic_compile_into_dev_stdout(client: &SccacheClient, compiler: &Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_basic_compile_into_dev_stdout: {}", name);
+    client.zero_stats();
+    // Compile a source file.
+    copy_to_tempdir(&[INPUT, INPUT_ERR], tempdir);
+
+    trace!("compile");
+    client
+        .cmd()
+        .args(compile_cmdline(name, exe, INPUT, DEV_STDOUT, Vec::new()))
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    trace!("request stats");
+    let stats = client.stats().unwrap();
+    assert_eq!(1, stats.compile_requests);
+    assert_eq!(1, stats.requests_executed);
+    assert_eq!(1, stats.cache_hits.all());
+    assert_eq!(0, stats.cache_misses.all());
+    assert!(stats.cache_misses.get("C/C++").is_none());
+    let adv_key = adv_key_kind("c", compiler.name);
+    assert!(stats.cache_misses.get_adv(&adv_key).is_none());
+    trace!("compile");
+    client
+        .cmd()
+        .args(compile_cmdline(name, exe, INPUT, DEV_STDOUT, Vec::new()))
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    trace!("request stats");
+    let stats = client.stats().unwrap();
+    assert_eq!(2, stats.compile_requests);
+    assert_eq!(2, stats.requests_executed);
+    assert_eq!(2, stats.cache_hits.all());
+    assert_eq!(0, stats.cache_misses.all());
+    assert_eq!(&2, stats.cache_hits.get("C/C++").unwrap());
+    assert!(stats.cache_misses.get("C/C++").is_none());
+    let adv_key = adv_key_kind("c", compiler.name);
+    assert_eq!(&2, stats.cache_hits.get_adv(&adv_key).unwrap());
+    assert!(stats.cache_misses.get_adv(&adv_key).is_none());
+}
+
+#[cfg(not(unix))]
+fn test_basic_compile_into_dev_stdout(_: &SccacheClient, _: &Compiler, _: &Path) {
+    info!("Not unix, skipping tests with /dev/stdout");
 }
 
 fn test_noncacheable_stats(client: &SccacheClient, compiler: &Compiler, tempdir: &Path) {
@@ -652,6 +762,8 @@ fn run_sccache_command_tests(
 ) {
     if compiler.name != "clang++" {
         test_basic_compile(client, compiler, tempdir, preprocessor_cache_mode);
+        test_basic_compile_into_null(client, compiler, tempdir);
+        test_basic_compile_into_dev_stdout(client, compiler, tempdir);
     }
     test_compile_with_define(client, compiler, tempdir);
     if compiler.name == "cl" {
