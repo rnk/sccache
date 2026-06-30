@@ -14,14 +14,16 @@
 
 use crate::{
     cache::{
-        disk::DiskCache, readonly::ReadOnlyStorage, tiered::TieredCache, utils::normalize_key,
+        disk::DiskCache,
+        multilevel::{MultiLevelStats, MultiLevelStorage},
+        readonly::ReadOnlyStorage,
+        utils::normalize_key,
     },
-    config::{CacheType, DiskCacheConfig, PreprocessorCacheModeConfig},
+    config::{CacheConfigs, CacheType, DiskCacheConfig, PreprocessorCacheModeConfig},
     errors::*,
 };
 use async_trait::async_trait;
-use futures::{FutureExt, StreamExt, TryFutureExt};
-use itertools::Itertools;
+use futures::{FutureExt, TryStreamExt};
 use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use super::cache_io::*;
@@ -55,7 +57,7 @@ use crate::{cache::webdav::WebdavCache, config::WebdavCacheConfig};
 pub trait Storage: Send + Sync {
     /// Get a cache entry by `key`.
     ///
-    /// If an error occurs, this method should return a `Cache::Error`.
+    /// If an error occurs, this method should return a `Result::Err`.
     /// If nothing fails but the entry is not found in the cache,
     /// it should return a `Cache::Miss`.
     /// If the entry is successfully found in the cache, it should
@@ -79,6 +81,16 @@ pub trait Storage: Send + Sync {
 
     async fn size(&self, key: &str) -> Result<u64>;
 
+    /// Get raw serialized cache entry bytes by `key` (for multi-level backfill).
+    /// Returns `None` if the entry is not found, or if the implementation doesn't support raw access.
+    /// This is used by multi-level caches to backfill faster levels.
+    async fn get_raw(&self, _key: &str) -> Result<Option<opendal::Buffer>>;
+
+    /// Put raw serialized cache entry bytes under `key` (for multi-level backfill).
+    /// Returns an error if the implementation doesn't support raw access.
+    /// This is used by multi-level caches to backfill faster levels.
+    async fn put_raw(&self, _key: &str, _data: opendal::Buffer) -> Result<Duration>;
+
     /// Check the cache capability.
     ///
     /// - `Ok(CacheMode::ReadOnly)` means cache can only be used to `get`
@@ -100,9 +112,7 @@ pub trait Storage: Send + Sync {
 
     /// Get the cache backend type name (e.g., "disk", "redis", "s3").
     /// Used for statistics and display purposes.
-    fn cache_type_name(&self) -> &'static str {
-        "unknown"
-    }
+    fn cache_type_name(&self) -> &'static str;
 
     /// Get the current storage usage, if applicable.
     async fn current_size(&self) -> Result<Option<u64>>;
@@ -110,12 +120,18 @@ pub trait Storage: Send + Sync {
     /// Get the maximum storage size, if applicable.
     async fn max_size(&self) -> Result<Option<u64>>;
 
+    /// Get multi-level cache statistics, if this is a multi-level storage.
+    fn multilevel_stats(&self) -> Option<MultiLevelStats> {
+        None
+    }
+
     /// Return the config for preprocessor cache mode if applicable
     fn preprocessor_cache_mode_config(&self) -> PreprocessorCacheModeConfig {
         PreprocessorCacheModeConfig::default()
     }
+
     /// Return the base directories for path normalization if configured
-    async fn basedirs(&self) -> Vec<Vec<u8>>;
+    fn basedirs(&self) -> &[Vec<u8>];
 }
 
 #[cfg(any(
@@ -243,11 +259,9 @@ impl RemoteStorage {
 #[async_trait]
 impl Storage for RemoteStorage {
     async fn get(&self, key: &str) -> Result<Cache<opendal::Buffer>> {
-        match operator::read_with_retry(&self.operator, key).await {
-            Ok(data) => Ok(Cache::Hit(data)),
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(Cache::Miss),
-            Err(e) => Err(e.into()),
-        }
+        self.get_raw(key)
+            .await
+            .map(|data| data.map_or(Cache::Miss, Cache::Hit))
     }
 
     async fn del(&self, key: &str) -> Result<()> {
@@ -262,9 +276,8 @@ impl Storage for RemoteStorage {
     }
 
     async fn put(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
-        let start = std::time::Instant::now();
-        operator::write_with_retry(&self.operator, key, entry).await?;
-        Ok(start.elapsed())
+        trace!("RemoteStorage::put({key})");
+        self.put_raw(key, entry).await
     }
 
     async fn size(&self, key: &str) -> Result<u64> {
@@ -345,8 +358,50 @@ impl Storage for RemoteStorage {
         Ok(None)
     }
 
-    async fn basedirs(&self) -> Vec<Vec<u8>> {
-        self.basedirs.clone()
+    fn basedirs(&self) -> &[Vec<u8>] {
+        &self.basedirs
+    }
+
+    /// Get raw bytes from remote storage for multi-level backfill.
+    ///
+    /// Unlike `get()` which parses bytes into `CacheRead` (a `ZipArchive<Box<dyn ReadSeek>>`),
+    /// this returns the raw bytes without parsing. `CacheRead` is a one-way transformation —
+    /// there is no way to extract the original bytes back from the parsed ZIP archive.
+    /// For backfill we need the raw bytes to write directly to another cache level.
+    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
+        trace!("opendal::Operator::get_raw({key})");
+        match operator::read_with_retry(&self.operator, key).await {
+            Ok(data) => {
+                trace!(
+                    "opendal::Operator::get_raw({key}): Found {} bytes",
+                    data.len()
+                );
+                Ok(Some(data))
+            }
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                trace!("opendal::Operator::get_raw({key}): NotFound");
+                Ok(None)
+            }
+            Err(e) => {
+                warn!("opendal::Operator::get_raw({key}): Error: {e:?}");
+                // Return error instead of silently returning None
+                Err(anyhow!("Failed to read raw bytes: {e:?}"))
+            }
+        }
+    }
+
+    /// Write raw bytes to remote storage for multi-level backfill.
+    ///
+    /// Unlike `put()` which takes a `CacheWrite` and serializes it, this writes
+    /// pre-serialized bytes directly. Paired with `get_raw()` for efficient
+    /// level-to-level data transfer without a deserialize/reserialize round-trip.
+    async fn put_raw(&self, key: &str, data: opendal::Buffer) -> Result<Duration> {
+        trace!("opendal::Operator::put_raw({}, {} bytes)", key, data.len());
+        let start = std::time::Instant::now();
+
+        operator::write_with_retry(&self.operator, key, data).await?;
+
+        Ok(start.elapsed())
     }
 }
 
@@ -380,6 +435,14 @@ impl Storage for PreprocessorCache {
         self.0.size(key).await
     }
 
+    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
+        self.0.get_raw(key).await
+    }
+
+    async fn put_raw(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
+        self.0.put_raw(key, entry).await
+    }
+
     /// Check the cache capability.
     async fn check(&self) -> Result<CacheMode> {
         self.0.check().await
@@ -388,6 +451,11 @@ impl Storage for PreprocessorCache {
     /// Get the storage location.
     async fn location(&self) -> String {
         self.0.location().await
+    }
+
+    /// Get the cache backend type name.
+    fn cache_type_name(&self) -> &'static str {
+        self.0.cache_type_name()
     }
 
     /// Get the current storage usage, if applicable.
@@ -405,8 +473,8 @@ impl Storage for PreprocessorCache {
         self.1.clone()
     }
 
-    async fn basedirs(&self) -> Vec<Vec<u8>> {
-        self.0.basedirs().await
+    fn basedirs(&self) -> &[Vec<u8>] {
+        self.0.basedirs()
     }
 }
 
@@ -923,15 +991,24 @@ impl StorageKind {
     /// Create suitable `Storage` implementations from a list of storage configurations.
     pub async fn create(
         &self,
-        cache_types: &[CacheType],
+        caches: &CacheConfigs,
         basedirs: &[Vec<u8>],
     ) -> Result<Arc<dyn Storage>> {
         let kind = *self;
-        futures::stream::iter(
-            cache_types
+
+        let cache_types: Result<Vec<CacheType>> = caches.into();
+        let multilevel = caches.multilevel.as_ref();
+        let levels = multilevel.map(|multilevel| {
+            multilevel
+                .chain
                 .iter()
-                .sorted()
-                .rev()
+                .map(|level| level.trim().to_lowercase())
+                .collect::<Vec<_>>()
+        });
+
+        let storage = futures::stream::iter(
+            cache_types?
+                .iter()
                 .filter({
                     let use_preprocessor_cache_mode = matches!(kind, StorageKind::Preprocessor);
                     move |&cache| {
@@ -949,42 +1026,55 @@ impl StorageKind {
                         }
                     }
                 })
-                .map(|cache| StorageBuilder::from((kind, basedirs.to_vec(), cache.clone()))),
+                .map(|cache| {
+                    let level = Into::<&str>::into(cache).to_owned();
+
+                    if let Some(levels) = levels.as_ref() && !levels.contains(&level) {
+                        return Err(anyhow!(
+                            "Cache level '{level}' specified in SCCACHE_MULTILEVEL_CHAIN but not configured (missing environment variables)"
+                        ))
+                    }
+                    Ok(StorageBuilder::from((kind, basedirs.to_vec(), cache.clone())))
+                }),
         )
-        .fold(None, |prev, curr| async move {
-            match prev {
-                Some(Err(err)) => Some(Err(err)),
-                None => Some(curr.build().await),
-                Some(Ok(secondary)) => Some(
-                    curr.build()
-                        .await
-                        .map(|primary| TieredCache::create(primary, secondary)),
-                ),
-            }
-        })
-        .then(|res| async move {
-            if let Some(storage) = res {
-                storage
-            } else {
-                // If we build only with `cargo build --no-default-features`
-                // only use sccache with a local cache (no remote storage)
-                StorageBuilder::from((kind, basedirs.to_vec(), DiskCacheConfig::default()))
-                    .build()
-                    .await
-            }
-        })
+        .and_then(|builder| builder.build().boxed())
         .inspect_err(|err| error!("storage init failed for {kind} cache: {err:?}"))
-        .and_then(|storage| async {
-            storage
-                .check()
-                .await
-                .context("storage check failed")
-                .map(|mode| {
-                    info!("server configured with {kind} cache: {mode:?}");
-                    storage
-                })
-        })
-        .await
+        .try_collect::<Vec<_>>()
+        .await?;
+
+        let storage = if storage.len() == 1 {
+            storage[0].clone()
+        } else if storage.len() > 1 {
+            Arc::new(
+                MultiLevelStorage::with_write_error_policy(
+                    storage,
+                    multilevel
+                        .map(|multilevel| multilevel.write_error_policy)
+                        .unwrap_or_default(),
+                )
+                .await,
+            )
+        } else if let Some(levels) = levels.as_ref().filter(|levels| !levels.is_empty()) {
+            return Err(anyhow!(
+                "Multi-level cache configured with {} levels but none could be built",
+                levels.len()
+            ));
+        } else {
+            // If we build only with `cargo build --no-default-features`
+            // only use sccache with a local cache (no remote storage)
+            StorageBuilder::from((kind, basedirs.to_vec(), DiskCacheConfig::default()))
+                .build()
+                .await?
+        };
+
+        storage
+            .check()
+            .await
+            .context("storage check failed")
+            .map(|mode| {
+                info!("server configured with {kind} cache: {mode:?}");
+                storage
+            })
     }
 
     fn key_prefix(
@@ -1004,7 +1094,6 @@ impl StorageKind {
 mod test {
     use super::*;
     use crate::config::{CacheModeConfig, Config};
-    use crate::test::utils::*;
     use fs_err as fs;
 
     #[test]
@@ -1024,11 +1113,14 @@ mod test {
         fs::create_dir(&cache_dir).unwrap();
 
         let make_config = |rw_mode| Config {
-            caches: vec![CacheType::Disk(DiskCacheConfig {
-                dir: cache_dir.clone(),
-                rw_mode,
-                ..DiskCacheConfig::default()
-            })],
+            caches: CacheConfigs {
+                disk: Some(DiskCacheConfig {
+                    dir: cache_dir.clone(),
+                    rw_mode,
+                    ..DiskCacheConfig::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -1083,7 +1175,7 @@ mod test {
         let storage = RemoteStorage::new(operator, basedirs.clone());
 
         // Verify basedirs are stored and retrieved correctly
-        let basedirs_actual = storage.basedirs().wait();
+        let basedirs_actual = storage.basedirs();
         assert_eq!(basedirs_actual, basedirs.as_slice());
         assert_eq!(basedirs_actual.len(), 2);
         assert_eq!(basedirs_actual[0], b"/home/user/project".to_vec());
@@ -1111,7 +1203,7 @@ mod test {
         let storage = RemoteStorage::new(operator, basedirs.clone());
 
         // Verify basedirs work
-        let basedirs_actual = storage.basedirs().wait();
+        let basedirs_actual = storage.basedirs();
         assert_eq!(basedirs_actual, basedirs.as_slice());
         assert_eq!(basedirs_actual.len(), 1);
     }

@@ -477,7 +477,7 @@ pub async fn preprocessor_cache_entry_hash_key(
     cwd: &Path,
     input: &Path,
     plusplus: bool,
-    basedirs: Vec<Vec<u8>>,
+    basedirs: &[Vec<u8>],
 ) -> Result<Option<String>> {
     // If you change any of the inputs to the hash, you should change `FORMAT_VERSION`.
 
@@ -563,7 +563,7 @@ pub async fn preprocessor_cache_entry_hash_key(
         // share preprocessor cache entries and a/r.h exists.
         let buf = path_to_bytes(&input_path)?;
         // Strip basedirs from the input file path if configured
-        let buf_to_hash = strip_basedirs(&buf, &basedirs);
+        let buf_to_hash = strip_basedirs(&buf, basedirs);
         digest.update(&buf_to_hash);
     }
 
@@ -994,7 +994,7 @@ pub fn include_is_too_new(
 }
 
 /// Corresponds to a cached include file used in the pre-processor stage
-#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
 pub struct IncludeEntry {
     /// Its absolute path
     path: OsString,
@@ -1561,7 +1561,7 @@ mod test {
             dir1.path(),
             file_path,
             false,
-            dirs.clone(),
+            &dirs,
         )
         .wait()
         .unwrap()
@@ -1576,7 +1576,7 @@ mod test {
             dir2.path(),
             file_path,
             false,
-            dirs.clone(),
+            &dirs,
         )
         .wait()
         .unwrap()
@@ -1597,7 +1597,7 @@ mod test {
             dir1.path(),
             file_path,
             false,
-            dirs[..1].to_vec(),
+            &dirs[..1],
         )
         .wait()
         .unwrap()
@@ -1612,7 +1612,7 @@ mod test {
             dir2.path(),
             file_path,
             false,
-            dirs[1..].to_vec(),
+            &dirs[1..],
         )
         .wait()
         .unwrap()
@@ -1633,7 +1633,7 @@ mod test {
             dir1.path(),
             file_path,
             false,
-            vec![],
+            &[],
         )
         .wait()
         .unwrap()
@@ -1648,7 +1648,7 @@ mod test {
             dir2.path(),
             file_path,
             false,
-            vec![],
+            &[],
         )
         .wait()
         .unwrap()

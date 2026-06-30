@@ -56,6 +56,16 @@ impl Storage for SimplexCache {
         self.0.size(key).await
     }
 
+    /// Get raw serialized cache entry bytes (forwarded to inner storage)
+    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
+        self.0.get_raw(key).await
+    }
+
+    /// Put raw serialized cache entry bytes under `key` (for multi-level backfill).
+    async fn put_raw(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
+        self.1.put_raw(key, entry).await
+    }
+
     /// Check the cache capability.
     async fn check(&self) -> Result<CacheMode> {
         self.1.check().await
@@ -64,6 +74,12 @@ impl Storage for SimplexCache {
     /// Get the storage location.
     async fn location(&self) -> String {
         [self.0.location().await, self.1.location().await].join("\n")
+    }
+
+    /// Get the cache backend type name (e.g., "disk", "redis", "s3").
+    /// Used for statistics and display purposes.
+    fn cache_type_name(&self) -> &'static str {
+        self.0.cache_type_name()
     }
 
     /// Get the current storage usage, if applicable.
@@ -81,7 +97,7 @@ impl Storage for SimplexCache {
         self.1.preprocessor_cache_mode_config()
     }
 
-    async fn basedirs(&self) -> Vec<Vec<u8>> {
-        self.0.basedirs().await
+    fn basedirs(&self) -> &[Vec<u8>] {
+        self.0.basedirs()
     }
 }

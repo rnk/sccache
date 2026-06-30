@@ -28,6 +28,7 @@ pub mod gha;
 pub mod lazy_disk_cache;
 #[cfg(feature = "memcached")]
 pub mod memcached;
+pub mod multilevel;
 #[cfg(feature = "oss")]
 pub mod oss;
 pub mod readonly;
@@ -54,8 +55,8 @@ pub(crate) mod http_client;
 pub(crate) mod watch;
 
 pub(crate) mod simplex;
-pub(crate) mod tiered;
 
 pub use crate::cache::cache::*;
 pub use crate::cache::cache_io::*;
 pub use crate::cache::lazy_disk_cache::*;
+pub use crate::cache::multilevel::MultiLevelStorage;

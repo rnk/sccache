@@ -74,6 +74,7 @@ pub fn sccache_client_cfg(data_dir: &Path, preprocessor_cache_mode: bool) -> Fil
             webdav: None,
             oss: None,
             cos: None,
+            multilevel: None,
         },
         dist: DistConfig {
             auth: Default::default(), // dangerously_insecure

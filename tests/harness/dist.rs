@@ -67,14 +67,20 @@ fn sccache_scheduler_cfg(message_broker: &MessageBroker) -> SchedulerConfig {
         client_auth: vec![ClientAuth::Insecure],
         message_broker: Some(message_broker.clone()),
         public_addr: SocketAddr::from(([0, 0, 0, 0], scheduler_port)),
-        jobs: vec![CacheType::Disk(DiskCacheConfig {
-            dir: Path::new(CONTAINER_EXTERNAL_PATH).join("jobs"),
-            ..DiskCacheConfig::default()
-        })],
-        toolchains: vec![CacheType::Disk(DiskCacheConfig {
-            dir: Path::new(CONTAINER_EXTERNAL_PATH).join("toolchains"),
-            ..DiskCacheConfig::default()
-        })],
+        jobs: sccache::config::CacheConfigs {
+            disk: Some(DiskCacheConfig {
+                dir: Path::new(CONTAINER_EXTERNAL_PATH).join("jobs"),
+                ..DiskCacheConfig::default()
+            }),
+            ..Default::default()
+        },
+        toolchains: sccache::config::CacheConfigs {
+            disk: Some(DiskCacheConfig {
+                dir: Path::new(CONTAINER_EXTERNAL_PATH).join("toolchains"),
+                ..DiskCacheConfig::default()
+            }),
+            ..Default::default()
+        },
         ..SchedulerConfig::default()
     }
 }
@@ -89,14 +95,20 @@ fn sccache_server_cfg(message_broker: &MessageBroker) -> ServerConfig {
             bwrap_path: DIST_IMAGE_BWRAP_PATH.into(),
         },
         cache_dir: Path::new(CONTAINER_INTERNAL_PATH).into(),
-        jobs: vec![CacheType::Disk(DiskCacheConfig {
-            dir: Path::new(CONTAINER_EXTERNAL_PATH).join("jobs"),
-            ..DiskCacheConfig::default()
-        })],
-        toolchains: vec![CacheType::Disk(DiskCacheConfig {
-            dir: Path::new(CONTAINER_EXTERNAL_PATH).join("toolchains"),
-            ..DiskCacheConfig::default()
-        })],
+        jobs: sccache::config::CacheConfigs {
+            disk: Some(DiskCacheConfig {
+                dir: Path::new(CONTAINER_EXTERNAL_PATH).join("jobs"),
+                ..DiskCacheConfig::default()
+            }),
+            ..Default::default()
+        },
+        toolchains: sccache::config::CacheConfigs {
+            disk: Some(DiskCacheConfig {
+                dir: Path::new(CONTAINER_EXTERNAL_PATH).join("toolchains"),
+                ..DiskCacheConfig::default()
+            }),
+            ..Default::default()
+        },
         toolchain_cache_size: TC_CACHE_SIZE,
         ..ServerConfig::default()
     }
@@ -441,7 +453,8 @@ impl SchedulerHandle {
     }
     pub fn jobs_dir<P: AsRef<Path>>(&self, root: P) -> Result<PathBuf> {
         self.config(root.as_ref())
-            .and_then(|cfg| match &cfg.jobs[0] {
+            .and_then(|cfg| (&cfg.jobs).into())
+            .and_then(|cfg| match &cfg[0] {
                 CacheType::Disk(DiskCacheConfig { dir, .. }) => Ok(dir.clone()),
                 _ => bail!("Scheduler should have disk cache as first job storage config"),
             })
@@ -454,7 +467,8 @@ impl SchedulerHandle {
     }
     pub fn toolchains_dir<P: AsRef<Path>>(&self, root: P) -> Result<PathBuf> {
         self.config(root.as_ref())
-            .and_then(|cfg| match &cfg.toolchains[0] {
+            .and_then(|cfg| (&cfg.toolchains).into())
+            .and_then(|cfg| match &cfg[0] {
                 CacheType::Disk(DiskCacheConfig { dir, .. }) => Ok(dir.clone()),
                 _ => bail!("Scheduler should have disk cache as first toolchain storage config"),
             })
@@ -499,7 +513,8 @@ impl ServerHandle {
     }
     pub fn jobs_dir<P: AsRef<Path>>(&self, root: P) -> Result<PathBuf> {
         self.config(root.as_ref())
-            .and_then(|cfg| match &cfg.jobs[0] {
+            .and_then(|cfg| (&cfg.jobs).into())
+            .and_then(|cfg| match &cfg[0] {
                 CacheType::Disk(DiskCacheConfig { dir, .. }) => Ok(dir.clone()),
                 _ => bail!("Server should have disk cache as first job storage config"),
             })
@@ -512,7 +527,8 @@ impl ServerHandle {
     }
     pub fn toolchains_dir<P: AsRef<Path>>(&self, root: P) -> Result<PathBuf> {
         self.config(root.as_ref())
-            .and_then(|cfg| match &cfg.toolchains[0] {
+            .and_then(|cfg| (&cfg.toolchains).into())
+            .and_then(|cfg| match &cfg[0] {
                 CacheType::Disk(DiskCacheConfig { dir, .. }) => Ok(dir.clone()),
                 _ => bail!("Server should have disk cache as first toolchain storage config"),
             })
@@ -740,11 +756,14 @@ impl DistSystemBuilder {
         let mut system = DistSystem::new(name);
         let message_broker = self.message_broker.as_ref().expect("Message broker exists");
 
-        fn storage_cfg(redis: &DistMessageBroker) -> Vec<CacheType> {
-            vec![CacheType::Redis(RedisCacheConfig {
-                endpoint: Some(redis.url().to_url().to_string()),
+        fn storage_cfg(redis: &DistMessageBroker) -> sccache::config::CacheConfigs {
+            sccache::config::CacheConfigs {
+                redis: Some(RedisCacheConfig {
+                    endpoint: Some(redis.url().to_url().to_string()),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            })]
+            }
         }
 
         for i in 0..self.scheduler_count {

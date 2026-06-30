@@ -54,6 +54,16 @@ impl Storage for ReadOnlyStorage {
         self.0.size(key).await
     }
 
+    /// Get raw serialized cache entry bytes (forwarded to inner storage)
+    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
+        self.0.get_raw(key).await
+    }
+
+    /// Put raw serialized cache entry bytes under `key` (for multi-level backfill).
+    async fn put_raw(&self, _key: &str, _entry: opendal::Buffer) -> Result<Duration> {
+        Err(anyhow!("Cannot write to read-only storage"))
+    }
+
     /// Check the cache capability.
     ///
     /// The ReadOnlyStorage cache is always read-only.
@@ -87,8 +97,8 @@ impl Storage for ReadOnlyStorage {
     }
 
     /// Return the base directories for path normalization if configured
-    async fn basedirs(&self) -> Vec<Vec<u8>> {
-        self.0.basedirs().await
+    fn basedirs(&self) -> &[Vec<u8>] {
+        self.0.basedirs()
     }
 }
 
@@ -98,7 +108,6 @@ mod test {
 
     use super::*;
     use crate::test::mock_storage::MockStorage;
-    use crate::test::utils::*;
 
     #[test]
     fn readonly_storage_is_readonly() {
@@ -151,7 +160,7 @@ mod test {
 
         let readonly_storage = ReadOnlyStorage(std::sync::Arc::new(disk_cache));
 
-        assert_eq!(readonly_storage.basedirs().wait(), basedirs.as_slice());
+        assert_eq!(readonly_storage.basedirs(), basedirs.as_slice());
     }
 
     #[test]

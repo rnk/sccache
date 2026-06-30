@@ -156,8 +156,25 @@ impl Storage for DiskCache {
         self.size(key).await.is_ok()
     }
 
-    async fn put(&self, key: &str, source: opendal::Buffer) -> Result<Duration> {
+    async fn put(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
         trace!("DiskCache::put({key})");
+        // Delegate to put_raw after serializing the entry
+        self.put_raw(key, entry).await
+    }
+
+    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
+        trace!("DiskCache::get_raw({key})");
+        match self.file(key).await {
+            Ok(file) => Ok(Some(Bytes::from_owner(unsafe { Mmap::map(&file) }?).into())),
+            Err(err) => match err.downcast_ref::<LruError>() {
+                Some(LruError::FileNotInCache) => Ok(None),
+                _ => Err(err),
+            },
+        }
+    }
+
+    async fn put_raw(&self, key: &str, source: opendal::Buffer) -> Result<Duration> {
+        trace!("DiskCache::put_raw({key})");
 
         if self.rw_mode == CacheMode::ReadOnly {
             return Err(anyhow!("Cannot write to read-only storage"));
@@ -172,7 +189,7 @@ impl Storage for DiskCache {
             .get_or_init()?
             .prepare_add(key, 0)
             .await
-            .with_context(|| format!("[DiskCache::put({key})]"))?;
+            .with_context(|| format!("[DiskCache::put_raw({key})]"))?;
 
         // Copy source into the tempfile
         let source = futures::io::AllowStdIo::new(source.reader());
@@ -181,7 +198,7 @@ impl Storage for DiskCache {
             &mut futures::io::AllowStdIo::new(std::io::BufWriter::new(f.as_file_mut())),
         )
         .await
-        .with_context(|| format!("[DiskCache::put({key})]"))?;
+        .with_context(|| format!("[DiskCache::put_raw({key})]"))?;
 
         self.lru
             .lock()
@@ -189,7 +206,7 @@ impl Storage for DiskCache {
             .get_or_init()?
             .commit(f)
             .await
-            .with_context(|| format!("[DiskCache::put({key})]"))?;
+            .with_context(|| format!("[DiskCache::put_raw({key})]"))?;
 
         Ok(start.elapsed())
     }
@@ -217,8 +234,8 @@ impl Storage for DiskCache {
         Ok(self.lru.lock().await.get().map(|l| l.size()))
     }
 
-    async fn basedirs(&self) -> Vec<Vec<u8>> {
-        self.basedirs.clone()
+    fn basedirs(&self) -> &[Vec<u8>] {
+        &self.basedirs
     }
 
     async fn max_size(&self) -> Result<Option<u64>> {

@@ -41,6 +41,55 @@ use typed_path::Utf8TypedPathBuf;
 
 use crate::errors::*;
 
+/// Defines how the multi-level cache handles write failures.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WriteErrorPolicy {
+    /// Never fail on write errors - log warnings only (most permissive)
+    Ignore,
+    /// Fail only if L0 write fails (default - balances reliability and performance)
+    #[default]
+    L0,
+    /// Fail if any read-write level fails (most strict)
+    All,
+}
+
+impl FromStr for WriteErrorPolicy {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "ignore" => Ok(WriteErrorPolicy::Ignore),
+            "l0" => Ok(WriteErrorPolicy::L0),
+            "all" => Ok(WriteErrorPolicy::All),
+            _ => Err(anyhow!(
+                "Invalid write policy '{s}'. Valid values: ignore, l0, all"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for WriteErrorPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteErrorPolicy::Ignore => write!(f, "ignore"),
+            WriteErrorPolicy::L0 => write!(f, "l0"),
+            WriteErrorPolicy::All => write!(f, "all"),
+        }
+    }
+}
+
+/// Configuration for multi-level cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiLevelConfig {
+    /// Ordered list of cache backends (L0, L1, L2, ...)
+    #[serde(rename = "chain")]
+    pub chain: Vec<String>,
+    /// Write failure handling policy
+    #[serde(default)]
+    pub write_error_policy: WriteErrorPolicy,
+}
+
 static CACHED_CONFIG_PATH: LazyLock<PathBuf> = LazyLock::new(CachedConfig::file_config_path);
 static CACHED_CONFIG: Mutex<Option<CachedFileConfig>> = Mutex::new(None);
 
@@ -185,7 +234,7 @@ impl HTTPUrl {
     }
 }
 
-enum TieredCacheOrder {
+enum MultiLevelCacheOrder {
     Disk = 0,
     S3 = 1,
     Redis = 2,
@@ -220,7 +269,7 @@ impl Default for AzureCacheConfig {
 
 impl AzureCacheConfig {
     fn default_order() -> u64 {
-        TieredCacheOrder::Azure as u64
+        MultiLevelCacheOrder::Azure as u64
     }
 }
 
@@ -276,7 +325,7 @@ pub struct DiskCacheConfig {
 
 impl DiskCacheConfig {
     fn default_order() -> u64 {
-        TieredCacheOrder::Disk as u64
+        MultiLevelCacheOrder::Disk as u64
     }
 }
 
@@ -336,7 +385,7 @@ impl Default for GCSCacheConfig {
 
 impl GCSCacheConfig {
     fn default_order() -> u64 {
-        TieredCacheOrder::Gcs as u64
+        MultiLevelCacheOrder::Gcs as u64
     }
 }
 
@@ -364,7 +413,7 @@ impl Default for GHACacheConfig {
 
 impl GHACacheConfig {
     fn default_order() -> u64 {
-        TieredCacheOrder::Gha as u64
+        MultiLevelCacheOrder::Gha as u64
     }
 }
 
@@ -423,7 +472,7 @@ impl Default for MemcachedCacheConfig {
 
 impl MemcachedCacheConfig {
     fn default_order() -> u64 {
-        TieredCacheOrder::Memcached as u64
+        MultiLevelCacheOrder::Memcached as u64
     }
 }
 
@@ -492,7 +541,7 @@ impl Default for RedisCacheConfig {
 
 impl RedisCacheConfig {
     fn default_order() -> u64 {
-        TieredCacheOrder::Redis as u64
+        MultiLevelCacheOrder::Redis as u64
     }
 }
 
@@ -519,7 +568,7 @@ impl Default for WebdavCacheConfig {
 
 impl WebdavCacheConfig {
     fn default_order() -> u64 {
-        TieredCacheOrder::Webdav as u64
+        MultiLevelCacheOrder::Webdav as u64
     }
 }
 
@@ -550,7 +599,7 @@ impl Default for S3CacheConfig {
 
 impl S3CacheConfig {
     fn default_order() -> u64 {
-        TieredCacheOrder::S3 as u64
+        MultiLevelCacheOrder::S3 as u64
     }
 }
 
@@ -577,7 +626,7 @@ impl Default for OSSCacheConfig {
 
 impl OSSCacheConfig {
     fn default_order() -> u64 {
-        TieredCacheOrder::Oss as u64
+        MultiLevelCacheOrder::Oss as u64
     }
 }
 
@@ -602,7 +651,7 @@ impl Default for COSCacheConfig {
 
 impl COSCacheConfig {
     fn default_order() -> u64 {
-        TieredCacheOrder::Cos as u64
+        MultiLevelCacheOrder::Cos as u64
     }
 }
 
@@ -651,6 +700,23 @@ impl CacheType {
     }
 }
 
+impl From<&CacheType> for &str {
+    fn from(cache: &CacheType) -> Self {
+        match cache {
+            CacheType::Disk(_) => "disk",
+            CacheType::S3(_) => "s3",
+            CacheType::Redis(_) => "redis",
+            CacheType::Memcached(_) => "memcached",
+            CacheType::GCS(_) => "gcs",
+            CacheType::GHA(_) => "gha",
+            CacheType::Azure(_) => "azure",
+            CacheType::Webdav(_) => "webdav",
+            CacheType::OSS(_) => "oss",
+            CacheType::COS(_) => "cos",
+        }
+    }
+}
+
 impl PartialOrd for CacheType {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -676,6 +742,8 @@ pub struct CacheConfigs {
     pub webdav: Option<WebdavCacheConfig>,
     pub oss: Option<OSSCacheConfig>,
     pub cos: Option<COSCacheConfig>,
+    /// Multi-level cache configuration
+    pub multilevel: Option<MultiLevelConfig>,
 }
 
 impl CacheConfigs {
@@ -692,6 +760,7 @@ impl CacheConfigs {
             webdav,
             oss,
             cos,
+            multilevel,
         } = other;
 
         if azure.is_some() {
@@ -724,43 +793,96 @@ impl CacheConfigs {
         if cos.is_some() {
             self.cos = cos;
         }
+        if multilevel.is_some() {
+            self.multilevel = multilevel.map(|mut multilevel| {
+                for level in multilevel.chain.as_mut_slice() {
+                    *level = level.trim().to_lowercase();
+                }
+                multilevel
+            });
+        }
 
         self
     }
 }
 
 // Return a list of caches in the order determined by the user
-impl From<CacheConfigs> for Vec<CacheType> {
-    fn from(value: CacheConfigs) -> Self {
-        [
-            value.disk.map(CacheType::Disk),
-            value.azure.map(CacheType::Azure),
-            value.gcs.map(CacheType::GCS),
-            value.gha.map(CacheType::GHA),
-            value.memcached.map(CacheType::Memcached),
-            value.redis.map(CacheType::Redis),
-            value.s3.map(CacheType::S3),
-            value.webdav.map(CacheType::Webdav),
-            value.oss.map(CacheType::OSS),
+impl From<&CacheConfigs> for Result<Vec<CacheType>> {
+    fn from(caches: &CacheConfigs) -> Self {
+        let chain = caches.multilevel.as_ref().map(|multilevel| {
+            multilevel
+                .chain
+                .iter()
+                .map(|level| level.as_str())
+                .map(|level| match level {
+                    "disk" => Ok(level),
+                    "s3" => Ok(level),
+                    "redis" => Ok(level),
+                    "memcached" => Ok(level),
+                    "gcs" => Ok(level),
+                    "gha" => Ok(level),
+                    "azure" => Ok(level),
+                    "webdav" => Ok(level),
+                    "oss" => Ok(level),
+                    "cos" => Ok(level),
+                    _ => Err(anyhow!("Unknown cache level: {level:?}")),
+                })
+                .try_collect::<_, Vec<_>, _>()
+        });
+
+        if let Some(chain) = chain {
+            return chain?
+                .into_iter()
+                .map(|level| {
+                    match level {
+                        "disk" => caches.disk.clone().map(CacheType::Disk).map(Ok),
+                        "s3" => caches.s3.clone().map(CacheType::S3).map(Ok),
+                        "redis" => caches.redis.clone().map(CacheType::Redis).map(Ok),
+                        "memcached" => caches.memcached.clone().map(CacheType::Memcached).map(Ok),
+                        "gcs" => caches.gcs.clone().map(CacheType::GCS).map(Ok),
+                        "gha" => caches.gha.clone().map(CacheType::GHA).map(Ok),
+                        "azure" => caches.azure.clone().map(CacheType::Azure).map(Ok),
+                        "webdav" => caches.webdav.clone().map(CacheType::Webdav).map(Ok),
+                        "oss" => caches.oss.clone().map(CacheType::OSS).map(Ok),
+                        "cos" => caches.cos.clone().map(CacheType::COS).map(Ok),
+                        _ => Some(Err(anyhow!("Unknown cache level: {level:?}"))),
+                    }
+                    .ok_or_else(|| anyhow!("{level} cache not configured but specified in levels"))
+                })
+                .flatten_ok()
+                .try_collect();
+        }
+
+        Ok([
+            caches.disk.clone().map(CacheType::Disk),
+            caches.azure.clone().map(CacheType::Azure),
+            caches.gcs.clone().map(CacheType::GCS),
+            caches.gha.clone().map(CacheType::GHA),
+            caches.memcached.clone().map(CacheType::Memcached),
+            caches.redis.clone().map(CacheType::Redis),
+            caches.s3.clone().map(CacheType::S3),
+            caches.webdav.clone().map(CacheType::Webdav),
+            caches.oss.clone().map(CacheType::OSS),
+            caches.cos.clone().map(CacheType::COS),
         ]
         .into_iter()
         .flatten()
+        // Default sort order
         .sorted()
-        .collect::<Vec<_>>()
-    }
-}
-
-impl From<Vec<CacheType>> for CacheConfigs {
-    fn from(configs: Vec<CacheType>) -> Self {
-        configs
-            .into_iter()
-            .fold(Self::default(), |caches, cache| caches.merge(cache.into()))
+        .collect::<Vec<_>>())
     }
 }
 
 impl From<CacheType> for CacheConfigs {
     fn from(cache: CacheType) -> Self {
-        let mut caches = Self::default();
+        let mut caches = Self {
+            multilevel: Some(MultiLevelConfig {
+                chain: vec![Into::<&str>::into(&cache).into()],
+                write_error_policy: Default::default(),
+            }),
+            ..Self::default()
+        };
+
         match cache {
             CacheType::Azure(c) => caches.azure = Some(c),
             CacheType::Disk(c) => caches.disk = Some(c),
@@ -773,6 +895,7 @@ impl From<CacheType> for CacheConfigs {
             CacheType::OSS(c) => caches.oss = Some(c),
             CacheType::COS(c) => caches.cos = Some(c),
         }
+
         caches
     }
 }
@@ -1639,6 +1762,26 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
         None
     };
 
+    // Parse multi-level cache configuration
+    let multilevel = if let Ok(chain_str) = env::var("SCCACHE_MULTILEVEL_CHAIN") {
+        let chain: Vec<String> = chain_str
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .collect();
+
+        let write_error_policy = env::var("SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY")
+            .ok()
+            .and_then(|s| s.parse::<WriteErrorPolicy>().ok())
+            .unwrap_or_default();
+
+        Some(MultiLevelConfig {
+            chain,
+            write_error_policy,
+        })
+    } else {
+        None
+    };
+
     let cache = CacheConfigs {
         azure,
         disk,
@@ -1650,6 +1793,7 @@ fn config_from_env<'a>(envvar_prefix: impl Into<Option<&'a str>>) -> Result<EnvC
         webdav,
         oss,
         cos,
+        multilevel,
     };
 
     // ======= Base directory =======
@@ -1695,7 +1839,7 @@ fn config_file(env_var: &str, leaf: &str) -> PathBuf {
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Config {
-    pub caches: Vec<CacheType>,
+    pub caches: CacheConfigs,
     pub dist: DistConfig,
     pub server_startup_timeout: Option<Duration>,
     /// Base directory (or directories) to strip from paths for cache key computation.
@@ -1724,12 +1868,9 @@ impl Config {
 
         let server_startup_timeout = server_startup_timeout_ms.map(Duration::from_millis);
 
-        let caches = {
-            CacheConfigs::default()
-                .merge(file_conf.cache)
-                .merge(env_conf.cache)
-                .into()
-        };
+        let caches = CacheConfigs::default()
+            .merge(file_conf.cache)
+            .merge(env_conf.cache);
 
         // Environment variable takes precedence over file config if it is set
         let basedirs_raw = env_conf.basedirs.unwrap_or(file_conf.basedirs);
@@ -2148,8 +2289,8 @@ pub mod scheduler {
     use serde::{Deserialize, Serialize};
 
     use super::{
-        CacheConfigs, CacheType, MessageBroker, MetricsConfigs, config_from_env,
-        number_from_env_var, try_read_config_file,
+        CacheConfigs, MessageBroker, MetricsConfigs, config_from_env, number_from_env_var,
+        try_read_config_file,
     };
 
     #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -2573,7 +2714,7 @@ pub mod scheduler {
         pub client_auth: Vec<ClientAuth>,
         pub heartbeat_interval_ms: u64,
         pub job_time_limit: u32,
-        pub jobs: Vec<CacheType>,
+        pub jobs: CacheConfigs,
         pub keepalive: DistNetworkingKeepalive,
         pub max_body_size: usize,
         pub max_concurrent_streams: Option<u32>,
@@ -2582,7 +2723,7 @@ pub mod scheduler {
         pub public_addr: SocketAddr,
         pub scheduler_id: String,
         pub shutdown_timeout: u64,
-        pub toolchains: Vec<CacheType>,
+        pub toolchains: CacheConfigs,
     }
 
     impl Default for Config {
@@ -2719,7 +2860,7 @@ pub mod scheduler {
                 client_auth,
                 heartbeat_interval_ms,
                 job_time_limit,
-                jobs: jobs.into(),
+                jobs,
                 keepalive: keepalive.with_env_or_config(),
                 max_body_size,
                 max_concurrent_streams,
@@ -2728,7 +2869,7 @@ pub mod scheduler {
                 public_addr,
                 scheduler_id,
                 shutdown_timeout,
-                toolchains: toolchains.into(),
+                toolchains,
             })
         }
 
@@ -2743,7 +2884,7 @@ pub mod scheduler {
                 client_auth: Some(scheduler_config.client_auth),
                 heartbeat_interval_ms: scheduler_config.heartbeat_interval_ms,
                 job_time_limit: scheduler_config.job_time_limit,
-                jobs: scheduler_config.jobs.into(),
+                jobs: scheduler_config.jobs,
                 keepalive: scheduler_config.keepalive,
                 max_body_size: scheduler_config.max_body_size,
                 max_concurrent_streams: scheduler_config.max_concurrent_streams,
@@ -2752,7 +2893,7 @@ pub mod scheduler {
                 public_addr: scheduler_config.public_addr,
                 scheduler_id: scheduler_config.scheduler_id,
                 shutdown_timeout: scheduler_config.shutdown_timeout,
-                toolchains: scheduler_config.toolchains.into(),
+                toolchains: scheduler_config.toolchains,
             }
         }
     }
@@ -2765,7 +2906,7 @@ pub mod scheduler {
                     .unwrap_or_else(|| vec![ClientAuth::Insecure]),
                 heartbeat_interval_ms: scheduler_config.heartbeat_interval_ms,
                 job_time_limit: scheduler_config.job_time_limit,
-                jobs: scheduler_config.jobs.into(),
+                jobs: scheduler_config.jobs,
                 keepalive: scheduler_config.keepalive,
                 max_body_size: scheduler_config.max_body_size,
                 max_concurrent_streams: scheduler_config.max_concurrent_streams,
@@ -2774,7 +2915,7 @@ pub mod scheduler {
                 public_addr: scheduler_config.public_addr,
                 scheduler_id: scheduler_config.scheduler_id,
                 shutdown_timeout: scheduler_config.shutdown_timeout,
-                toolchains: scheduler_config.toolchains.into(),
+                toolchains: scheduler_config.toolchains,
             }
         }
     }
@@ -2783,8 +2924,8 @@ pub mod scheduler {
 #[cfg(feature = "dist-server")]
 pub mod server {
     use super::{
-        CacheConfigs, CacheType, MessageBroker, MetricsConfigs, PrometheusMetricsConfig,
-        config_from_env, default_disk_cache_dir, number_from_env_var, try_read_config_file,
+        CacheConfigs, MessageBroker, MetricsConfigs, PrometheusMetricsConfig, config_from_env,
+        default_disk_cache_dir, number_from_env_var, try_read_config_file,
     };
     use serde::{Deserialize, Serialize};
     use std::{env, net::SocketAddr, path::PathBuf, str::FromStr};
@@ -2971,7 +3112,7 @@ pub mod server {
         pub cache_dir: PathBuf,
         pub health_check_bind_addr: Option<SocketAddr>,
         pub heartbeat_interval_ms: u64,
-        pub jobs: Vec<CacheType>,
+        pub jobs: CacheConfigs,
         pub max_per_core_load: f64,
         pub max_per_core_prefetch: f64,
         pub message_broker: Option<MessageBroker>,
@@ -2979,7 +3120,7 @@ pub mod server {
         pub server_id: String,
         pub shutdown_timeout: u64,
         pub toolchain_cache_size: u64,
-        pub toolchains: Vec<CacheType>,
+        pub toolchains: CacheConfigs,
     }
 
     impl Default for Config {
@@ -3099,7 +3240,7 @@ pub mod server {
                 cache_dir,
                 health_check_bind_addr,
                 heartbeat_interval_ms,
-                jobs: jobs.into(),
+                jobs,
                 max_per_core_load,
                 max_per_core_prefetch,
                 message_broker,
@@ -3107,7 +3248,7 @@ pub mod server {
                 server_id,
                 shutdown_timeout,
                 toolchain_cache_size,
-                toolchains: toolchains.into(),
+                toolchains,
             })
         }
 
@@ -3123,7 +3264,7 @@ pub mod server {
                 cache_dir: server_config.cache_dir,
                 health_check_bind_addr: server_config.health_check_bind_addr,
                 heartbeat_interval_ms: server_config.heartbeat_interval_ms,
-                jobs: server_config.jobs.into(),
+                jobs: server_config.jobs,
                 max_per_core_load: server_config.max_per_core_load,
                 max_per_core_prefetch: server_config.max_per_core_prefetch,
                 message_broker: server_config.message_broker,
@@ -3131,7 +3272,7 @@ pub mod server {
                 server_id: server_config.server_id,
                 shutdown_timeout: server_config.shutdown_timeout,
                 toolchain_cache_size: server_config.toolchain_cache_size,
-                toolchains: server_config.toolchains.into(),
+                toolchains: server_config.toolchains,
             }
         }
     }
@@ -3143,7 +3284,7 @@ pub mod server {
                 cache_dir: server_config.cache_dir,
                 health_check_bind_addr: server_config.health_check_bind_addr,
                 heartbeat_interval_ms: server_config.heartbeat_interval_ms,
-                jobs: server_config.jobs.into(),
+                jobs: server_config.jobs,
                 max_per_core_load: server_config.max_per_core_load,
                 max_per_core_prefetch: server_config.max_per_core_prefetch,
                 message_broker: server_config.message_broker,
@@ -3151,7 +3292,7 @@ pub mod server {
                 server_id: server_config.server_id,
                 shutdown_timeout: server_config.shutdown_timeout,
                 toolchain_cache_size: server_config.toolchain_cache_size,
-                toolchains: server_config.toolchains.into(),
+                toolchains: server_config.toolchains,
             }
         }
     }
@@ -3259,14 +3400,14 @@ fn config_overrides() {
     assert_eq!(
         Config::from_env_and_file_configs(env_conf, file_conf).unwrap(),
         Config {
-            caches: vec![
-                CacheType::Disk(DiskCacheConfig {
+            caches: CacheConfigs {
+                disk: Some(DiskCacheConfig {
                     dir: "/env-cache".into(),
                     size: 5,
                     rw_mode: CacheModeConfig::ReadWrite,
                     ..Default::default()
                 }),
-                CacheType::Redis(RedisCacheConfig {
+                redis: Some(RedisCacheConfig {
                     endpoint: Some("myotherredisurl".to_owned()),
                     ttl: 24 * 3600,
                     key_prefix: "/redis/prefix".into(),
@@ -3275,19 +3416,20 @@ fn config_overrides() {
                     password: Some("secret".to_owned()),
                     ..Default::default()
                 }),
-                CacheType::Memcached(MemcachedCacheConfig {
+                memcached: Some(MemcachedCacheConfig {
                     url: "memurl".to_owned(),
                     expiration: 24 * 3600,
                     key_prefix: String::new(),
                     ..Default::default()
                 }),
-                CacheType::Azure(AzureCacheConfig {
+                azure: Some(AzureCacheConfig {
                     connection_string: String::new(),
                     container: String::new(),
                     key_prefix: String::new(),
                     ..Default::default()
                 }),
-            ],
+                ..Default::default()
+            },
             basedirs: vec![],
             ..Default::default()
         }
@@ -4007,6 +4149,7 @@ key_prefix = "cosprefix"
                     key_prefix: "cosprefix".into(),
                     ..Default::default()
                 }),
+                multilevel: None,
             },
             dist: DistConfig {
                 auth: DistAuth::Token {
@@ -4523,4 +4666,110 @@ fn test_integration_env_variable_to_strip() {
     let input2 = b"# 1 \"/tmp/build/obj/file.o\"";
     let output2 = strip_basedirs(input2, &config.basedirs);
     assert_eq!(&*output2, b"# 1 \"obj/file.o\"");
+}
+
+#[test]
+fn test_cache_levels_parsing() {
+    // Test parsing cache levels from config
+    let config_str = r#"
+[cache.disk]
+dir = "/tmp/disk"
+size = 1024
+
+[cache.s3]
+bucket = "my-bucket"
+region = "us-west-2"
+no_credentials = false
+
+[cache.redis]
+endpoint = "redis://localhost"
+
+[cache.multilevel]
+chain = ["disk", "redis", "s3"]
+"#;
+
+    let file_config: FileConfig = toml::from_str(config_str).expect("Is valid toml");
+    assert!(file_config.cache.multilevel.is_some());
+    let ml_config = file_config.cache.multilevel.unwrap();
+    assert_eq!(ml_config.chain.len(), 3);
+    assert_eq!(ml_config.chain[0], "disk");
+    assert_eq!(ml_config.chain[1], "redis");
+    assert_eq!(ml_config.chain[2], "s3");
+}
+
+#[test]
+fn test_cache_levels_backward_compatibility() {
+    // Test that configs without levels still work (single cache selection)
+    let config_str = r#"
+[cache.s3]
+bucket = "my-bucket"
+region = "us-west-2"
+no_credentials = false
+"#;
+
+    let file_config: FileConfig = toml::from_str(config_str).expect("Is valid toml");
+    assert!(file_config.cache.multilevel.is_none());
+    assert!(file_config.cache.s3.is_some());
+}
+
+#[test]
+fn test_get_cache_levels_single_cache() {
+    let configs = &CacheConfigs {
+        s3: Some(S3CacheConfig {
+            bucket: "test".to_string(),
+            region: None,
+            key_prefix: String::new(),
+            no_credentials: false,
+            endpoint: None,
+            use_ssl: None,
+            server_side_encryption: None,
+            enable_virtual_host_style: None,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let levels: Result<Vec<CacheType>> = configs.into();
+    let levels = levels.expect("Should get single cache");
+    assert_eq!(levels.len(), 1);
+}
+
+#[test]
+fn test_get_cache_levels_invalid_level() {
+    let configs = &CacheConfigs {
+        multilevel: Some(MultiLevelConfig {
+            chain: vec!["unknown_cache".to_string()],
+            write_error_policy: WriteErrorPolicy::default(),
+        }),
+        ..Default::default()
+    };
+
+    let result: Result<Vec<CacheType>> = configs.into();
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown cache level")
+    );
+}
+
+#[test]
+fn test_get_cache_levels_missing_config() {
+    let configs = &CacheConfigs {
+        multilevel: Some(MultiLevelConfig {
+            chain: vec!["s3".to_string()],
+            write_error_policy: WriteErrorPolicy::default(),
+        }),
+        ..Default::default()
+    };
+
+    let result: Result<Vec<CacheType>> = configs.into();
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("s3 cache not configured")
+    );
 }

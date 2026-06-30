@@ -739,10 +739,10 @@ where
                 };
 
                 let (hash_key, outputs, cacheable, dist_type, mut output) = compile?;
-                let basedirs = compilations_storage.basedirs().await;
+                let basedirs = compilations_storage.basedirs();
 
-                output.stdout = strip_basedirs(&output.stdout, &basedirs).into_owned();
-                output.stderr = strip_basedirs(&output.stderr, &basedirs).into_owned();
+                output.stdout = strip_basedirs(&output.stdout, basedirs).into_owned();
+                output.stderr = strip_basedirs(&output.stderr, basedirs).into_owned();
 
                 if !output.success() {
                     trace!(

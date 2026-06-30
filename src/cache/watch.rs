@@ -25,6 +25,8 @@ use crate::{
 };
 
 pub struct WatchStorage {
+    basedirs: Vec<Vec<u8>>,
+    cache_type_name: &'static str,
     storage: Arc<futures::lock::Mutex<Arc<dyn Storage>>>,
     preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
     #[allow(dead_code)]
@@ -42,10 +44,14 @@ impl WatchStorage {
             trace!("No paths to watch, returning storage");
             return Ok(storage);
         }
+        let basedirs = storage.basedirs().to_vec();
+        let cache_type_name = storage.cache_type_name();
         let preprocessor_cache_mode_config = storage.preprocessor_cache_mode_config();
         let storage = Arc::new(futures::lock::Mutex::new(storage));
         let watcher = Self::watch(create, storage.clone(), paths)?;
         Ok(Arc::new(Self {
+            basedirs,
+            cache_type_name,
             preprocessor_cache_mode_config,
             storage,
             watcher,
@@ -201,7 +207,7 @@ impl WatchStorage {
 
     async fn inner(&self) -> Arc<dyn Storage> {
         // clone() so the lock is dropped immediately, otherwise concurrent
-        // operations are serialized until until their Future completes.
+        // operations are serialized until their Future completes.
         self.storage.lock().await.clone()
     }
 }
@@ -228,6 +234,14 @@ impl Storage for WatchStorage {
         self.inner().await.size(key).await
     }
 
+    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
+        self.inner().await.get_raw(key).await
+    }
+
+    async fn put_raw(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
+        self.inner().await.put_raw(key, entry).await
+    }
+
     /// Check the cache capability.
     async fn check(&self) -> Result<CacheMode> {
         self.inner().await.check().await
@@ -236,6 +250,12 @@ impl Storage for WatchStorage {
     /// Get the storage location.
     async fn location(&self) -> String {
         self.inner().await.location().await
+    }
+
+    /// Get the cache backend type name (e.g., "disk", "redis", "s3").
+    /// Used for statistics and display purposes.
+    fn cache_type_name(&self) -> &'static str {
+        self.cache_type_name
     }
 
     /// Get the current storage usage, if applicable.
@@ -253,7 +273,7 @@ impl Storage for WatchStorage {
         self.preprocessor_cache_mode_config.clone()
     }
 
-    async fn basedirs(&self) -> Vec<Vec<u8>> {
-        self.inner().await.basedirs().await
+    fn basedirs(&self) -> &[Vec<u8>] {
+        &self.basedirs
     }
 }

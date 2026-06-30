@@ -655,7 +655,7 @@ where
             cwd,
             &parsed_args.input,
             compiler.plusplus(),
-            storage.basedirs().await,
+            storage.basedirs(),
         )
         .await?
         .filter(|_| !matches!(cache_control, CacheControl::ForceNoCache));
@@ -738,7 +738,7 @@ where
             ..
         } = self.as_ref();
 
-        let basedirs = storage.basedirs().await;
+        let basedirs = storage.basedirs();
 
         // A compiler binary may be a symlink to another and so has the same digest, but that means
         // the toolchain will not contain the correct path to invoke the compiler! Add the compiler
@@ -825,7 +825,7 @@ where
             .with_cwd(&cwd)
             .with_exe(executable)
             .with_env_vars(&env_vars)
-            .with_basedirs(&basedirs)
+            .with_basedirs(basedirs)
             .with_extra_hashes(&extra_hashes)
             .with_executable_digest(executable_digest)
             .rewrite_includes_only(rewrite_includes_only)
@@ -2204,7 +2204,7 @@ impl<'a> HashKeyParams<'a> {
 mod test {
     use crate::{
         cache::StorageKind,
-        config::{CacheModeConfig, CacheType, Config, DiskCacheConfig},
+        config::{CacheConfigs, CacheModeConfig, Config, DiskCacheConfig},
         test::utils::*,
     };
 
@@ -2679,11 +2679,14 @@ mod test {
         fs::create_dir(&cache_dir).unwrap();
 
         let make_config = |rw_mode| Config {
-            caches: vec![CacheType::Disk(DiskCacheConfig {
-                dir: cache_dir.clone(),
-                rw_mode,
-                ..DiskCacheConfig::default()
-            })],
+            caches: CacheConfigs {
+                disk: Some(DiskCacheConfig {
+                    dir: cache_dir.clone(),
+                    rw_mode,
+                    ..DiskCacheConfig::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
 

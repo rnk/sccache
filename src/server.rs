@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.SCCACHE_MAX_FRAME_LENGTH
 
+use crate::cache::multilevel::MultiLevelStats;
 use crate::cache::{Storage, StorageKind};
 use crate::compiler::{
     CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
@@ -2005,6 +2006,10 @@ pub struct ServerStats {
     pub dist_errors: u64,
     /// The count of sccache fatal errors (per language).
     pub fatal_errors: PerLanguageCount,
+    /// Multi-level cache statistics (if multi-level caching is enabled)
+    pub cache_multi_level: Option<MultiLevelStats>,
+    /// Multi-level preprocessor cache statistics (if multi-level caching is enabled)
+    pub preprocessor_multi_level: Option<MultiLevelStats>,
 }
 
 /// Info and stats about the server.
@@ -2068,6 +2073,8 @@ impl Default for ServerStats {
             dist_compiles: HashMap::new(),
             dist_errors: u64::default(),
             fatal_errors: PerLanguageCount::new(),
+            cache_multi_level: None,
+            preprocessor_multi_level: None,
         }
     }
 }
@@ -2271,17 +2278,51 @@ impl ServerStats {
             self.dist_errors,
             "Failed distributed compilations"
         );
-        let name_width = stats_vec.iter().map(|(n, _, _)| n.len()).max().unwrap();
-        let stat_width = stats_vec.iter().map(|(_, s, _)| s.len()).max().unwrap();
-        for (name, stat, suffix_len) in stats_vec {
-            writer.write(&format!(
-                "{:<name_width$} {:>stat_width$}",
-                name,
-                stat,
-                name_width = name_width,
-                stat_width = stat_width + suffix_len
-            ));
+
+        let mut name_width: usize = 0;
+        let mut stat_width: usize = 0;
+
+        macro_rules! write_stats_vec {
+            ($vec:ident) => {{
+                name_width = name_width.max($vec.iter().map(|(n, _, _)| n.len()).max().unwrap());
+                stat_width = stat_width.max($vec.iter().map(|(_, s, _)| s.len()).max().unwrap());
+                for (name, stat, suffix_len) in $vec.drain(..) {
+                    writer.write(&format!(
+                        "{:<name_width$} {:>stat_width$}",
+                        name,
+                        stat,
+                        name_width = name_width,
+                        stat_width = stat_width + suffix_len
+                    ));
+                }
+            }};
         }
+
+        write_stats_vec!(stats_vec);
+
+        // Add multi-level cache statistics if available
+        if let Some(ref ml_stats) = self.cache_multi_level {
+            let mut stats_vec = vec![];
+            for (name, value, suffix_type) in ml_stats.format_stats() {
+                stats_vec.push((name, value, suffix_type));
+            }
+            write_stats_vec!(stats_vec);
+        }
+
+        if let Some(ref ml_stats) = self.preprocessor_multi_level {
+            let mut stats_vec = vec![];
+            let ml_stats = ml_stats.format_stats();
+            for (idx, (name, value, suffix_type)) in ml_stats.iter().enumerate() {
+                let name = if idx == 0 {
+                    "Multi-level preprocessor cache levels"
+                } else {
+                    name.as_str()
+                };
+                stats_vec.push((name, value, suffix_type));
+            }
+            write_stats_vec!(stats_vec);
+        }
+
         // Compare values. If equal, compare keys to have a fully deterministic order.
         let sort_func =
             |(k1, v1): &(&String, &usize), (k2, v2): &(&String, &usize)| match v1.cmp(v2).reverse()
@@ -2404,18 +2445,25 @@ impl ServerInfo {
         storage: Option<&dyn Storage>,
         preprocessor_storage: Option<&dyn Storage>,
     ) -> Result<Self> {
+        use crate::cache::multilevel::MultiLevelStats;
         async fn storage_info(
             storage: Option<&dyn Storage>,
-        ) -> (Option<u64>, Option<u64>, String, Vec<String>) {
+        ) -> (
+            Option<u64>,
+            Option<u64>,
+            String,
+            Option<MultiLevelStats>,
+            Vec<String>,
+        ) {
             storage
                 .map(|s| {
-                    futures::future::try_join4(
+                    futures::future::try_join5(
                         s.current_size(),
                         s.max_size(),
                         async { Ok(s.location().await) },
+                        async { Ok(s.multilevel_stats()) },
                         async {
                             Ok(s.basedirs()
-                                .await
                                 .iter()
                                 .map(|p| String::from_utf8_lossy(p).to_string())
                                 .collect())
@@ -2423,14 +2471,20 @@ impl ServerInfo {
                     )
                     .boxed()
                 })
-                .unwrap_or_else(|| async { Ok((None, None, String::new(), vec![])) }.boxed())
+                .unwrap_or_else(|| async { Ok((None, None, String::new(), None, vec![])) }.boxed())
                 .await
-                .unwrap_or_else(|_| (None, None, String::new(), vec![]))
+                .unwrap_or_else(|_| (None, None, String::new(), None, vec![]))
         }
 
-        let (cache_size, max_cache_size, cache_location, basedirs) = storage_info(storage).await;
-        let (preprocessor_cache_size, preprocessor_max_cache_size, preprocessor_cache_location, _) =
-            storage_info(preprocessor_storage).await;
+        let (cache_size, max_cache_size, cache_location, cache_multi_level, basedirs) =
+            storage_info(storage).await;
+        let (
+            preprocessor_cache_size,
+            preprocessor_max_cache_size,
+            preprocessor_cache_location,
+            preprocessor_multi_level,
+            _,
+        ) = storage_info(preprocessor_storage).await;
 
         let use_preprocessor_cache_mode = preprocessor_storage
             .map(|s| {
@@ -2441,7 +2495,11 @@ impl ServerInfo {
 
         let version = env!("CARGO_PKG_VERSION").to_string();
         Ok(ServerInfo {
-            stats,
+            stats: ServerStats {
+                cache_multi_level,
+                preprocessor_multi_level,
+                ..stats
+            },
             cache_location,
             cache_size,
             max_cache_size,
@@ -2461,23 +2519,23 @@ impl ServerInfo {
             advanced,
             self.use_preprocessor_cache_mode,
         );
-        for (i, cache_location) in self.cache_location.split("\n").enumerate() {
-            if i == 0 {
+        println!(
+            "{:<name_width$} {}",
+            "Cache location:",
+            self.cache_location,
+            name_width = name_width
+        );
+        if let Some(ref ml_stats) = self.stats.cache_multi_level {
+            for level in &ml_stats.0 {
                 println!(
                     "{:<name_width$} {}",
-                    "Cache location",
-                    cache_location,
-                    name_width = name_width
-                );
-            } else {
-                println!(
-                    "{:<name_width$} {}",
-                    "              ",
-                    cache_location,
+                    format!("  {}", level.name),
+                    level.location,
                     name_width = name_width
                 );
             }
         }
+
         println!(
             "{:<name_width$} {}",
             "Use direct/preprocessor mode?",
@@ -2488,6 +2546,25 @@ impl ServerInfo {
             },
             name_width = name_width
         );
+
+        if self.use_preprocessor_cache_mode {
+            println!(
+                "{:<name_width$} {}",
+                "Preprocessor cache location:",
+                self.preprocessor_cache_location,
+                name_width = name_width
+            );
+            if let Some(ref ml_stats) = self.stats.preprocessor_multi_level {
+                for level in &ml_stats.0 {
+                    println!(
+                        "{:<name_width$} {}",
+                        format!("  {}", level.name),
+                        level.location,
+                        name_width = name_width
+                    );
+                }
+            }
+        }
         println!(
             "{:<name_width$} {}",
             "Base directories",
@@ -2498,28 +2575,6 @@ impl ServerInfo {
             },
             name_width = name_width
         );
-
-        if self.use_preprocessor_cache_mode {
-            for (i, preprocessor_cache_location) in
-                self.preprocessor_cache_location.split("\n").enumerate()
-            {
-                if i == 0 {
-                    println!(
-                        "{:<name_width$} {}",
-                        "Preprocessor cache location",
-                        preprocessor_cache_location,
-                        name_width = name_width
-                    );
-                } else {
-                    println!(
-                        "{:<name_width$} {}",
-                        "              ",
-                        preprocessor_cache_location,
-                        name_width = name_width
-                    );
-                }
-            }
-        }
         println!(
             "{:<name_width$} {}",
             "Version (client)",
