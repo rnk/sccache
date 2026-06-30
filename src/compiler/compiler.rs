@@ -694,7 +694,10 @@ where
 
         if let Err(e) = hash_result {
             return match e.downcast::<ProcessError>() {
-                Ok(ProcessError(output)) => Ok((CompileResult::Error(start.elapsed()), output)),
+                Ok(ProcessError(output)) => {
+                    debug!("[{out_pretty}]: process error: {output:?}");
+                    Ok((CompileResult::Error(start.elapsed()), output))
+                }
                 Err(e) => Err(e),
             };
         }
