@@ -14,7 +14,10 @@ use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{errors::*, util};
+use crate::{
+    errors::*,
+    util::{self, new_client_runtime},
+};
 
 // These (arbitrary) ports need to be registered as valid redirect urls in the oauth provider you're using
 pub const VALID_PORTS: &[u16] = &[12731, 32492, 56909];
@@ -519,13 +522,7 @@ pub fn get_token_oauth2_code_grant_pkce(
     mut auth_url: Url,
     token_url: &str,
 ) -> Result<String> {
-    // We don't need a multi-threaded runtime here: with the default tokio
-    // runtime every client spawns its own NUM_THREADS worker threads, so on a
-    // 96-core server running 96 clients we would get 96 x 96 = 9216
-    // short-lived threads instead of a single one per client.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = new_client_runtime()?;
     let mut server = runtime.block_on(async move { try_bind().await })?;
     let port = server.local_addr().port();
 
@@ -573,9 +570,7 @@ pub fn get_token_oauth2_code_grant_pkce(
 
 // https://auth0.com/docs/api-auth/tutorials/implicit-grant
 pub fn get_token_oauth2_implicit(client_id: &str, mut auth_url: Url) -> Result<String> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = new_client_runtime()?;
     let mut server = runtime.block_on(async move { try_bind().await })?;
     let port = server.local_addr().port();
     let _guard = runtime.enter();

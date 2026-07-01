@@ -23,7 +23,7 @@ use crate::{
     mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand},
     protocol::{Compile, CompileFinished, CompileResponse, Request, Response},
     server::{self, DistInfo, ServerInfo, ServerStartup, ServerStats},
-    util::daemonize,
+    util::{daemonize, new_client_runtime},
 };
 use byteorder::{BigEndian, ByteOrder};
 use fs::{File, OpenOptions};
@@ -92,9 +92,7 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
     trace!("run_server_process");
     let tempdir = crate::util::temp_dir()?;
     let socket_path = tempdir.path().join("sock");
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = new_client_runtime()?;
     let exe_path = env::current_exe()?;
     let workdir = exe_path.parent().expect("executable path has no parent?!");
 
@@ -199,9 +197,7 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
     trace!("run_server_process");
 
     // Create a mini event loop and register our named pipe server
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = new_client_runtime()?;
     let pipe_name = &format!(r"\\.\pipe\{}", Uuid::new_v4().as_simple());
 
     // Spawn a server which should come back and connect to us
@@ -663,9 +659,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 // If there is no server, spawning a new server would start with zero stats
                 // anyways, so we can just return (mostly) empty stats directly.
                 Err(_) => {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
+                    let runtime = new_client_runtime()?;
                     runtime.block_on(async {
                         let (compilations_storage, preprocessor_storage) = tokio::try_join!(
                             StorageKind::Compilations.create(&config.caches, &config.basedirs),
@@ -837,9 +831,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             use crate::dist::Toolchain;
 
             trace!("Command::PackageToolchain({})", executable.display());
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+            let runtime = new_client_runtime()?;
             let jobserver = Client::new();
             let creator = ProcessCommandCreator::new(&jobserver);
             let args: Vec<_> = env::args_os().collect();
@@ -901,9 +893,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
 
             let jobserver = Client::new_num(1);
             let conn = connect_or_start_server(&get_addr(), config.server_startup_timeout)?;
-            let mut runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+            let mut runtime = new_client_runtime()?;
             let res = do_compile(
                 ProcessCommandCreator::new(&jobserver),
                 &mut runtime,
