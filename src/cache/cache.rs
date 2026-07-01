@@ -487,6 +487,82 @@ struct StorageBuilder {
 }
 
 impl StorageBuilder {
+    pub fn from_config(
+        storage_kind: StorageKind,
+        basedirs: Vec<Vec<u8>>,
+        cache_type: CacheType,
+    ) -> Result<StorageBuilder> {
+        #[allow(unreachable_patterns)]
+        match cache_type {
+            CacheType::Azure(cfg) => {
+                if cfg!(feature = "azure") {
+                    Ok((storage_kind, basedirs, cfg).into())
+                } else {
+                    bail!("The 'azure' feature must be enabled to use the Azure storage backend")
+                }
+            }
+            CacheType::GCS(cfg) => {
+                if cfg!(feature = "gcs") {
+                    Ok((storage_kind, basedirs, cfg).into())
+                } else {
+                    bail!("The 'gcs' feature must be enabled to use the GCS storage backend")
+                }
+            }
+            CacheType::GHA(cfg) => {
+                if cfg!(feature = "gha") {
+                    Ok((storage_kind, basedirs, cfg).into())
+                } else {
+                    bail!("The 'gha' feature must be enabled to use the GHA storage backend")
+                }
+            }
+            CacheType::Memcached(cfg) => {
+                if cfg!(feature = "memcached") {
+                    Ok((storage_kind, basedirs, cfg).into())
+                } else {
+                    bail!(
+                        "The 'memcached' feature must be enabled to use the Memcached storage backend"
+                    )
+                }
+            }
+            CacheType::Redis(cfg) => {
+                if cfg!(feature = "redis") {
+                    Ok((storage_kind, basedirs, cfg).into())
+                } else {
+                    bail!("The 'redis' feature must be enabled to use the Redis storage backend")
+                }
+            }
+            CacheType::S3(cfg) => {
+                if cfg!(feature = "s3") {
+                    Ok((storage_kind, basedirs, cfg).into())
+                } else {
+                    bail!("The 's3' feature must be enabled to use the S3 storage backend")
+                }
+            }
+            CacheType::Webdav(cfg) => {
+                if cfg!(feature = "webdav") {
+                    Ok((storage_kind, basedirs, cfg).into())
+                } else {
+                    bail!("The 'webdav' feature must be enabled to use the Webdav storage backend")
+                }
+            }
+            CacheType::OSS(cfg) => {
+                if cfg!(feature = "oss") {
+                    Ok((storage_kind, basedirs, cfg).into())
+                } else {
+                    bail!("The 'oss' feature must be enabled to use the OSS storage backend")
+                }
+            }
+            CacheType::COS(cfg) => {
+                if cfg!(feature = "cos") {
+                    Ok((storage_kind, basedirs, cfg).into())
+                } else {
+                    bail!("The 'cos' feature must be enabled to use the COS storage backend")
+                }
+            }
+            CacheType::Disk(cfg) => Ok((storage_kind, basedirs, cfg).into()),
+            _ => Ok(StorageBuilder::default()),
+        }
+    }
     pub fn create_storage<F: Fn() -> Result<Arc<dyn Storage>> + Send + 'static>(
         self,
         factory: F,
@@ -976,34 +1052,6 @@ impl From<(StorageKind, Vec<Vec<u8>>, COSCacheConfig)> for StorageBuilder {
     }
 }
 
-impl From<(StorageKind, Vec<Vec<u8>>, CacheType)> for StorageBuilder {
-    fn from((storage_kind, basedirs, cache_type): (StorageKind, Vec<Vec<u8>>, CacheType)) -> Self {
-        #[allow(unreachable_patterns)]
-        match cache_type {
-            #[cfg(feature = "azure")]
-            CacheType::Azure(cfg) => (storage_kind, basedirs, cfg).into(),
-            #[cfg(feature = "gcs")]
-            CacheType::GCS(cfg) => (storage_kind, basedirs, cfg).into(),
-            #[cfg(feature = "gha")]
-            CacheType::GHA(cfg) => (storage_kind, basedirs, cfg).into(),
-            #[cfg(feature = "memcached")]
-            CacheType::Memcached(cfg) => (storage_kind, basedirs, cfg).into(),
-            #[cfg(feature = "redis")]
-            CacheType::Redis(cfg) => (storage_kind, basedirs, cfg).into(),
-            #[cfg(feature = "s3")]
-            CacheType::S3(cfg) => (storage_kind, basedirs, cfg).into(),
-            #[cfg(feature = "webdav")]
-            CacheType::Webdav(cfg) => (storage_kind, basedirs, cfg).into(),
-            #[cfg(feature = "oss")]
-            CacheType::OSS(cfg) => (storage_kind, basedirs, cfg).into(),
-            #[cfg(feature = "cos")]
-            CacheType::COS(cfg) => (storage_kind, basedirs, cfg).into(),
-            CacheType::Disk(cfg) => (storage_kind, basedirs, cfg).into(),
-            _ => Self::default(),
-        }
-    }
-}
-
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum StorageKind {
     Compilations,
@@ -1066,7 +1114,7 @@ impl StorageKind {
                             "Cache level '{level}' specified in SCCACHE_MULTILEVEL_CHAIN but not configured (missing environment variables)"
                         ))
                     }
-                    Ok(StorageBuilder::from((kind, basedirs.to_vec(), cache.clone())))
+                    StorageBuilder::from_config(kind, basedirs.to_vec(), cache.clone())
                 }),
         )
         .and_then(|builder| builder.build().boxed())
