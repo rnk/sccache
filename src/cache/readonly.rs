@@ -54,16 +54,6 @@ impl Storage for ReadOnlyStorage {
         self.0.size(key).await
     }
 
-    /// Get raw serialized cache entry bytes (forwarded to inner storage)
-    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
-        self.0.get_raw(key).await
-    }
-
-    /// Put raw serialized cache entry bytes under `key` (for multi-level backfill).
-    async fn put_raw(&self, _key: &str, _entry: opendal::Buffer) -> Result<Duration> {
-        Err(anyhow!("Cannot write to read-only storage"))
-    }
-
     /// Check the cache capability.
     ///
     /// The ReadOnlyStorage cache is always read-only.

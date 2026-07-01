@@ -234,14 +234,6 @@ impl Storage for WatchStorage {
         self.inner().await.size(key).await
     }
 
-    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
-        self.inner().await.get_raw(key).await
-    }
-
-    async fn put_raw(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
-        self.inner().await.put_raw(key, entry).await
-    }
-
     /// Check the cache capability.
     async fn check(&self) -> Result<CacheMode> {
         self.inner().await.check().await

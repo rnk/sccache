@@ -156,36 +156,8 @@ impl Storage for DiskCache {
         self.size(key).await.is_ok()
     }
 
-    async fn put(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
+    async fn put(&self, key: &str, data: opendal::Buffer) -> Result<Duration> {
         trace!("DiskCache::put({key})");
-        // Delegate to put_raw after serializing the entry
-        self.put_raw(key, entry).await
-    }
-
-    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
-        trace!("DiskCache::get_raw({key})");
-        match self.file(key).await {
-            Ok(file) => Ok(Some(Bytes::from_owner(unsafe { Mmap::map(&file) }?).into())),
-            Err(err) => match err.downcast_ref::<LruError>() {
-                Some(LruError::FileNotInCache) => Ok(None),
-                _ => Err(err),
-            },
-        }
-    }
-
-    async fn get_path(&self, key: &str) -> GetPathResult {
-        self.lru
-            .lock()
-            .await
-            .get_or_init()
-            .ok()
-            .and_then(|lru| lru.get_abs_path(key))
-            .map_or_else(|| GetPathResult::Miss, GetPathResult::Found)
-    }
-
-    async fn put_raw(&self, key: &str, source: opendal::Buffer) -> Result<Duration> {
-        trace!("DiskCache::put_raw({key})");
-
         if self.rw_mode == CacheMode::ReadOnly {
             return Err(anyhow!("Cannot write to read-only storage"));
         }
@@ -199,16 +171,16 @@ impl Storage for DiskCache {
             .get_or_init()?
             .prepare_add(key, 0)
             .await
-            .with_context(|| format!("[DiskCache::put_raw({key})]"))?;
+            .with_context(|| format!("[DiskCache::put({key})]"))?;
 
         // Copy source into the tempfile
-        let source = futures::io::AllowStdIo::new(source.reader());
+        let source = futures::io::AllowStdIo::new(data.reader());
         futures::io::copy_buf(
             source,
             &mut futures::io::AllowStdIo::new(std::io::BufWriter::new(f.as_file_mut())),
         )
         .await
-        .with_context(|| format!("[DiskCache::put_raw({key})]"))?;
+        .with_context(|| format!("[DiskCache::put({key})]"))?;
 
         self.lru
             .lock()
@@ -216,9 +188,19 @@ impl Storage for DiskCache {
             .get_or_init()?
             .commit(f)
             .await
-            .with_context(|| format!("[DiskCache::put_raw({key})]"))?;
+            .with_context(|| format!("[DiskCache::put({key})]"))?;
 
         Ok(start.elapsed())
+    }
+
+    async fn get_path(&self, key: &str) -> GetPathResult {
+        self.lru
+            .lock()
+            .await
+            .get_or_init()
+            .ok()
+            .and_then(|lru| lru.get_abs_path(key))
+            .map_or_else(|| GetPathResult::Miss, GetPathResult::Found)
     }
 
     async fn size(&self, key: &str) -> Result<u64> {

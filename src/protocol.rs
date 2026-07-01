@@ -1,5 +1,5 @@
 use crate::{
-    cache::{CacheMode, GetPathResult},
+    cache::{CacheMode, GetPathResult, StorageKind},
     compiler::ColorMode,
     config::PreprocessorCacheModeConfig,
     mock_command::ProcessOutput,
@@ -24,28 +24,30 @@ pub enum Request {
 
     // --- Storage RPCs (client-side mode) ---
     /// One-shot handshake: client requests cache metadata from the daemon.
-    StorageHandshake { preprocessor_cache: bool },
+    StorageHandshake {
+        kind: StorageKind,
+    },
     /// Fetch the filesystem path of the cached entry for `key`.
     /// Returns `None` if the backend does not support direct file access or the key is absent.
     StorageGetPath {
         key: String,
-        preprocessor_cache: bool,
+        kind: StorageKind,
     },
     // Delete the file for the cached entry for `key`
     StorageDelPath {
         key: String,
-        preprocessor_cache: bool,
+        kind: StorageKind,
     },
     /// Fetch raw (zip) bytes for `key`; returns `None` on a miss.
     StorageGetRaw {
         key: String,
-        preprocessor_cache: bool,
+        kind: StorageKind,
     },
     /// Store raw (zip) bytes under `key`.
     StoragePutRaw {
         key: String,
         data: Vec<u8>,
-        preprocessor_cache: bool,
+        kind: StorageKind,
     },
     /// Merge per-invocation stats into the daemon's running totals.
     RecordStats(Box<ServerStats>),

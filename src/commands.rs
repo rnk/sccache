@@ -712,8 +712,8 @@ where
     trace!("do_compile_client_side");
     let exe_path = which_in(exe, path, cwd)?;
     let conn = Arc::new(std::sync::Mutex::new(conn));
-    let compilations_storage = IpcStorage::connect(conn.clone(), false)?;
-    let preprocessor_storage = IpcStorage::connect(conn.clone(), true)?;
+    let compilations_storage = IpcStorage::connect(conn.clone(), StorageKind::Compilations)?;
+    let preprocessor_storage = IpcStorage::connect(conn.clone(), StorageKind::Preprocessor)?;
     let (tx, _rx) = futures::channel::mpsc::channel(1);
     let (_, info) = server::WaitUntilZero::new();
     let service = server::SccacheService::<C>::new(

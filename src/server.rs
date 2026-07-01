@@ -13,7 +13,7 @@
 // limitations under the License.SCCACHE_MAX_FRAME_LENGTH
 
 use crate::{
-    cache::{CacheMode, Storage, StorageKind, multilevel::MultiLevelStats},
+    cache::{Cache, CacheMode, Storage, StorageKind, multilevel::MultiLevelStats},
     compiler::{
         CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
         CompilerProxy, DistType, Language, MissType, compiler_info_args, get_compiler_info,
@@ -1095,16 +1095,14 @@ where
                         Message::WithoutBody(Response::ShuttingDown(Box::new(info)))
                     })
                 }
-                Request::StorageHandshake { preprocessor_cache } => {
-                    let storage = if preprocessor_cache {
-                        trace!("handle_client: preprocessor_storage_handshake");
-                        me.preprocessor_storage.clone()
+                Request::StorageHandshake { kind } => {
+                    let storage = if kind == StorageKind::Compilations {
+                        &me.storage
                     } else {
-                        trace!("handle_client: storage_handshake");
-                        me.storage.clone()
+                        &me.preprocessor_storage
                     };
 
-                    trace!("handle_client: storage_handshake");
+                    trace!("handle_client: storage_handshake kind={kind}");
                     let info = StorageHandshakeInfo {
                         location: storage.location().await,
                         cache_type_name: storage.cache_type_name().to_owned(),
@@ -1115,70 +1113,54 @@ where
                     };
                     Ok(Message::WithoutBody(Response::StorageHandshake(info)))
                 }
-                Request::StorageGetPath {
-                    key,
-                    preprocessor_cache,
-                } => {
-                    let storage = if preprocessor_cache {
-                        trace!("handle_client: storage_get_preprocessor_cache_path key={key}");
-                        me.preprocessor_storage.clone()
+                Request::StorageGetPath { key, kind } => {
+                    trace!("handle_client: storage_get_path kind={kind}, key={key}");
+                    let storage = if kind == StorageKind::Compilations {
+                        &me.storage
                     } else {
-                        trace!("handle_client: storage_get_path key={key}");
-                        me.storage.clone()
+                        &me.preprocessor_storage
                     };
                     Ok(Message::WithoutBody(Response::StorageGetPath(
                         storage.get_path(&key).await,
                     )))
                 }
-                Request::StorageDelPath {
-                    key,
-                    preprocessor_cache,
-                } => {
-                    let storage = if preprocessor_cache {
-                        trace!("handle_client: storage_del_preprocessor_cache_path key={key}");
-                        me.preprocessor_storage.clone()
+                Request::StorageDelPath { key, kind } => {
+                    trace!("handle_client: storage_del_path kind={kind}, key={key}");
+                    let storage = if kind == StorageKind::Compilations {
+                        &me.storage
                     } else {
-                        trace!("handle_client: storage_del_path key={key}");
-                        me.storage.clone()
+                        &me.preprocessor_storage
                     };
                     Ok(Message::WithoutBody(Response::StorageDelPath(
                         storage.del(&key).await.map_err(|e| format!("{e:#}")),
                     )))
                 }
-                Request::StorageGetRaw {
-                    key,
-                    preprocessor_cache,
-                } => {
-                    let storage = if preprocessor_cache {
-                        trace!("handle_client: storage_get_preprocessor_cache_raw key={key}");
-                        me.preprocessor_storage.clone()
+                Request::StorageGetRaw { key, kind } => {
+                    trace!("handle_client: storage_get kind={kind}, key={key}");
+                    let storage = if kind == StorageKind::Compilations {
+                        &me.storage
                     } else {
-                        trace!("handle_client: storage_get_raw key={key}");
-                        me.storage.clone()
+                        &me.preprocessor_storage
                     };
-                    let resp = match storage.get_raw(&key).await {
-                        Ok(opt) => Response::StorageGetRaw(opt.map(|b| b.to_vec())),
+                    let resp = match storage.get(&key).await {
+                        Ok(Cache::Hit(data)) => Response::StorageGetRaw(Some(data.to_vec())),
+                        Ok(Cache::Miss) => Response::StorageGetRaw(None),
                         Err(e) => {
-                            warn!("storage_get_raw error: {e:#}");
+                            warn!("storage_get error: {e:#}");
                             Response::StorageGetRaw(None)
                         }
                     };
                     Ok(Message::WithoutBody(resp))
                 }
-                Request::StoragePutRaw {
-                    key,
-                    data,
-                    preprocessor_cache,
-                } => {
-                    let storage = if preprocessor_cache {
-                        trace!("handle_client: storage_put_preprocessor_cache_raw key={key}");
-                        me.preprocessor_storage.clone()
+                Request::StoragePutRaw { key, data, kind } => {
+                    trace!("handle_client: storage_put kind={kind}, key={key}");
+                    let storage = if kind == StorageKind::Compilations {
+                        &me.storage
                     } else {
-                        trace!("handle_client: storage_put_raw key={key}");
-                        me.storage.clone()
+                        &me.preprocessor_storage
                     };
                     let result = storage
-                        .put_raw(&key, data.into())
+                        .put(&key, data.into())
                         .await
                         .map(|_| ())
                         .map_err(|e| format!("{e:#}"));

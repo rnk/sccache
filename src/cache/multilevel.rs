@@ -378,7 +378,7 @@ impl MultiLevelStorage {
         data: opendal::Buffer,
     ) -> Result<()> {
         // Bytes::clone() is a cheap ref-count bump, no data copy
-        level.put_raw(key, data).await?;
+        level.put(key, data).await?;
         Ok(())
     }
 
@@ -451,57 +451,35 @@ impl Storage for MultiLevelStorage {
                         let key_str = key.to_string();
                         let hit_level = idx;
 
-                        // Try to get raw bytes for backfilling
-                        match level.get_raw(key).await {
-                            Ok(Some(raw_bytes)) => {
-                                // Update backfill stats
-                                inc_stat!(
-                                    self.atomic_stats.get(hit_level),
-                                    backfills_from,
-                                    idx as u64
-                                );
+                        // Update backfill stats
+                        inc_stat!(self.atomic_stats.get(hit_level), backfills_from, idx as u64);
 
-                                // Spawn background backfill tasks for each faster level
-                                // Iterate slice directly instead of creating Vec
-                                for backfill_idx in 0..idx {
-                                    let key_bf = key_str.clone();
-                                    let bytes_bf = raw_bytes.clone();
-                                    let level_bf = Arc::clone(&self.levels[backfill_idx]);
-                                    let stats_arc =
-                                        self.atomic_stats.get(backfill_idx).map(Arc::clone);
+                        // Spawn background backfill tasks for each faster level
+                        // Iterate slice directly instead of creating Vec
+                        for backfill_idx in 0..idx {
+                            let key_bf = key_str.clone();
+                            let bytes_bf = entry.clone();
+                            let level_bf = Arc::clone(&self.levels[backfill_idx]);
+                            let stats_arc = self.atomic_stats.get(backfill_idx).map(Arc::clone);
 
-                                    tokio::spawn(async move {
-                                        match Self::write_entry_from_bytes(
-                                            &level_bf, &key_bf, bytes_bf,
-                                        )
-                                        .await
-                                        {
-                                            Ok(_) => {
-                                                trace!(
-                                                    "Backfilled cache level {backfill_idx} from level {hit_level}"
-                                                );
-                                                // Update backfill_to stats
-                                                inc_stat!(stats_arc.as_deref(), backfills_to, 1);
-                                            }
-                                            Err(e) => {
-                                                debug!(
-                                                    "Background backfill from level {hit_level} to level {backfill_idx} failed: {e}"
-                                                );
-                                            }
-                                        }
-                                    });
+                            tokio::spawn(async move {
+                                match Self::write_entry_from_bytes(&level_bf, &key_bf, bytes_bf)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        trace!(
+                                            "Backfilled cache level {backfill_idx} from level {hit_level}"
+                                        );
+                                        // Update backfill_to stats
+                                        inc_stat!(stats_arc.as_deref(), backfills_to, 1);
+                                    }
+                                    Err(e) => {
+                                        debug!(
+                                            "Background backfill from level {hit_level} to level {backfill_idx} failed: {e}"
+                                        );
+                                    }
                                 }
-                            }
-                            Ok(None) => {
-                                debug!(
-                                    "Cache backend at level {hit_level} does not support get_raw(), skipping backfill"
-                                );
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "Failed to get raw bytes from level {hit_level} for backfill: {e}"
-                                );
-                            }
+                            });
                         }
                     }
 
@@ -540,21 +518,6 @@ impl Storage for MultiLevelStorage {
     }
 
     async fn put(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
-        self.put_raw(key, entry).await
-    }
-
-    /// Get raw serialized cache entry bytes (forwarded to inner storage)
-    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
-        for level in &self.levels {
-            if let Some(bytes) = level.get_raw(key).await? {
-                return Ok(Some(bytes));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Put raw serialized cache entry bytes under `key` (for multi-level backfill).
-    async fn put_raw(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
         if self.levels.is_empty() {
             return Err(anyhow!("No cache levels configured"));
         }

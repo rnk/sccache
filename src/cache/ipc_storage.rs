@@ -11,7 +11,7 @@
 // limitations under the License.
 
 use crate::{
-    cache::{CacheMode, GetPathResult, cache::Storage, cache_io::Cache},
+    cache::{CacheMode, GetPathResult, StorageKind, cache::Storage, cache_io::Cache},
     client::ServerConnection,
     config::PreprocessorCacheModeConfig,
     errors::*,
@@ -37,17 +37,17 @@ use std::{
 pub struct IpcStorage {
     conn: Arc<Mutex<ServerConnection>>,
     handshake: StorageHandshakeInfo,
-    preprocessor_cache: bool,
+    kind: StorageKind,
 }
 
 impl IpcStorage {
     /// Connect to the daemon and perform the `StorageHandshake` RPC.
     /// Returns an `IpcStorage` that can be used as an `Arc<dyn Storage>`.
-    pub fn connect(conn: Arc<Mutex<ServerConnection>>, preprocessor_cache: bool) -> Result<Self> {
+    pub fn connect(conn: Arc<Mutex<ServerConnection>>, kind: StorageKind) -> Result<Self> {
         let resp = conn
             .lock()
             .unwrap()
-            .request(Request::StorageHandshake { preprocessor_cache })?;
+            .request(Request::StorageHandshake { kind })?;
         let handshake = match resp {
             Response::StorageHandshake(info) => info,
             other => bail!("IpcStorage: unexpected handshake response: {other:?}"),
@@ -55,7 +55,7 @@ impl IpcStorage {
         Ok(Self {
             conn,
             handshake,
-            preprocessor_cache,
+            kind,
         })
     }
 
@@ -79,8 +79,9 @@ impl Storage for IpcStorage {
     async fn get(&self, key: &str) -> Result<Cache<opendal::Buffer>> {
         match self.get_path(key).await {
             GetPathResult::Found(path) => {
-                let file = std::fs::File::open(&path)
-                    .with_context(|| format!("IpcStorage::get: open {}", path.display()))?;
+                let file = std::fs::File::open(&path).with_context(|| {
+                    format!("[IpcStorage::get({key:?})]: open {}", path.display())
+                })?;
 
                 Ok(Cache::Hit(
                     Bytes::from_owner(unsafe { Mmap::map(&file) }?).into(),
@@ -88,10 +89,21 @@ impl Storage for IpcStorage {
             }
             GetPathResult::Miss => Ok(Cache::Miss),
             // Backend doesn't support paths (S3, Redis, …); fall back to bytes over IPC.
-            GetPathResult::Unsupported => match self.get_raw(key).await? {
-                Some(bytes) => Ok(Cache::Hit(bytes)),
-                None => Ok(Cache::Miss),
-            },
+            GetPathResult::Unsupported => {
+                let resp = self
+                    .rpc(Request::StorageGetRaw {
+                        key: key.to_owned(),
+                        kind: self.kind,
+                    })
+                    .await?;
+
+                match resp {
+                    Response::StorageGetRaw(opt) => {
+                        Ok(opt.map_or_else(|| Cache::Miss, |data| Cache::Hit(data.into())))
+                    }
+                    other => bail!("[IpcStorage::get({key:?})]: unexpected response: {other:?}"),
+                }
+            }
         }
     }
 
@@ -100,13 +112,13 @@ impl Storage for IpcStorage {
         match self
             .rpc(Request::StorageDelPath {
                 key: key.to_owned(),
-                preprocessor_cache: self.preprocessor_cache,
+                kind: self.kind,
             })
             .await
         {
             Ok(Response::StorageDelPath(res)) => res.map_err(|msg| anyhow!(msg)),
             Err(err) => bail!(err),
-            other => bail!("IpcStorage::del: unexpected response: {other:?}"),
+            other => bail!("[IpcStorage::del({key:?})]: unexpected response: {other:?}"),
         }
     }
 
@@ -131,7 +143,7 @@ impl Storage for IpcStorage {
         match self
             .rpc(Request::StorageGetPath {
                 key: key.to_owned(),
-                preprocessor_cache: self.preprocessor_cache,
+                kind: self.kind,
             })
             .await
         {
@@ -140,35 +152,20 @@ impl Storage for IpcStorage {
         }
     }
 
-    async fn put(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
-        self.put_raw(key, entry).await
-    }
-
-    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
-        let resp = self
-            .rpc(Request::StorageGetRaw {
-                key: key.to_owned(),
-                preprocessor_cache: self.preprocessor_cache,
-            })
-            .await?;
-        match resp {
-            Response::StorageGetRaw(opt) => Ok(opt.map(Into::into)),
-            other => bail!("IpcStorage::get_raw: unexpected response: {other:?}"),
-        }
-    }
-
-    async fn put_raw(&self, key: &str, data: opendal::Buffer) -> Result<Duration> {
+    async fn put(&self, key: &str, data: opendal::Buffer) -> Result<Duration> {
         let resp = self
             .rpc(Request::StoragePutRaw {
                 key: key.to_owned(),
                 data: data.to_vec(),
-                preprocessor_cache: self.preprocessor_cache,
+                kind: self.kind,
             })
             .await?;
         match resp {
             Response::StoragePutRaw(Ok(())) => Ok(Duration::ZERO),
-            Response::StoragePutRaw(Err(e)) => bail!("IpcStorage::put_raw: daemon error: {e}"),
-            other => bail!("IpcStorage::put_raw: unexpected response: {other:?}"),
+            Response::StoragePutRaw(Err(e)) => {
+                bail!("[IpcStorage::put({key:?})]: daemon error: {e}")
+            }
+            other => bail!("[IpcStorage::put({key:?})]: unexpected response: {other:?}"),
         }
     }
 

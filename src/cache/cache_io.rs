@@ -43,6 +43,21 @@ pub enum Cache<T> {
     Miss,
 }
 
+impl<T> Cache<T> {
+    pub fn into_option(self) -> Option<T> {
+        self.into()
+    }
+}
+
+impl<T> From<Cache<T>> for Option<T> {
+    fn from(val: Cache<T>) -> Self {
+        match val {
+            Cache::Hit(data) => Some(data),
+            Cache::Miss => None,
+        }
+    }
+}
+
 impl<T> fmt::Debug for Cache<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {

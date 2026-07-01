@@ -90,20 +90,6 @@ impl Storage for MockStorage {
         }
         Ok(0)
     }
-    async fn get_raw(&self, _key: &str) -> Result<Option<opendal::Buffer>> {
-        if let Some(delay) = self.delay {
-            sleep(delay).await;
-        }
-        match self.rx.lock().await.try_next() {
-            Ok(Some(Err(err))) => Err(err),
-            Ok(Some(Ok(Cache::Hit(data)))) => Ok(Some(data)),
-            Ok(Some(Ok(Cache::Miss))) | Ok(None) => Ok(None),
-            Err(err) => Err(err.into()),
-        }
-    }
-    async fn put_raw(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
-        self.put(key, entry).await
-    }
     async fn location(&self) -> String {
         "Mock Storage".to_string()
     }

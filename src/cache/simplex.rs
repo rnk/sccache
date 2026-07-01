@@ -56,16 +56,6 @@ impl Storage for SimplexCache {
         self.0.size(key).await
     }
 
-    /// Get raw serialized cache entry bytes (forwarded to inner storage)
-    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
-        self.0.get_raw(key).await
-    }
-
-    /// Put raw serialized cache entry bytes under `key` (for multi-level backfill).
-    async fn put_raw(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
-        self.1.put_raw(key, entry).await
-    }
-
     /// Check the cache capability.
     async fn check(&self) -> Result<CacheMode> {
         self.1.check().await

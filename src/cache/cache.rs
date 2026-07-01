@@ -60,7 +60,7 @@ pub enum GetPathResult {
     Found(PathBuf),
     /// Cache miss: the key is not in the cache.
     Miss,
-    /// This backend does not support direct file access; use `get`/`get_raw` instead.
+    /// This backend does not support direct file access; use `get` instead.
     Unsupported,
 }
 
@@ -92,16 +92,6 @@ pub trait Storage: Send + Sync {
     async fn put(&self, key: &str, entry: opendal::Buffer) -> Result<Duration>;
 
     async fn size(&self, key: &str) -> Result<u64>;
-
-    /// Get raw serialized cache entry bytes by `key` (for multi-level backfill).
-    /// Returns `None` if the entry is not found, or if the implementation doesn't support raw access.
-    /// This is used by multi-level caches to backfill faster levels.
-    async fn get_raw(&self, _key: &str) -> Result<Option<opendal::Buffer>>;
-
-    /// Put raw serialized cache entry bytes under `key` (for multi-level backfill).
-    /// Returns an error if the implementation doesn't support raw access.
-    /// This is used by multi-level caches to backfill faster levels.
-    async fn put_raw(&self, _key: &str, _data: opendal::Buffer) -> Result<Duration>;
 
     /// Check the cache capability.
     ///
@@ -277,9 +267,21 @@ impl RemoteStorage {
 #[async_trait]
 impl Storage for RemoteStorage {
     async fn get(&self, key: &str) -> Result<Cache<opendal::Buffer>> {
-        self.get_raw(key)
-            .await
-            .map(|data| data.map_or(Cache::Miss, Cache::Hit))
+        match operator::read_with_retry(&self.operator, key).await {
+            Ok(data) => {
+                trace!("opendal::Operator::get({key}): Found {} bytes", data.len());
+                Ok(Cache::Hit(data))
+            }
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                trace!("opendal::Operator::get({key}): NotFound");
+                Ok(Cache::Miss)
+            }
+            Err(e) => {
+                warn!("opendal::Operator::get({key}): Error: {e:?}");
+                // Return error instead of silently returning None
+                Err(anyhow!("Failed to read raw bytes: {e:?}"))
+            }
+        }
     }
 
     async fn del(&self, key: &str) -> Result<()> {
@@ -293,9 +295,11 @@ impl Storage for RemoteStorage {
         self.operator.stat(&normalize_key(key)).await.is_ok()
     }
 
-    async fn put(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
+    async fn put(&self, key: &str, data: opendal::Buffer) -> Result<Duration> {
         trace!("RemoteStorage::put({key})");
-        self.put_raw(key, entry).await
+        let start = std::time::Instant::now();
+        operator::write_with_retry(&self.operator, key, data).await?;
+        Ok(start.elapsed())
     }
 
     async fn size(&self, key: &str) -> Result<u64> {
@@ -379,48 +383,6 @@ impl Storage for RemoteStorage {
     fn basedirs(&self) -> &[Vec<u8>] {
         &self.basedirs
     }
-
-    /// Get raw bytes from remote storage for multi-level backfill.
-    ///
-    /// Unlike `get()` which parses bytes into `CacheRead` (a `ZipArchive<Box<dyn ReadSeek>>`),
-    /// this returns the raw bytes without parsing. `CacheRead` is a one-way transformation —
-    /// there is no way to extract the original bytes back from the parsed ZIP archive.
-    /// For backfill we need the raw bytes to write directly to another cache level.
-    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
-        trace!("opendal::Operator::get_raw({key})");
-        match operator::read_with_retry(&self.operator, key).await {
-            Ok(data) => {
-                trace!(
-                    "opendal::Operator::get_raw({key}): Found {} bytes",
-                    data.len()
-                );
-                Ok(Some(data))
-            }
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                trace!("opendal::Operator::get_raw({key}): NotFound");
-                Ok(None)
-            }
-            Err(e) => {
-                warn!("opendal::Operator::get_raw({key}): Error: {e:?}");
-                // Return error instead of silently returning None
-                Err(anyhow!("Failed to read raw bytes: {e:?}"))
-            }
-        }
-    }
-
-    /// Write raw bytes to remote storage for multi-level backfill.
-    ///
-    /// Unlike `put()` which takes a `CacheWrite` and serializes it, this writes
-    /// pre-serialized bytes directly. Paired with `get_raw()` for efficient
-    /// level-to-level data transfer without a deserialize/reserialize round-trip.
-    async fn put_raw(&self, key: &str, data: opendal::Buffer) -> Result<Duration> {
-        trace!("opendal::Operator::put_raw({}, {} bytes)", key, data.len());
-        let start = std::time::Instant::now();
-
-        operator::write_with_retry(&self.operator, key, data).await?;
-
-        Ok(start.elapsed())
-    }
 }
 
 pub struct PreprocessorCache(pub Arc<dyn Storage>, pub PreprocessorCacheModeConfig);
@@ -451,14 +413,6 @@ impl Storage for PreprocessorCache {
 
     async fn size(&self, key: &str) -> Result<u64> {
         self.0.size(key).await
-    }
-
-    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
-        self.0.get_raw(key).await
-    }
-
-    async fn put_raw(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
-        self.0.put_raw(key, entry).await
     }
 
     /// Check the cache capability.
@@ -1061,7 +1015,7 @@ impl From<(StorageKind, Vec<Vec<u8>>, COSCacheConfig)> for StorageBuilder {
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum StorageKind {
     Compilations,
     Preprocessor,
