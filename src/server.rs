@@ -12,22 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.SCCACHE_MAX_FRAME_LENGTH
 
-use crate::cache::multilevel::MultiLevelStats;
-use crate::cache::{Storage, StorageKind};
-use crate::compiler::{
-    CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
-    CompilerProxy, DistType, Language, MissType, compiler_info_args, get_compiler_info,
+use crate::{
+    cache::{CacheMode, Storage, StorageKind, multilevel::MultiLevelStats},
+    compiler::{
+        CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
+        CompilerProxy, DistType, Language, MissType, compiler_info_args, get_compiler_info,
+    },
+    config::Config,
+    dist,
+    errors::*,
+    jobserver::Client,
+    mock_command::{CommandCreatorSync, ProcessCommandCreator, ProcessOutput},
+    protocol::{
+        Compile, CompileFinished, CompileResponse, Request, Response, StorageHandshakeInfo,
+    },
+    util::{self, AsyncMulticast, AsyncMulticastFunc},
 };
-#[cfg(feature = "dist-client")]
-use crate::config;
-use crate::config::Config;
-use crate::dist;
-use crate::jobserver::Client;
-use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator, ProcessOutput};
-use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
-use crate::util::{self, AsyncMulticast, AsyncMulticastFunc};
-#[cfg(feature = "dist-client")]
-use anyhow::Context as _;
+
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut, buf::BufMut};
 use filetime::FileTime;
@@ -35,15 +36,14 @@ use fs::metadata;
 use fs_err as fs;
 use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, TryFutureExt, channel::mpsc, future};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "dist-client")]
-use std::mem;
+
 #[cfg(target_os = "android")]
 use std::os::android::net::SocketAddrExt;
+
 #[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
 use std::sync::atomic::AtomicU64;
-#[cfg(feature = "dist-client")]
-use std::time::Instant;
+
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
@@ -69,7 +69,12 @@ use tokio_util::codec::{LengthDelimitedCodec, length_delimited};
 use tower::Service;
 use unit_prefix::NumberPrefix;
 
-use crate::errors::*;
+#[cfg(feature = "dist-client")]
+use {
+    crate::config,
+    anyhow::Context as _,
+    std::{mem, time::Instant},
+};
 
 /// If the dist client couldn't be created, retry creation at this number
 /// of seconds from now (or later)
@@ -1090,6 +1095,76 @@ where
                         Message::WithoutBody(Response::ShuttingDown(Box::new(info)))
                     })
                 }
+                Request::StorageHandshake => {
+                    debug!("handle_client: storage_handshake");
+                    let info = StorageHandshakeInfo {
+                        location: me.storage.location().await,
+                        cache_type_name: me.storage.cache_type_name().to_owned(),
+                        basedirs: me.storage.basedirs().to_vec(),
+                        preprocessor_cache_mode_config: me.storage.preprocessor_cache_mode_config(),
+                        cache_mode: me.storage.check().await.unwrap_or(CacheMode::ReadWrite),
+                        max_size: me.storage.max_size().await.unwrap_or(None),
+                    };
+                    Ok(Message::WithoutBody(Response::StorageHandshake(info)))
+                }
+                Request::StorageGetPath { key } => {
+                    debug!("handle_client: storage_get_path key={}", key);
+                    Ok(Message::WithoutBody(Response::StorageGetPath(
+                        me.storage.get_path(&key).await,
+                    )))
+                }
+                Request::StorageGetRaw { key } => {
+                    debug!("handle_client: storage_get_raw key={}", key);
+                    let resp = match me.storage.get_raw(&key).await {
+                        Ok(opt) => Response::StorageGetRaw(opt.map(|b| b.to_vec())),
+                        Err(e) => {
+                            warn!("storage_get_raw error: {e:#}");
+                            Response::StorageGetRaw(None)
+                        }
+                    };
+                    Ok(Message::WithoutBody(resp))
+                }
+                Request::StoragePutRaw { key, data } => {
+                    debug!("handle_client: storage_put_raw key={}", key);
+                    let result = me
+                        .storage
+                        .put_raw(&key, data.into())
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("{e:#}"));
+                    Ok(Message::WithoutBody(Response::StoragePutRaw(result)))
+                }
+                Request::StorageGetPreprocessorEntry { key } => {
+                    debug!("handle_client: storage_get_preprocessor_entry key={key}");
+                    let result = me
+                        .preprocessor_storage
+                        .get_raw(&key)
+                        .await
+                        .map(|opt| opt.map(|buf| buf.to_vec()))
+                        .map_err(|e| format!("{e:#}"));
+                    Ok(Message::WithoutBody(Response::StorageGetPreprocessorEntry(
+                        result,
+                    )))
+                }
+                Request::StoragePutPreprocessorEntry { key, entry_bytes } => {
+                    debug!("handle_client: storage_put_preprocessor_entry key={key}");
+                    let result = async {
+                        me.preprocessor_storage
+                            .put_raw(&key, entry_bytes.into())
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| format!("{e:#}"))
+                    }
+                    .await;
+                    Ok(Message::WithoutBody(Response::StoragePutPreprocessorEntry(
+                        result,
+                    )))
+                }
+                Request::RecordStats(delta) => {
+                    debug!("handle_client: record_stats");
+                    me.merge_stats(*delta).await;
+                    Ok(Message::WithoutBody(Response::RecordStats))
+                }
             }
         })
     }
@@ -1337,6 +1412,10 @@ where
     /// Zero stats about the cache.
     async fn zero_stats(&self) {
         *self.stats.lock().await = ServerStats::default();
+    }
+
+    async fn merge_stats(&self, delta: ServerStats) {
+        *self.stats.lock().await += delta;
     }
 
     /// Handle a compile request from a client.
@@ -2025,14 +2104,20 @@ pub struct ServerStats {
 
 impl std::ops::AddAssign for ServerStats {
     fn add_assign(&mut self, rhs: Self) {
+        self.active_compilations += rhs.active_compilations;
+        self.queued_compilations += rhs.queued_compilations;
+        self.pending_compilations += rhs.pending_compilations;
+        self.pending_cache_lookups += rhs.pending_cache_lookups;
         self.compile_requests += rhs.compile_requests;
+        self.compile_request_errors += rhs.compile_request_errors;
         self.requests_unsupported_compiler += rhs.requests_unsupported_compiler;
         self.requests_not_compile += rhs.requests_not_compile;
         self.requests_not_cacheable += rhs.requests_not_cacheable;
         self.requests_executed += rhs.requests_executed;
-        self.cache_errors += rhs.cache_errors;
         self.cache_hits += rhs.cache_hits;
+        self.preprocessor_cache_hits += rhs.preprocessor_cache_hits;
         self.cache_misses += rhs.cache_misses;
+        self.preprocessor_cache_misses += rhs.preprocessor_cache_misses;
         self.cache_timeouts += rhs.cache_timeouts;
         self.cache_read_errors += rhs.cache_read_errors;
         self.non_cacheable_compilations += rhs.non_cacheable_compilations;
@@ -2041,7 +2126,11 @@ impl std::ops::AddAssign for ServerStats {
         self.cache_writes += rhs.cache_writes;
         self.cache_write_duration += rhs.cache_write_duration;
         self.cache_read_hit_duration += rhs.cache_read_hit_duration;
+        self.preprocessed += rhs.preprocessed;
         self.compilations += rhs.compilations;
+        self.preprocessor_cache_hit_duration += rhs.preprocessor_cache_hit_duration;
+        self.preprocessor_cache_miss_duration += rhs.preprocessor_cache_miss_duration;
+        self.preprocessor_duration += rhs.preprocessor_duration;
         self.compiler_write_duration += rhs.compiler_write_duration;
         self.compile_fails += rhs.compile_fails;
         for (k, v) in rhs.not_cached {
@@ -2051,7 +2140,19 @@ impl std::ops::AddAssign for ServerStats {
             *self.dist_compiles.entry(k).or_default() += v;
         }
         self.dist_errors += rhs.dist_errors;
-        self.multi_level = match (self.multi_level.take(), rhs.multi_level) {
+        self.fatal_errors += rhs.fatal_errors;
+        self.cache_multi_level = match (self.cache_multi_level.take(), rhs.cache_multi_level) {
+            (Some(mut a), Some(b)) => {
+                a += b;
+                Some(a)
+            }
+            (a, None) => a,
+            (None, b) => b,
+        };
+        self.preprocessor_multi_level = match (
+            self.preprocessor_multi_level.take(),
+            rhs.preprocessor_multi_level,
+        ) {
             (Some(mut a), Some(b)) => {
                 a += b;
                 Some(a)

@@ -24,6 +24,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures::{FutureExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
 use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use super::cache_io::*;
@@ -53,7 +54,7 @@ use crate::{cache::s3::S3Cache, config::S3CacheConfig};
 use crate::{cache::webdav::WebdavCache, config::WebdavCacheConfig};
 
 /// Result of [`Storage::get_path`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GetPathResult {
     /// Cache hit: the entry lives at this filesystem path.
     Found(PathBuf),
