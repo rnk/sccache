@@ -603,6 +603,14 @@ impl LruDiskCache {
             .map(|f| Box::new(std::io::BufReader::new(f)) as Box<dyn BufReadSeek>)
     }
 
+    /// Return the absolute path for `key` if it is present in the cache, without opening the
+    /// file. Updates the LRU eviction order. Returns `None` if the key is absent.
+    pub fn get_abs_path<K: AsRef<OsStr>>(&mut self, key: K) -> Option<PathBuf> {
+        let key = key.as_ref();
+        let path = self.key_to_abs_path(key);
+        self.lru.get(key).map(|_| path)
+    }
+
     /// Remove the given key from the cache.
     pub async fn remove<K: AsRef<OsStr>>(&mut self, key: K) -> Result<()> {
         let rel_path = self.key_to_rel_path(key);

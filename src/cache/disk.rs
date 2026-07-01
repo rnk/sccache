@@ -14,7 +14,7 @@
 
 use super::lazy_disk_cache::LazyDiskCache;
 use crate::{
-    cache::{Cache, CacheMode, Storage},
+    cache::{Cache, CacheMode, GetPathResult, Storage},
     config::DiskCacheConfig,
     lru_disk_cache::Error as LruError,
 };
@@ -171,6 +171,16 @@ impl Storage for DiskCache {
                 _ => Err(err),
             },
         }
+    }
+
+    async fn get_path(&self, key: &str) -> GetPathResult {
+        self.lru
+            .lock()
+            .await
+            .get_or_init()
+            .ok()
+            .and_then(|lru| lru.get_abs_path(key))
+            .map_or_else(|| GetPathResult::Miss, GetPathResult::Found)
     }
 
     async fn put_raw(&self, key: &str, source: opendal::Buffer) -> Result<Duration> {

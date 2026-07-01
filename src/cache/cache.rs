@@ -52,6 +52,17 @@ use crate::{cache::s3::S3Cache, config::S3CacheConfig};
 #[cfg(feature = "webdav")]
 use crate::{cache::webdav::WebdavCache, config::WebdavCacheConfig};
 
+/// Result of [`Storage::get_path`].
+#[derive(Debug, Clone)]
+pub enum GetPathResult {
+    /// Cache hit: the entry lives at this filesystem path.
+    Found(PathBuf),
+    /// Cache miss: the key is not in the cache.
+    Miss,
+    /// This backend does not support direct file access; use `get`/`get_raw` instead.
+    Unsupported,
+}
+
 /// An interface to cache storage.
 #[async_trait]
 pub trait Storage: Send + Sync {
@@ -132,6 +143,12 @@ pub trait Storage: Send + Sync {
 
     /// Return the base directories for path normalization if configured
     fn basedirs(&self) -> &[Vec<u8>];
+
+    /// Return the filesystem path of the cached entry for `key`.
+    /// Default impl returns [`GetPathResult::Unsupported`].
+    async fn get_path(&self, _key: &str) -> GetPathResult {
+        GetPathResult::Unsupported
+    }
 }
 
 #[cfg(any(
