@@ -513,6 +513,21 @@ impl Storage for MultiLevelStorage {
     }
 
     async fn put(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
+        self.put_raw(key, entry).await
+    }
+
+    /// Get raw serialized cache entry bytes (forwarded to inner storage)
+    async fn get_raw(&self, key: &str) -> Result<Option<opendal::Buffer>> {
+        for level in &self.levels {
+            if let Some(bytes) = level.get_raw(key).await? {
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Put raw serialized cache entry bytes under `key` (for multi-level backfill).
+    async fn put_raw(&self, key: &str, entry: opendal::Buffer) -> Result<Duration> {
         if self.levels.is_empty() {
             return Err(anyhow!("No cache levels configured"));
         }
@@ -642,16 +657,6 @@ impl Storage for MultiLevelStorage {
             return Err(err);
         }
         Err(anyhow!("Unknown key {key:?}"))
-    }
-
-    /// Get raw serialized cache entry bytes (forwarded to inner storage)
-    async fn get_raw(&self, _key: &str) -> Result<Option<opendal::Buffer>> {
-        Err(anyhow!("get_raw not implemented for MultiLevelStorage"))
-    }
-
-    /// Put raw serialized cache entry bytes under `key` (for multi-level backfill).
-    async fn put_raw(&self, _key: &str, _data: opendal::Buffer) -> Result<Duration> {
-        Err(anyhow!("put_raw not implemented for MultiLevelStorage"))
     }
 
     async fn check(&self) -> Result<CacheMode> {
