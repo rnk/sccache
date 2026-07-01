@@ -22,9 +22,15 @@ use std::sync::Arc;
 
 use crate::errors::*;
 
-#[cfg(any(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(all(
+    feature = "dist-client",
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "freebsd"
+    )
 ))]
 pub use self::toolchain_imp::*;
 
@@ -88,9 +94,15 @@ pub trait InputsPackager: Send {
     ) -> Result<()>;
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(all(
+    feature = "dist-client",
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "freebsd"
+    )
 )))]
 mod toolchain_imp {
     use std::sync::Arc;
@@ -110,9 +122,15 @@ mod toolchain_imp {
     }
 }
 
-#[cfg(any(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(all(
+    feature = "dist-client",
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "freebsd"
+    )
 ))]
 mod toolchain_imp {
     use async_trait::async_trait;

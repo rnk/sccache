@@ -397,6 +397,7 @@ where
 impl Rust {
     /// Create a new Rust compiler instance, calculating the hashes of
     /// all the shared libraries in its sysroot.
+    #[allow(unused)]
     pub async fn new<T>(
         mut creator: T,
         executable: PathBuf,
@@ -2238,15 +2239,26 @@ struct RustToolchainPackager {
     sysroot: PathBuf,
 }
 
-#[cfg(feature = "dist-client")]
-#[cfg(any(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(all(
+    feature = "dist-client",
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "freebsd"
+    )
 ))]
 #[async_trait]
-#[cfg(any(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(all(
+    feature = "dist-client",
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "freebsd"
+    )
 ))]
 impl pkg::ToolchainPackager for RustToolchainPackager {
     async fn package(&self) -> Result<Arc<dyn pkg::PackagedToolchain>> {

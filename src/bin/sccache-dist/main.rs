@@ -26,8 +26,10 @@ use sccache::{
 
 // Only supported on x86_64/aarch64 Linux machines and on FreeBSD
 #[cfg(not(any(
-    all(target_os = "linux", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     target_os = "freebsd"
 )))]
 fn main() {
@@ -36,8 +38,10 @@ fn main() {
 
 // Only supported on x86_64/aarch64 Linux machines and on FreeBSD
 #[cfg(any(
-    all(target_os = "linux", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
     target_os = "freebsd"
 ))]
 fn main() {

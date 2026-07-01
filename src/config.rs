@@ -1299,7 +1299,7 @@ fn cache_mode_from_env_var(env_var_name: &str) -> Option<CacheModeConfig> {
         "READ_ONLY" => Some(CacheModeConfig::ReadOnly),
         "READ_WRITE" => Some(CacheModeConfig::ReadWrite),
         _ => {
-            warn!("{} must be 'READ_ONLY' or 'READ_WRITE'", env_var_name);
+            warn!("{env_var_name} must be 'READ_ONLY' or 'READ_WRITE'");
             None
         }
     })

@@ -269,7 +269,7 @@ fn test_basic_compile_into_null(client: &SccacheClient, compiler: &Compiler, tem
         exe,
         env_vars,
     } = compiler;
-    println!("test_basic_compile_into_dev_null: {}", name);
+    println!("test_basic_compile_into_dev_null: {name}");
     client.zero_stats();
     // Compile a source file.
     copy_to_tempdir(&[INPUT, INPUT_ERR], tempdir);
@@ -319,7 +319,7 @@ fn test_basic_compile_into_dev_stdout(client: &SccacheClient, compiler: &Compile
         exe,
         env_vars,
     } = compiler;
-    println!("test_basic_compile_into_dev_stdout: {}", name);
+    println!("test_basic_compile_into_dev_stdout: {name}");
     client.zero_stats();
     // Compile a source file.
     copy_to_tempdir(&[INPUT, INPUT_ERR], tempdir);

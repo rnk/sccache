@@ -1873,7 +1873,7 @@ mod test {
             ..
         } = match parse_arguments_(args, false) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.s"), input.to_str());
         assert_eq!(Language::Assembler, language);
@@ -1901,7 +1901,7 @@ mod test {
             ..
         } = match parse_arguments_clang(args, false) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.i"), input.to_str());
         assert_eq!(Language::CPreprocessed, language);

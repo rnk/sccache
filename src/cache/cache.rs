@@ -513,69 +513,60 @@ impl StorageBuilder {
         #[allow(unreachable_patterns)]
         match cache_type {
             CacheType::Azure(cfg) => {
-                if cfg!(feature = "azure") {
-                    Ok((storage_kind, basedirs, cfg).into())
-                } else {
-                    bail!("The 'azure' feature must be enabled to use the Azure storage backend")
-                }
+                #[cfg(feature = "azure")]
+                return Ok((storage_kind, basedirs, cfg).into());
+                #[cfg(not(feature = "azure"))]
+                bail!("The 'azure' feature must be enabled to use the Azure storage backend")
             }
             CacheType::GCS(cfg) => {
-                if cfg!(feature = "gcs") {
-                    Ok((storage_kind, basedirs, cfg).into())
-                } else {
-                    bail!("The 'gcs' feature must be enabled to use the GCS storage backend")
-                }
+                #[cfg(feature = "gcs")]
+                return Ok((storage_kind, basedirs, cfg).into());
+                #[cfg(not(feature = "gcs"))]
+                bail!("The 'gcs' feature must be enabled to use the GCS storage backend")
             }
             CacheType::GHA(cfg) => {
-                if cfg!(feature = "gha") {
-                    Ok((storage_kind, basedirs, cfg).into())
-                } else {
-                    bail!("The 'gha' feature must be enabled to use the GHA storage backend")
-                }
+                #[cfg(feature = "gha")]
+                return Ok((storage_kind, basedirs, cfg).into());
+                #[cfg(not(feature = "gha"))]
+                bail!("The 'gha' feature must be enabled to use the GHA storage backend")
             }
             CacheType::Memcached(cfg) => {
-                if cfg!(feature = "memcached") {
-                    Ok((storage_kind, basedirs, cfg).into())
-                } else {
-                    bail!(
-                        "The 'memcached' feature must be enabled to use the Memcached storage backend"
-                    )
-                }
+                #[cfg(feature = "memcached")]
+                return Ok((storage_kind, basedirs, cfg).into());
+                #[cfg(not(feature = "memcached"))]
+                bail!(
+                    "The 'memcached' feature must be enabled to use the Memcached storage backend"
+                )
             }
             CacheType::Redis(cfg) => {
-                if cfg!(feature = "redis") {
-                    Ok((storage_kind, basedirs, cfg).into())
-                } else {
-                    bail!("The 'redis' feature must be enabled to use the Redis storage backend")
-                }
+                #[cfg(feature = "redis")]
+                return Ok((storage_kind, basedirs, cfg).into());
+                #[cfg(not(feature = "redis"))]
+                bail!("The 'redis' feature must be enabled to use the Redis storage backend")
             }
             CacheType::S3(cfg) => {
-                if cfg!(feature = "s3") {
-                    Ok((storage_kind, basedirs, cfg).into())
-                } else {
-                    bail!("The 's3' feature must be enabled to use the S3 storage backend")
-                }
+                #[cfg(feature = "s3")]
+                return Ok((storage_kind, basedirs, cfg).into());
+                #[cfg(not(feature = "s3"))]
+                bail!("The 's3' feature must be enabled to use the S3 storage backend")
             }
             CacheType::Webdav(cfg) => {
-                if cfg!(feature = "webdav") {
-                    Ok((storage_kind, basedirs, cfg).into())
-                } else {
-                    bail!("The 'webdav' feature must be enabled to use the Webdav storage backend")
-                }
+                #[cfg(feature = "webdav")]
+                return Ok((storage_kind, basedirs, cfg).into());
+                #[cfg(not(feature = "webdav"))]
+                bail!("The 'webdav' feature must be enabled to use the Webdav storage backend")
             }
             CacheType::OSS(cfg) => {
-                if cfg!(feature = "oss") {
-                    Ok((storage_kind, basedirs, cfg).into())
-                } else {
-                    bail!("The 'oss' feature must be enabled to use the OSS storage backend")
-                }
+                #[cfg(feature = "oss")]
+                return Ok((storage_kind, basedirs, cfg).into());
+                #[cfg(not(feature = "oss"))]
+                bail!("The 'oss' feature must be enabled to use the OSS storage backend")
             }
             CacheType::COS(cfg) => {
-                if cfg!(feature = "cos") {
-                    Ok((storage_kind, basedirs, cfg).into())
-                } else {
-                    bail!("The 'cos' feature must be enabled to use the COS storage backend")
-                }
+                #[cfg(feature = "cos")]
+                return Ok((storage_kind, basedirs, cfg).into());
+                #[cfg(not(feature = "cos"))]
+                bail!("The 'cos' feature must be enabled to use the COS storage backend")
             }
             CacheType::Disk(cfg) => Ok((storage_kind, basedirs, cfg).into()),
             _ => Ok(StorageBuilder::default()),

@@ -1622,15 +1622,26 @@ struct CToolchainPackager {
     parsed_args: ParsedArguments,
 }
 
-#[cfg(feature = "dist-client")]
-#[cfg(any(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(all(
+    feature = "dist-client",
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "freebsd"
+    )
 ))]
 #[async_trait]
-#[cfg(any(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(all(
+    feature = "dist-client",
+    any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "freebsd"
+    )
 ))]
 impl pkg::ToolchainPackager for CToolchainPackager {
     async fn package(&self) -> Result<Arc<dyn pkg::PackagedToolchain>> {
@@ -2611,9 +2622,16 @@ mod test {
         ];
 
         let hash_with_basedirs = |output: &[u8], dirs: &[Vec<u8>]| {
-            HashKeyParams::new("abcd", Language::C, &args, output)
-                .with_basedirs(dirs)
-                .compute()
+            HashKeyParams::new(
+                "abcd",
+                Language::C,
+                &args,
+                into_process_output_stream(output),
+            )
+            .with_basedirs(dirs)
+            .compute()
+            .wait()
+            .unwrap()
         };
 
         // Same hash with different absolute (escaped backslash) paths
@@ -2623,8 +2641,24 @@ mod test {
 
         // Different hashes without basedirs
         assert_neq!(
-            HashKeyParams::new("abcd", Language::C, &args, preprocessed1).compute(),
-            HashKeyParams::new("abcd", Language::C, &args, preprocessed2).compute()
+            HashKeyParams::new(
+                "abcd",
+                Language::C,
+                &args,
+                into_process_output_stream(preprocessed1)
+            )
+            .compute()
+            .wait()
+            .unwrap(),
+            HashKeyParams::new(
+                "abcd",
+                Language::C,
+                &args,
+                into_process_output_stream(preprocessed2)
+            )
+            .compute()
+            .wait()
+            .unwrap()
         );
     }
 

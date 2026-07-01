@@ -65,8 +65,10 @@ use tempfile::TempDir;
 #[cfg(all(
     feature = "dist-client",
     any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         target_os = "freebsd"
     )
 ))]
@@ -74,8 +76,10 @@ pub const CAN_DIST_DYLIBS: bool = true;
 #[cfg(all(
     feature = "dist-client",
     not(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         target_os = "freebsd"
     ))
 ))]
