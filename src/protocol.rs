@@ -27,15 +27,35 @@ pub enum Request {
     StorageHandshake,
     /// Fetch the filesystem path of the cached entry for `key`.
     /// Returns `None` if the backend does not support direct file access or the key is absent.
-    StorageGetPath { key: String },
+    StorageGetPath {
+        key: String,
+    },
+    // Delete the file for the cached entry for `key`
+    StorageDelPath {
+        key: String,
+    },
     /// Fetch raw (zip) bytes for `key`; returns `None` on a miss.
-    StorageGetRaw { key: String },
+    StorageGetRaw {
+        key: String,
+    },
     /// Store raw (zip) bytes under `key`.
-    StoragePutRaw { key: String, data: Vec<u8> },
+    StoragePutRaw {
+        key: String,
+        data: Vec<u8>,
+    },
     /// Retrieve the preprocessor cache entry for `key`.
-    StorageGetPreprocessorEntry { key: String },
+    StorageGetPreprocessorEntry {
+        key: String,
+    },
+    // Delete the preprocessor cache entry for `key`
+    StorageDelPreprocessorEntry {
+        key: String,
+    },
     /// Store or overwrite the preprocessor cache entry for `key`.
-    StoragePutPreprocessorEntry { key: String, entry_bytes: Vec<u8> },
+    StoragePutPreprocessorEntry {
+        key: String,
+        entry_bytes: Vec<u8>,
+    },
     /// Merge per-invocation stats into the daemon's running totals.
     RecordStats(Box<ServerStats>),
 }
@@ -61,12 +81,16 @@ pub enum Response {
     StorageHandshake(StorageHandshakeInfo),
     /// Response for `Request::StorageGetPath`.
     StorageGetPath(GetPathResult),
+    /// Response for `Request::StorageDelPath`.
+    StorageDelPath(Result<(), String>),
     /// Response for `Request::StorageGetRaw`: zip bytes on hit, `None` on miss.
     StorageGetRaw(Option<Vec<u8>>),
     /// Response for `Request::StoragePutRaw`.
     StoragePutRaw(Result<(), String>),
     /// Response for `Request::StorageGetPreprocessorEntry`.
     StorageGetPreprocessorEntry(Result<Option<Vec<u8>>, String>),
+    /// Response for `Request::StorageDelPreprocessorEntry`.
+    StorageDelPreprocessorEntry(Result<(), String>),
     /// Response for `Request::StoragePutPreprocessorEntry`.
     StoragePutPreprocessorEntry(Result<(), String>),
     /// Response for `Request::RecordStats`.

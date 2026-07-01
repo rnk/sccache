@@ -1113,6 +1113,12 @@ where
                         me.storage.get_path(&key).await,
                     )))
                 }
+                Request::StorageDelPath { key } => {
+                    debug!("handle_client: storage_del_path key={}", key);
+                    Ok(Message::WithoutBody(Response::StorageDelPath(
+                        me.storage.del(&key).await.map_err(|e| format!("{e:#}")),
+                    )))
+                }
                 Request::StorageGetRaw { key } => {
                     debug!("handle_client: storage_get_raw key={}", key);
                     let resp = match me.storage.get_raw(&key).await {
@@ -1143,6 +1149,17 @@ where
                         .map(|opt| opt.map(|buf| buf.to_vec()))
                         .map_err(|e| format!("{e:#}"));
                     Ok(Message::WithoutBody(Response::StorageGetPreprocessorEntry(
+                        result,
+                    )))
+                }
+                Request::StorageDelPreprocessorEntry { key } => {
+                    debug!("handle_client: storage_del_preprocessor_entry key={key}");
+                    let result = me
+                        .preprocessor_storage
+                        .del(&key)
+                        .await
+                        .map_err(|e| format!("{e:#}"));
+                    Ok(Message::WithoutBody(Response::StorageDelPreprocessorEntry(
                         result,
                     )))
                 }
