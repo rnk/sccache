@@ -1095,33 +1095,68 @@ where
                         Message::WithoutBody(Response::ShuttingDown(Box::new(info)))
                     })
                 }
-                Request::StorageHandshake => {
-                    debug!("handle_client: storage_handshake");
+                Request::StorageHandshake { preprocessor_cache } => {
+                    let storage = if preprocessor_cache {
+                        trace!("handle_client: preprocessor_storage_handshake");
+                        me.preprocessor_storage.clone()
+                    } else {
+                        trace!("handle_client: storage_handshake");
+                        me.storage.clone()
+                    };
+
+                    trace!("handle_client: storage_handshake");
                     let info = StorageHandshakeInfo {
-                        location: me.storage.location().await,
-                        cache_type_name: me.storage.cache_type_name().to_owned(),
-                        basedirs: me.storage.basedirs().to_vec(),
-                        preprocessor_cache_mode_config: me.storage.preprocessor_cache_mode_config(),
-                        cache_mode: me.storage.check().await.unwrap_or(CacheMode::ReadWrite),
-                        max_size: me.storage.max_size().await.unwrap_or(None),
+                        location: storage.location().await,
+                        cache_type_name: storage.cache_type_name().to_owned(),
+                        basedirs: storage.basedirs().to_vec(),
+                        preprocessor_cache_mode_config: storage.preprocessor_cache_mode_config(),
+                        cache_mode: storage.check().await.unwrap_or(CacheMode::ReadWrite),
+                        max_size: storage.max_size().await.unwrap_or(None),
                     };
                     Ok(Message::WithoutBody(Response::StorageHandshake(info)))
                 }
-                Request::StorageGetPath { key } => {
-                    debug!("handle_client: storage_get_path key={}", key);
+                Request::StorageGetPath {
+                    key,
+                    preprocessor_cache,
+                } => {
+                    let storage = if preprocessor_cache {
+                        trace!("handle_client: storage_get_preprocessor_cache_path key={key}");
+                        me.preprocessor_storage.clone()
+                    } else {
+                        trace!("handle_client: storage_get_path key={key}");
+                        me.storage.clone()
+                    };
                     Ok(Message::WithoutBody(Response::StorageGetPath(
-                        me.storage.get_path(&key).await,
+                        storage.get_path(&key).await,
                     )))
                 }
-                Request::StorageDelPath { key } => {
-                    debug!("handle_client: storage_del_path key={}", key);
+                Request::StorageDelPath {
+                    key,
+                    preprocessor_cache,
+                } => {
+                    let storage = if preprocessor_cache {
+                        trace!("handle_client: storage_del_preprocessor_cache_path key={key}");
+                        me.preprocessor_storage.clone()
+                    } else {
+                        trace!("handle_client: storage_del_path key={key}");
+                        me.storage.clone()
+                    };
                     Ok(Message::WithoutBody(Response::StorageDelPath(
-                        me.storage.del(&key).await.map_err(|e| format!("{e:#}")),
+                        storage.del(&key).await.map_err(|e| format!("{e:#}")),
                     )))
                 }
-                Request::StorageGetRaw { key } => {
-                    debug!("handle_client: storage_get_raw key={}", key);
-                    let resp = match me.storage.get_raw(&key).await {
+                Request::StorageGetRaw {
+                    key,
+                    preprocessor_cache,
+                } => {
+                    let storage = if preprocessor_cache {
+                        trace!("handle_client: storage_get_preprocessor_cache_raw key={key}");
+                        me.preprocessor_storage.clone()
+                    } else {
+                        trace!("handle_client: storage_get_raw key={key}");
+                        me.storage.clone()
+                    };
+                    let resp = match storage.get_raw(&key).await {
                         Ok(opt) => Response::StorageGetRaw(opt.map(|b| b.to_vec())),
                         Err(e) => {
                             warn!("storage_get_raw error: {e:#}");
@@ -1130,55 +1165,27 @@ where
                     };
                     Ok(Message::WithoutBody(resp))
                 }
-                Request::StoragePutRaw { key, data } => {
-                    debug!("handle_client: storage_put_raw key={}", key);
-                    let result = me
-                        .storage
+                Request::StoragePutRaw {
+                    key,
+                    data,
+                    preprocessor_cache,
+                } => {
+                    let storage = if preprocessor_cache {
+                        trace!("handle_client: storage_put_preprocessor_cache_raw key={key}");
+                        me.preprocessor_storage.clone()
+                    } else {
+                        trace!("handle_client: storage_put_raw key={key}");
+                        me.storage.clone()
+                    };
+                    let result = storage
                         .put_raw(&key, data.into())
                         .await
                         .map(|_| ())
                         .map_err(|e| format!("{e:#}"));
                     Ok(Message::WithoutBody(Response::StoragePutRaw(result)))
                 }
-                Request::StorageGetPreprocessorEntry { key } => {
-                    debug!("handle_client: storage_get_preprocessor_entry key={key}");
-                    let result = me
-                        .preprocessor_storage
-                        .get_raw(&key)
-                        .await
-                        .map(|opt| opt.map(|buf| buf.to_vec()))
-                        .map_err(|e| format!("{e:#}"));
-                    Ok(Message::WithoutBody(Response::StorageGetPreprocessorEntry(
-                        result,
-                    )))
-                }
-                Request::StorageDelPreprocessorEntry { key } => {
-                    debug!("handle_client: storage_del_preprocessor_entry key={key}");
-                    let result = me
-                        .preprocessor_storage
-                        .del(&key)
-                        .await
-                        .map_err(|e| format!("{e:#}"));
-                    Ok(Message::WithoutBody(Response::StorageDelPreprocessorEntry(
-                        result,
-                    )))
-                }
-                Request::StoragePutPreprocessorEntry { key, entry_bytes } => {
-                    debug!("handle_client: storage_put_preprocessor_entry key={key}");
-                    let result = async {
-                        me.preprocessor_storage
-                            .put_raw(&key, entry_bytes.into())
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| format!("{e:#}"))
-                    }
-                    .await;
-                    Ok(Message::WithoutBody(Response::StoragePutPreprocessorEntry(
-                        result,
-                    )))
-                }
                 Request::RecordStats(delta) => {
-                    debug!("handle_client: record_stats");
+                    trace!("handle_client: record_stats");
                     me.merge_stats(*delta).await;
                     Ok(Message::WithoutBody(Response::RecordStats))
                 }
@@ -1431,6 +1438,12 @@ where
         *self.stats.lock().await = ServerStats::default();
     }
 
+    /// Snapshot and reset the current stats (used by client-side processes before exit).
+    pub async fn take_stats(&self) -> ServerStats {
+        let mut s = self.stats.lock().await;
+        std::mem::take(&mut *s)
+    }
+
     async fn merge_stats(&self, delta: ServerStats) {
         *self.stats.lock().await += delta;
     }
@@ -1536,6 +1549,27 @@ where
                     err.to_string().into(),
                 )))
             }
+        }
+    }
+
+    /// Run a compile entirely in the current process (used in client-side mode).
+    ///
+    /// Returns the `CompileResponse` variant and, when compilation started, the
+    /// accompanying `CompileFinished` result.
+    pub async fn compile_direct(
+        &self,
+        compile: Compile,
+    ) -> Result<(CompileResponse, Option<CompileFinished>)> {
+        match self.handle_compile(compile).await {
+            Message::WithBody(Response::Compile(resp), body) => {
+                let finished = match body.await? {
+                    Response::CompileFinished(f) => f,
+                    _ => bail!("unexpected body response from compile_direct"),
+                };
+                Ok((resp, Some(finished)))
+            }
+            Message::WithoutBody(Response::Compile(resp)) => Ok((resp, None)),
+            _ => bail!("unexpected response from handle_compile in compile_direct"),
         }
     }
 
@@ -2925,7 +2959,7 @@ impl Future for ShutdownOrInactive {
 
 /// Helper future which tracks the `ActiveInfo` below. This future will resolve
 /// once all instances of `ActiveInfo` have been dropped.
-struct WaitUntilZero {
+pub(crate) struct WaitUntilZero {
     info: std::sync::Weak<std::sync::Mutex<Info>>,
 }
 
@@ -2949,7 +2983,7 @@ impl Drop for Info {
 
 impl WaitUntilZero {
     #[rustfmt::skip]
-    fn new() -> (WaitUntilZero, ActiveInfo) {
+    pub(crate) fn new() -> (WaitUntilZero, ActiveInfo) {
         let info = Arc::new(std::sync::Mutex::new(Info { waker: None }));
 
         (WaitUntilZero { info: Arc::downgrade(&info) }, ActiveInfo { info })

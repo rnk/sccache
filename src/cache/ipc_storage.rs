@@ -37,20 +37,25 @@ use std::{
 pub struct IpcStorage {
     conn: Arc<Mutex<ServerConnection>>,
     handshake: StorageHandshakeInfo,
+    preprocessor_cache: bool,
 }
 
 impl IpcStorage {
     /// Connect to the daemon and perform the `StorageHandshake` RPC.
     /// Returns an `IpcStorage` that can be used as an `Arc<dyn Storage>`.
-    pub fn connect(mut conn: ServerConnection) -> Result<Self> {
-        let resp = conn.request(Request::StorageHandshake)?;
+    pub fn connect(conn: Arc<Mutex<ServerConnection>>, preprocessor_cache: bool) -> Result<Self> {
+        let resp = conn
+            .lock()
+            .unwrap()
+            .request(Request::StorageHandshake { preprocessor_cache })?;
         let handshake = match resp {
             Response::StorageHandshake(info) => info,
             other => bail!("IpcStorage: unexpected handshake response: {other:?}"),
         };
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn,
             handshake,
+            preprocessor_cache,
         })
     }
 
@@ -95,6 +100,7 @@ impl Storage for IpcStorage {
         match self
             .rpc(Request::StorageDelPath {
                 key: key.to_owned(),
+                preprocessor_cache: self.preprocessor_cache,
             })
             .await
         {
@@ -125,6 +131,7 @@ impl Storage for IpcStorage {
         match self
             .rpc(Request::StorageGetPath {
                 key: key.to_owned(),
+                preprocessor_cache: self.preprocessor_cache,
             })
             .await
         {
@@ -141,6 +148,7 @@ impl Storage for IpcStorage {
         let resp = self
             .rpc(Request::StorageGetRaw {
                 key: key.to_owned(),
+                preprocessor_cache: self.preprocessor_cache,
             })
             .await?;
         match resp {
@@ -154,6 +162,7 @@ impl Storage for IpcStorage {
             .rpc(Request::StoragePutRaw {
                 key: key.to_owned(),
                 data: data.to_vec(),
+                preprocessor_cache: self.preprocessor_cache,
             })
             .await?;
         match resp {
