@@ -1358,19 +1358,23 @@ pub fn generate_compile_commands(
 
     let mut common_args = parsed_args.common_args.clone();
 
-    if parsed_args.language.needs_c_preprocessing() && parsed_args.color_mode != ColorMode::Off {
+    arguments.extend_from_slice(&parsed_args.arch_args);
+    arguments.extend_from_slice(&parsed_args.unhashed_args);
+    arguments.extend_from_slice(&parsed_args.preprocessor_args);
+
+    if parsed_args.language.needs_c_preprocessing() {
+        // Only add dependency args for files that need preprocessing
+        arguments.extend_from_slice(&parsed_args.dependency_args);
+
         // Rewrite `-fdiagnostics-color[=auto]` to `fdiagnostics-color=always`,
         // otherwise gcc disables colored output because stdout is not a tty.
-        //
         // See: https://github.com/mozilla/sccache/pull/2758
-        common_args.push("-fdiagnostics-color=always".into());
+        if parsed_args.color_mode != ColorMode::Off {
+            common_args.push("-fdiagnostics-color=always".into());
+        }
     }
 
-    arguments.extend_from_slice(&parsed_args.preprocessor_args);
-    arguments.extend_from_slice(&parsed_args.dependency_args);
-    arguments.extend_from_slice(&parsed_args.unhashed_args);
     arguments.extend_from_slice(&common_args);
-    arguments.extend_from_slice(&parsed_args.arch_args);
 
     if parsed_args.double_dash_input {
         arguments.push("--".into());
@@ -1435,6 +1439,9 @@ pub fn generate_compile_commands(
                         arguments.extend_from_slice(&["-x".into(), lang.into()][..]);
                     }
 
+                    arguments.extend(dist::osstrings_to_strings(&parsed_args.arch_args)?);
+                    arguments.extend(dist::osstrings_to_strings(&common_args)?);
+
                     if let CCompilerKind::Gcc = kind {
                         // From https://gcc.gnu.org/onlinedocs/gcc/Preprocessor-Options.html:
                         //
@@ -1454,9 +1461,6 @@ pub fn generate_compile_commands(
                         }
                         arguments.push("-fpreprocessed".into());
                     }
-
-                    arguments.extend(dist::osstrings_to_strings(&common_args)?);
-                    arguments.extend(dist::osstrings_to_strings(&parsed_args.arch_args)?);
 
                     // Escape hatch to work around compiler bugs when compiling preprocessed input.
                     // Sometimes code that doesn't warn in fused preprocess-compile mode does warn
@@ -1761,9 +1765,6 @@ mod test {
             CompilerArguments::Ok(args) => args,
             o => panic!("Got unexpected parse result: {o:?}"),
         };
-        let mut common_and_arch_args = common_args.clone();
-        common_and_arch_args.extend(common_args.clone());
-        debug!("common_and_arch_args: {common_and_arch_args:?}");
         assert_eq!(Some("foo.cpp"), input.to_str());
         assert_eq!(Language::Cxx, language);
         assert_map_contains!(
