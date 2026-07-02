@@ -443,6 +443,7 @@ where
     let mut preprocessor_args = vec![];
     let mut dependency_args = vec![];
     let mut extra_hash_files = vec![];
+    let mut extra_dist_files = vec![];
     let mut compilation = kind == CCompilerKind::Nvcc;
     let mut multiple_input = false;
     let mut multiple_input_files = Vec::new();
@@ -631,8 +632,6 @@ where
             | Some(ClangProfileUse(_))
             | Some(TestCoverage)
             | Some(Coverage)
-            | Some(DiagnosticsColor(_))
-            | Some(DiagnosticsColorFlag)
             | Some(NoDiagnosticsColorFlag)
             | Some(PassThroughFlag)
             | Some(PassThrough(_))
@@ -672,6 +671,9 @@ where
             | Some(StructuredDepTarget(_))
             | Some(StructuredDepArgumentPath(_)) => &mut dependency_args,
             Some(DoCompilation)
+            // Skip `-fdiagnostics-color[=auto]` flags and handle in `generate_compile_commands`
+            | Some(DiagnosticsColor(_))
+            | Some(DiagnosticsColorFlag)
             | Some(Language(_))
             | Some(Output(_))
             | Some(XClang(_))
@@ -693,10 +695,7 @@ where
             _ => NormalizedDisposition::Separated,
         };
 
-        match arg.get_data() {
-            Some(DiagnosticsColor(_)) | Some(DiagnosticsColorFlag) => {}
-            _ => args.extend(arg.normalize(norm).iter_os_strings()),
-        }
+        args.extend(arg.normalize(norm).iter_os_strings());
     }
 
     let xclang_it = ExpandIncludeFile::new(cwd, &xclangs);
@@ -858,6 +857,11 @@ where
 
     // If the language doesn't need preprocessing, it doesn't generate a dependency file. See issue #2664
     if language.needs_c_preprocessing() {
+        // If the language needs preprocessing, include the source file in the dist inputs.
+        // This ensures gcc embeds the correct source and line numbers in warnings/errors.
+        // See the docstring on the `PathTransformer::as_dist_input_path` impl for details.
+        extra_dist_files.push(cwd.join(&input));
+
         if need_explicit_dep_target {
             dependency_args.push(dep_flag);
             dependency_args.push(dep_target.unwrap_or_else(|| output.clone().into_os_string()));
@@ -908,12 +912,6 @@ where
             optional: false,
         },
     );
-
-    let mut extra_dist_files = vec![];
-
-    if language.needs_c_preprocessing() {
-        extra_dist_files.push(cwd.join(&input));
-    }
 
     CompilerArguments::Ok(ParsedArguments {
         input: input.into(),
@@ -1357,15 +1355,23 @@ pub fn generate_compile_commands(
         "-o".into(),
         out_file.into(),
     ]);
+
+    let mut common_args = parsed_args.common_args.clone();
+
+    if parsed_args.language.needs_c_preprocessing() && parsed_args.color_mode != ColorMode::Off {
+        // Rewrite `-fdiagnostics-color[=auto]` to `fdiagnostics-color=always`,
+        // otherwise gcc disables colored output because stdout is not a tty.
+        //
+        // See: https://github.com/mozilla/sccache/pull/2758
+        common_args.push("-fdiagnostics-color=always".into());
+    }
+
     arguments.extend_from_slice(&parsed_args.preprocessor_args);
     arguments.extend_from_slice(&parsed_args.dependency_args);
     arguments.extend_from_slice(&parsed_args.unhashed_args);
-    arguments.extend_from_slice(&parsed_args.common_args);
+    arguments.extend_from_slice(&common_args);
     arguments.extend_from_slice(&parsed_args.arch_args);
 
-    if matches!(parsed_args.color_mode, ColorMode::On | ColorMode::Auto) {
-        arguments.push("-fdiagnostics-color=always".into());
-    }
     if parsed_args.double_dash_input {
         arguments.push("--".into());
     }
@@ -1449,7 +1455,7 @@ pub fn generate_compile_commands(
                         arguments.push("-fpreprocessed".into());
                     }
 
-                    arguments.extend(dist::osstrings_to_strings(&parsed_args.common_args)?);
+                    arguments.extend(dist::osstrings_to_strings(&common_args)?);
                     arguments.extend(dist::osstrings_to_strings(&parsed_args.arch_args)?);
 
                     // Escape hatch to work around compiler bugs when compiling preprocessed input.
