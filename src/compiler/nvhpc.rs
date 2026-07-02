@@ -15,7 +15,7 @@
 
 use crate::{
     compiler::{
-        Cacheable, CompileCommandImpl, CompilerArguments,
+        Cacheable, ColorMode, CompileCommandImpl, CompilerArguments,
         args::*,
         c::{CCompilerImpl, CCompilerKind, DepfilePath, ParsedArguments, PreprocessorOutput},
         gcc::{self, ArgData::*},
@@ -151,6 +151,10 @@ impl CCompilerImpl for Nvhpc {
                         }
                     }
                 }
+            }
+            // nvc does not support -fdiagnostics-color=always
+            if !self.nvcplusplus {
+                parsed_args.color_mode = ColorMode::Off;
             }
         }
         parsed_args
