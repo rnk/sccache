@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cache::{Cache, Storage},
+    compiler::{ColorMode, c::ParsedArguments},
     errors::*,
     lru_disk_cache::{LruCache, lru_cache},
     util::{
@@ -43,11 +44,9 @@ use crate::{
     },
 };
 
-use super::Language;
-
 /// The current format is 1 header byte for the version + bincode encoding
 /// of the [`PreprocessorCacheEntry`] struct.
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 const MAX_PREPROCESSOR_CACHE_ENTRIES: u64 = 1_000;
 
 #[derive(Clone)]
@@ -470,12 +469,10 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
 #[allow(clippy::too_many_arguments)]
 pub async fn preprocessor_cache_entry_hash_key(
     compiler_digest: &str,
-    language: Language,
-    arguments: &[OsString],
+    parsed_args: &ParsedArguments,
     extra_hashes: &[String],
     env_vars: &[(OsString, OsString)],
     cwd: &Path,
-    input: &Path,
     plusplus: bool,
     basedirs: &[Vec<u8>],
 ) -> Result<Option<String>> {
@@ -488,12 +485,24 @@ pub async fn preprocessor_cache_entry_hash_key(
     // we have to incorporate that into the hash as well.
     digest.update(&[plusplus as u8]);
     digest.update(&[FORMAT_VERSION]);
-    digest.update(language.as_str().as_bytes());
+    // Encode the color mode too, because that affects the cached stdout/stderr
+    digest.update(&[(parsed_args.color_mode != ColorMode::Off) as u8]);
+    digest.update(parsed_args.language.as_str().as_bytes());
 
-    for arg in arguments {
-        arg.hash(&mut HashToDigest {
-            digest: &mut digest,
-        });
+    // Hash preprocessor, dependency, common, and arch args
+    // If the dependency args change, we need to re-run the preprocessor to generate them
+    // common_args is used in preprocessing too
+    for arguments in [
+        &parsed_args.preprocessor_args[..],
+        &parsed_args.dependency_args[..],
+        &parsed_args.common_args[..],
+        &parsed_args.arch_args[..],
+    ] {
+        for arg in arguments {
+            arg.hash(&mut HashToDigest {
+                digest: &mut digest,
+            });
+        }
     }
 
     for hash in extra_hashes {
@@ -551,7 +560,7 @@ pub async fn preprocessor_cache_entry_hash_key(
         }
     }
 
-    let input_path = cwd.join(input);
+    let input_path = cwd.join(&parsed_args.input);
 
     {
         // Hash the input file path, otherwise:
@@ -1052,6 +1061,7 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod test {
     use crate::{
+        compiler::Language,
         test::utils::*,
         util::{HASH_BUFFER_SIZE, MAX_TIME_MACRO_HAYSTACK_LEN},
     };
@@ -1551,15 +1561,19 @@ mod test {
         fs::write(dir1.path().join(file_path), content).unwrap();
         fs::write(dir2.path().join(file_path), content).unwrap();
 
+        let args = ParsedArguments {
+            language: Language::C,
+            input: file_path.into(),
+            ..Default::default()
+        };
+
         // Test 1: With basedirs, hashes should be the same
         let hash1_with_basedirs = preprocessor_cache_entry_hash_key(
             "test_digest",
-            Language::C,
-            &[],
+            &args,
             &[],
             &[],
             dir1.path(),
-            file_path,
             false,
             &dirs,
         )
@@ -1569,12 +1583,10 @@ mod test {
 
         let hash2_with_basedirs = preprocessor_cache_entry_hash_key(
             "test_digest",
-            Language::C,
-            &[],
+            &args,
             &[],
             &[],
             dir2.path(),
-            file_path,
             false,
             &dirs,
         )
@@ -1590,12 +1602,10 @@ mod test {
         // Test 2: With basedir1 for first, and basedir2 for second, hashes should be the same
         let hash1_with_basedirs = preprocessor_cache_entry_hash_key(
             "test_digest",
-            Language::C,
-            &[],
+            &args,
             &[],
             &[],
             dir1.path(),
-            file_path,
             false,
             &dirs[..1],
         )
@@ -1605,12 +1615,10 @@ mod test {
 
         let hash2_with_basedirs = preprocessor_cache_entry_hash_key(
             "test_digest",
-            Language::C,
-            &[],
+            &args,
             &[],
             &[],
             dir2.path(),
-            file_path,
             false,
             &dirs[1..],
         )
@@ -1626,12 +1634,10 @@ mod test {
         // Test 3: Without basedirs, hashes should be different
         let hash1_no_basedirs = preprocessor_cache_entry_hash_key(
             "test_digest",
-            Language::C,
-            &[],
+            &args,
             &[],
             &[],
             dir1.path(),
-            file_path,
             false,
             &[],
         )
@@ -1641,12 +1647,10 @@ mod test {
 
         let hash2_no_basedirs = preprocessor_cache_entry_hash_key(
             "test_digest",
-            Language::C,
-            &[],
+            &args,
             &[],
             &[],
             dir2.path(),
-            file_path,
             false,
             &[],
         )
