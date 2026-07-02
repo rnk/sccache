@@ -692,7 +692,11 @@ where
             Some(s) if s.len() == 2 => NormalizedDisposition::Concatenated,
             _ => NormalizedDisposition::Separated,
         };
-        args.extend(arg.normalize(norm).iter_os_strings());
+
+        match arg.get_data() {
+            Some(DiagnosticsColor(_)) | Some(DiagnosticsColorFlag) => {}
+            _ => args.extend(arg.normalize(norm).iter_os_strings()),
+        }
     }
 
     let xclang_it = ExpandIncludeFile::new(cwd, &xclangs);
@@ -1358,6 +1362,10 @@ pub fn generate_compile_commands(
     arguments.extend_from_slice(&parsed_args.unhashed_args);
     arguments.extend_from_slice(&parsed_args.common_args);
     arguments.extend_from_slice(&parsed_args.arch_args);
+
+    if matches!(parsed_args.color_mode, ColorMode::On | ColorMode::Auto) {
+        arguments.push("-fdiagnostics-color=always".into());
+    }
     if parsed_args.double_dash_input {
         arguments.push("--".into());
     }
@@ -2417,7 +2425,7 @@ mod test {
             o => panic!("Got unexpected parse result: {o:?}"),
         };
 
-        assert!(args.common_args.contains(&"-fdiagnostics-color".into()));
+        assert!(!args.common_args.contains(&"-fdiagnostics-color".into()));
     }
 
     #[test]
@@ -3069,7 +3077,16 @@ mod test {
             false,
         )
         .unwrap();
-        let expected_args = ovec!["-x", "c", "-c", "-o", "foo.o", "--", "foo.c"];
+        let expected_args = ovec![
+            "-x",
+            "c",
+            "-c",
+            "-o",
+            "foo.o",
+            "-fdiagnostics-color=always",
+            "--",
+            "foo.c"
+        ];
         assert_eq!(command.get_arguments(), expected_args);
     }
 
