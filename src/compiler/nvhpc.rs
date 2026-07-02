@@ -19,6 +19,7 @@ use crate::{
         args::*,
         c::{CCompilerImpl, CCompilerKind, DepfilePath, ParsedArguments, PreprocessorOutput},
         gcc::{self, ArgData::*},
+        msvc::from_local_codepage,
     },
     errors::*,
     mock_command::{CommandCreatorSync, RunCommand},
@@ -29,7 +30,7 @@ use crate::{counted_array, dist};
 use async_trait::async_trait;
 use futures::FutureExt;
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     path::{Path, PathBuf},
 };
 
@@ -51,7 +52,6 @@ impl Nvhpc {
     where
         T: CommandCreatorSync,
     {
-        use crate::util::OsStrExt;
         use bytes::Buf;
         use std::io::BufRead;
 
@@ -61,10 +61,10 @@ impl Nvhpc {
             .arg("-showme:command");
 
         let exe = if let Ok(out) = run_input_output(cmd, None).await {
-            which::which(unsafe {
+            which::which(
                 // Remove the trailing newlines (if present)
-                OsStr::from_encoded_bytes_unchecked(&out.stdout).trim()
-            })
+                from_local_codepage(out.stdout).ok()?.trim(),
+            )
             .ok()
             .unwrap_or_else(|| exe.to_path_buf())
         } else {
