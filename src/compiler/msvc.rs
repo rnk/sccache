@@ -450,6 +450,7 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_flag!("analyze-", PassThrough),
     msvc_take_arg!("analyze:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_take_arg!("arch:", OsString, Concatenated, PassThroughWithSuffix),
+    msvc_flag!("arm64EC", PassThrough),
     msvc_flag!("await", PassThrough),
     msvc_flag!("await:strict", PassThrough),
     msvc_flag!("bigobj", PassThrough),
