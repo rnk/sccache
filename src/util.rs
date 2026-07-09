@@ -981,22 +981,26 @@ impl OsStrExt for OsStr {
 
     fn split<P: AsRef<OsStr>>(&self, pat: P) -> impl Iterator<Item = &'_ OsStr> {
         struct Split<'a> {
-            rest: &'a OsStr,
+            rest: Option<&'a OsStr>,
             delim: OsString,
         }
         impl<'a> Iterator for Split<'a> {
             type Item = &'a OsStr;
             fn next(&mut self) -> Option<&'a OsStr> {
-                if let Some((lhs, rhs)) = self.rest.split_once(&self.delim) {
-                    self.rest = rhs;
-                    Some(lhs)
+                if let Some(rest) = self.rest {
+                    if let Some((lhs, rhs)) = rest.split_once(&self.delim) {
+                        self.rest.replace(rhs);
+                        Some(lhs)
+                    } else {
+                        self.rest.take()
+                    }
                 } else {
                     None
                 }
             }
         }
         Split::<'_> {
-            rest: self,
+            rest: Some(self),
             delim: pat.as_ref().to_owned(),
         }
     }
