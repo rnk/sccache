@@ -2055,6 +2055,8 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
         "WATCHOS_DEPLOYMENT_TARGET",
         "SDKROOT",
         "CCC_OVERRIDE_OPTIONS",
+        "QNX_HOST",
+        "QNX_TARGET",
     ]
     .iter()
     .map(OsStr::new)
