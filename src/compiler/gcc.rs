@@ -656,11 +656,38 @@ where
                 extra_hash_files.push(cwd.join(path));
                 &mut common_args
             }
-            Some(PreprocessorArgument(_)) => {
+            Some(PreprocessorArgument(val)) => {
                 if matches!(arg.flag_str(), Some("-Xpreprocessor") | Some("-Wp")) {
-                    too_hard_for_preprocessor_cache_mode.extend(arg.iter_os_strings());
+                    // `-Wp,-MD`, `-Wp,-MT`, and `-Wp,-MF` are not too hard for preprocessor cache mode.
+                    // Instead, parse out the dependency file and target names, for example:
+                    //  * `-Wp,-MD,CMakeFiles/foo.dir/foo.cpp.o.d`
+                    //  * `-Wp,-MT,CMakeFiles/foo.dir/foo.cpp.o`
+                    //  * `-Wp,-MF,CMakeFiles/foo.dir/foo.cpp.o.d`
+                    let mut preprocessor_arg = val.split(",");
+                    let preprocessor_arg_arg = preprocessor_arg.next().and_then(|s| s.to_str());
+                    let preprocessor_arg_val = preprocessor_arg.next();
+                    match (preprocessor_arg_arg, preprocessor_arg_val) {
+                        (Some("-MD"), Some(s)) |
+                        (Some("-MF"), Some(s)) |
+                        (Some("--write-dependencies"), Some(s)) => {
+                            depfile = Some(s.into());
+                            need_explicit_dep_argument_path = DepArgumentRequirePath::Provided;
+                            &mut dependency_args
+                        }
+                        (Some("-MT"), Some(s)) |
+                        (Some("-MQ"), Some(s)) => {
+                            need_explicit_dep_target = false;
+                            dep_target = Some(s.into());
+                            &mut dependency_args
+                        }
+                        _ => {
+                            too_hard_for_preprocessor_cache_mode.extend(arg.iter_os_strings());
+                            &mut preprocessor_args
+                        }
+                    }
+                } else {
+                    &mut preprocessor_args
                 }
-                &mut preprocessor_args
             }
             Some(PreprocessorArgumentFlag) | Some(PreprocessorArgumentPath(_)) => {
                 &mut preprocessor_args
@@ -1044,7 +1071,15 @@ where
                 }
             )
             .as_slice(),
-        )
+        );
+
+    // Some "gcc-like" compilers (QNX's qcc/q++) need an explicit `-o -`,
+    // otherwise they write the preprocessed file to `<input>.i`
+    if let CCompilerKind::Gcc = kind {
+        cmd.arg("-o").arg("-");
+    }
+
+    cmd
         // older NVCC versions only support `-E` when it comes after preprocessor and common flags.
         .arg("-E")
         .args(extra_preprocessor_flags);
@@ -1139,8 +1174,6 @@ where
         &depfile,
     );
 
-    trace!("[{}]: dependencies: {cmd}", parsed_args.output_pretty());
-
     run_input_output(cmd, None).await?;
 
     Ok(depfile)
@@ -1161,12 +1194,12 @@ where
     let generate_deps_with_system_headers = parsed_args
         .dependency_args
         .iter()
-        .any(|arg| arg == "-MD" || arg == "--write-dependencies");
+        .any(|arg| arg.contains("-MD") || arg.contains("--write-dependencies"));
 
     let generate_deps_without_system_headers = parsed_args
         .dependency_args
         .iter()
-        .any(|arg| arg == "-MMD" || arg == "--write-user-dependencies");
+        .any(|arg| arg.contains("-MMD") || arg.contains("--write-user-dependencies"));
 
     let depfile = if let Some(depfile) = parsed_args
         .depfile
@@ -1201,11 +1234,25 @@ where
             // If only `-MD`, or missing/invalid depflags, write all dependencies to a tempfile while preprocessing.
             if !generate_deps_with_system_headers {
                 // Add missing `-MD` to preprocessor command
-                preprocess_command.arg("-MD");
+                if let CCompilerKind::Gcc = kind {
+                    let mut md = OsString::new();
+                    md.push("-Wp,-MD,");
+                    md.push(temp.as_os_str());
+                    preprocess_command.arg(md);
+                } else {
+                    preprocess_command.arg("-MD");
+                }
             }
             // Add `-MF <temp>` to preprocessor command
-            preprocess_command.arg("-MF");
-            preprocess_command.arg(&temp);
+            if let CCompilerKind::Gcc = kind {
+                let mut mf = OsString::new();
+                mf.push("-Wp,-MF,");
+                mf.push(temp.as_os_str());
+                preprocess_command.arg(mf);
+            } else {
+                preprocess_command.arg("-MF");
+                preprocess_command.arg(&temp);
+            }
         }
 
         DepfilePath::Temp(temp)
@@ -1226,19 +1273,36 @@ fn generate_dependencies_cmd<T>(
 where
     T: CommandCreatorSync,
 {
+    // Replace existing dependency options with flags to generate and write all dependencies to `depfile`
+    let mut dependency_args = vec![];
+
+    if parsed_args.cxx20_modules {
+        if let CCompilerKind::Gcc = kind {
+            let mut md = OsString::new();
+            md.push("-Wp,-MD,");
+            md.push(depfile);
+            dependency_args.push(md);
+        } else {
+            dependency_args.push("-MD".into());
+        }
+    } else {
+        dependency_args.push("-M".into());
+    }
+
+    if let CCompilerKind::Gcc = kind {
+        let mut mf = OsString::new();
+        mf.push("-Wp,-MF,");
+        mf.push(depfile);
+        dependency_args.push(mf);
+    } else {
+        dependency_args.push("-MF".into());
+        dependency_args.push(depfile.into());
+    }
+
     let cmd = preprocess_cmd(
         creator.clone().new_command_sync(executable),
         &ParsedArguments {
-            // Replace existing dependency options with flags to generate and write all dependencies to `depfile`
-            dependency_args: vec![
-                if parsed_args.cxx20_modules {
-                    "-MD".into()
-                } else {
-                    "-M".into()
-                },
-                "-MF".into(),
-                depfile.into(),
-            ],
+            dependency_args,
             ..parsed_args.clone()
         },
         cwd,
@@ -1248,11 +1312,7 @@ where
         &[],
     );
 
-    trace!(
-        "[{}]: generate all dependencies cmd: {}",
-        parsed_args.output_pretty(),
-        cmd
-    );
+    trace!("[{}]: dependencies: {}", parsed_args.output_pretty(), cmd);
 
     cmd
 }
@@ -2497,6 +2557,8 @@ mod test {
             "-D__PREPROCESS_ONLY__",
             "-arch",
             "arm64",
+            "-o",
+            "-",
             "-E",
             "foo.cc"
         ];
@@ -3225,5 +3287,58 @@ mod test {
             parsed_args.too_hard_for_preprocessor_cache_mode,
             vec![r#"-Wp,-DFOO="something""#]
         );
+    }
+
+    #[test]
+    fn test_xpreprocessor_dependency_args() {
+        let args = stringvec![
+            "-c",
+            "foo.c",
+            "-fabc",
+            "-Wp,-MD,foo.o.d",
+            "-Wp,-MT,foo.o",
+            "-Wp,-MF,foo.o.d",
+            "-o",
+            "foo.o"
+        ];
+        let ParsedArguments {
+            input,
+            language,
+            outputs,
+            dependency_args,
+            msvc_show_includes,
+            common_args,
+            depfile,
+            ..
+        } = match parse_arguments_(args, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {o:?}"),
+        };
+        assert_eq!(Some("foo.c"), input.to_str());
+        assert_eq!(Language::C, language);
+        assert_eq!(Some("foo.o.d"), depfile.unwrap().to_str());
+        assert_map_contains!(
+            outputs,
+            (
+                "obj",
+                ArtifactDescriptor {
+                    path: "foo.o".into(),
+                    optional: false,
+                }
+            ),
+            (
+                "dep",
+                ArtifactDescriptor {
+                    path: "foo.o.d".into(),
+                    optional: false,
+                }
+            )
+        );
+        assert_eq!(
+            ovec!["-Wp,-MD,foo.o.d", "-Wp,-MT,foo.o", "-Wp,-MF,foo.o.d"],
+            dependency_args
+        );
+        assert_eq!(ovec!["-fabc"], common_args);
+        assert!(!msvc_show_includes);
     }
 }
