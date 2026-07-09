@@ -527,31 +527,9 @@ impl CCompilerImpl for Nvcc {
     where
         T: CommandCreatorSync,
     {
-        gcc::generate_dependencies(
-            creator,
-            executable,
-            &ParsedArguments {
-                dependency_args: parsed_args
-                    .dependency_args
-                    .iter()
-                    // Translate nvcc-specific dependency flags
-                    .map(|arg| match arg.to_str() {
-                        Some("--dependency-output") => "-MF".into(),
-                        Some("--generate-dependencies") => "M".into(),
-                        Some("--generate-nonsystem-dependencies") => "-MM".into(),
-                        Some("--generate-dependencies-with-compile") => "-MD".into(),
-                        Some("--generate-nonsystem-dependencies-with-compile") => "-MMD".into(),
-                        _ => arg.to_owned(),
-                    })
-                    .collect::<Vec<_>>(),
-                ..parsed_args.clone()
-            },
-            cwd,
-            env_vars,
-            self.kind(),
-        )
-        .await
-        .map(Some)
+        gcc::generate_dependencies(creator, executable, parsed_args, cwd, env_vars, self.kind())
+            .await
+            .map(Some)
     }
 
     fn generate_compile_commands(
