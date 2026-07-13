@@ -44,7 +44,7 @@ echo "Test 3: Test ASM"
 ASM="$SCCACHE clang++"
 $ASM -c /sccache/tests/integration/test_intel_asm.s
 
-DEPFILE="/tmp/test.o.d"
+DEPFILE="/build/test.o.d"
 rm -f $DEPFILE
 $ASM -c /sccache/tests/integration/test_intel_asm.s -MD -MF $DEPFILE
 test ! -f $DEPFILE || { echo "ERROR: Dependency file found"; exit 1; }
