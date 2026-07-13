@@ -254,7 +254,7 @@ services:
     entrypoint: /sccache/tests/integration/scripts/test-gcc.sh
     environment:
       <<: *common-env
-      SCCACHE_DIR: /tmp/sccache
+      SCCACHE_DIR: /build/sccache
       SCCACHE_ERROR_LOG: /tmp/sccache-gcc.log
     profiles:
       - test
@@ -266,7 +266,7 @@ services:
     entrypoint: /sccache/tests/integration/scripts/test-clang.sh
     environment:
       <<: *common-env
-      SCCACHE_DIR: /tmp/sccache
+      SCCACHE_DIR: /build/sccache
       SCCACHE_ERROR_LOG: /tmp/sccache-clang.log
     profiles:
       - test
