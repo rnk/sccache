@@ -1443,7 +1443,7 @@ fn create_nvcc_commands_graph(
     env_vars: Vec<(OsString, OsString)>,
     host_compiler: &NvccHostCompiler,
     cudafe_has_gen_module_id_file_flag: bool,
-    mut all_commands: Vec<(PathBuf, PathBuf, Vec<String>)>,
+    all_commands: Vec<(PathBuf, PathBuf, Vec<String>)>,
     output_path: &Path,
 ) -> Vec<Vec<NvccGeneratedSubcommand>> {
     // Create groups of commands that should be run sequential relative to each other,
@@ -1457,7 +1457,7 @@ fn create_nvcc_commands_graph(
     let mut device_compile_groups =
         HashMap::<PathBuf, Vec<(ParsedArguments, NvccGeneratedSubcommand)>>::new();
 
-    for (dir, exe, args) in all_commands.iter_mut() {
+    for (dir, exe, args) in all_commands.iter() {
         let cmd = exe.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
         if let Some((kind, group, parsed_args, env_vars)) = match cmd {
             "" => continue,
@@ -1644,9 +1644,11 @@ counted_array!(static SIMPLE_ARGS: [ArgInfo<gcc::ArgData>; _] = [
 
 fn parse_args_simple<I: IntoIterator<Item = OsString>>(args: I, cwd: &Path) -> ParsedArguments {
     let (input, mut outputs, args) =
-        parse_input_outputs(args.into_iter(), &SIMPLE_ARGS[..], |data| match data {
-            Output(p) => Some(p),
-            _ => None,
+        parse_input_outputs(args.into_iter(), &SIMPLE_ARGS[..], |arg| {
+            match arg.get_data() {
+                Some(Output(p)) => Some(p),
+                _ => None,
+            }
         });
 
     let input = input.map(|p| cwd.join(p)).unwrap_or_default();
@@ -1658,7 +1660,9 @@ fn parse_args_simple<I: IntoIterator<Item = OsString>>(args: I, cwd: &Path) -> P
     if let Some(p) = None
         .or_else(|| outputs.remove("-o"))
         .or_else(|| outputs.remove("-Fo"))
+        .or_else(|| outputs.remove("/Fo"))
         .or_else(|| outputs.remove("-Fi"))
+        .or_else(|| outputs.remove("/Fi"))
         .or_else(|| {
             if outputs.len() == 1 {
                 outputs.drain().next().map(|(_, v)| v)
@@ -1672,16 +1676,16 @@ fn parse_args_simple<I: IntoIterator<Item = OsString>>(args: I, cwd: &Path) -> P
 
     let outputs = outputs
         .drain()
-        .fold(HashMap::new(), |mut map, (key, path)| {
-            map.insert(
+        .map(|(key, path)| {
+            (
                 key,
                 ArtifactDescriptor {
                     path,
                     optional: false,
                 },
-            );
-            map
-        });
+            )
+        })
+        .collect();
 
     ParsedArguments {
         input,
@@ -1819,7 +1823,7 @@ where
         .args(&[arguments, &["--dryrun".into(), "--keep".into()][..]].concat())
         .env_clear()
         .current_dir(cwd)
-        .envs(env_vars.clone());
+        .envs(env_vars.iter().map(|(k, v)| (k, v)));
 
     trace!(
         "[{}]: nvcc dryrun command: {nvcc_dryrun_cmd}",

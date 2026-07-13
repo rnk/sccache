@@ -27,10 +27,9 @@ use crate::{
     util::OsStrExt,
 };
 use async_trait::async_trait;
-use itertools::Itertools;
 use std::{
     collections::HashMap,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
 };
 
@@ -128,29 +127,40 @@ where
     let (input, mut outputs, mut args) = parse_input_outputs(
         arguments.iter().cloned(),
         arg_info.clone(),
-        |data| match data {
-            Output(p) => Some(p),
+        |arg| match arg.get_data() {
+            Some(Output(p)) => Some(p),
             _ => None,
         },
     );
 
-    if let Some(input) = input.as_ref().and_then(|s| s.to_str())
-        && let Some(idx) = args.iter().position(|arg| arg.ends_with(input))
-    {
+    let input = match input {
+        Some(input) => input,
+        // We can't cache compilation without an input.
+        None => return CompilerArguments::CannotCache("no input file", None),
+    };
+
+    // Remove the input from the args list
+    if let Some(idx) = args.iter().position(|arg| arg.ends_with(&input)) {
         args.splice(idx..idx + 1, []);
     }
 
-    for output in outputs.values().map(|p| p.as_os_str()) {
-        if let Some((idx, arg)) = args.iter().find_position(|arg| arg.ends_with(output)) {
-            if arg.starts_with(output) {
+    // Remove the output(s) from the args list
+    for (flag, path) in outputs.iter() {
+        let flag = OsStr::new(flag);
+        let mut both = flag.to_owned();
+        both.push(path);
+        for (idx, arg) in args.iter().enumerate() {
+            if arg == flag {
                 // -o <output>
                 // --tile_bc_file_name <output>
                 // --module_id_file_name <module_id>
-                args.splice(idx - 1..idx + 1, []);
-            } else {
+                args.splice(idx..idx + 2, []);
+                break;
+            } else if arg == &both {
                 // -Fi<output>
                 // -Fo<output>
                 args.splice(idx..idx + 1, []);
+                break;
             }
         }
     }
@@ -164,16 +174,16 @@ where
 
     let mut outputs = outputs
         .drain()
-        .fold(HashMap::new(), |mut map, (key, path)| {
-            map.insert(
+        .map(|(key, path)| {
+            (
                 key,
                 ArtifactDescriptor {
                     path,
                     optional: false,
                 },
-            );
-            map
-        });
+            )
+        })
+        .collect::<HashMap<&'static str, ArtifactDescriptor>>();
 
     let (common_args, unhashed_args, gen_module_id_file, module_id_file_name) =
         ArgsIter::new(args.into_iter(), arg_info)
@@ -187,41 +197,32 @@ where
                     mut module_id_file_name,
                 ),
                  arg| {
-                    let args = if let Some(Unhashed(_)) = arg.get_data() {
-                        &mut unhashed_args
-                    } else {
-                        &mut common_args
+                    let args = match arg.get_data() {
+                        Some(Unhashed(_)) => &mut unhashed_args,
+                        Some(ExtraOutput(path)) => {
+                            if let Some(flag) = arg.flag_str() {
+                                outputs.insert(
+                                    flag,
+                                    ArtifactDescriptor {
+                                        path: path.to_owned(),
+                                        optional: false,
+                                    },
+                                );
+                            }
+                            &mut common_args
+                        }
+                        Some(GenModuleIdFileFlag) => {
+                            gen_module_id_file = true;
+                            &mut common_args
+                        }
+                        Some(ModuleIdFileName(path)) => {
+                            module_id_file_name = Some(cwd.join(path));
+                            &mut common_args
+                        }
+                        _ => &mut common_args,
                     };
 
-                    args.extend(
-                        arg.get_data()
-                            .map(|data| match data {
-                                ExtraOutput(path) => {
-                                    if let Some(flag) = arg.flag_str() {
-                                        outputs.insert(
-                                            flag,
-                                            ArtifactDescriptor {
-                                                path: path.to_owned(),
-                                                optional: false,
-                                            },
-                                        );
-                                    }
-                                    None
-                                }
-                                GenModuleIdFileFlag => {
-                                    gen_module_id_file = true;
-                                    None
-                                }
-                                ModuleIdFileName(path) => {
-                                    module_id_file_name = Some(cwd.join(path));
-                                    None
-                                }
-                                _ => None,
-                            })
-                            .and_then(|arg| arg)
-                            .unwrap_or(arg)
-                            .iter_os_strings(),
-                    );
+                    args.extend(arg.iter_os_strings());
 
                     (
                         common_args,
@@ -258,12 +259,6 @@ where
         }
         _ => {}
     }
-
-    let input = match input {
-        Some(i) => i,
-        // We can't cache compilation without an input.
-        None => return CompilerArguments::CannotCache("no input file", None),
-    };
 
     CompilerArguments::Ok(ParsedArguments {
         input: input.into(),

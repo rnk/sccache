@@ -695,42 +695,25 @@ where
     I: Iterator<Item = OsString>,
     T: ArgumentValue,
     S: SearchableArgInfo<T>,
-    F: Fn(&T) -> Option<&PathBuf>,
+    F: Fn(&Argument<T>) -> Option<&PathBuf>,
 {
     let (input, outputs, args) = ArgsIter::new(args.into_iter(), info)
         .filter_map(|arg| arg.ok())
         .fold(
             (None, HashMap::new(), vec![]),
             |(mut input, mut outputs, mut args), arg| {
-                args.extend(
-                    arg.get_data()
-                        .map(|data| {
-                            if let Some(p) = get_output(data) {
-                                if let Some(flag) = arg.flag_str() {
-                                    outputs.insert(flag, p.clone());
-                                }
-                                let disposition = match arg.flag_str() {
-                                    Some("-Fi") | Some("-Fo") => {
-                                        NormalizedDisposition::Concatenated
-                                    }
-                                    _ => NormalizedDisposition::Separated,
-                                };
-                                Some(arg.clone().normalize(disposition))
-                            } else {
-                                None
-                            }
-                        })
-                        .or_else(|| {
-                            if let Argument::Raw(ref val) = arg {
-                                // Assume the last "raw" argument is the input file
-                                input = Some(val.to_owned());
-                            }
-                            None
-                        })
-                        .and_then(|arg| arg)
-                        .unwrap_or(arg)
-                        .iter_os_strings(),
-                );
+                if let Some(p) = get_output(&arg) {
+                    if let Some(flag) = arg.flag_str() {
+                        outputs.insert(flag, p.clone());
+                    }
+                    args.extend(arg.iter_os_strings());
+                } else {
+                    if let Argument::Raw(ref val) = arg {
+                        // Assume the last "raw" argument is the input file
+                        input = Some(val.to_owned());
+                    }
+                    args.extend(arg.iter_os_strings());
+                }
 
                 (input, outputs, args)
             },
