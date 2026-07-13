@@ -48,6 +48,7 @@ use async_trait::async_trait;
 use filetime::FileTime;
 use fs::File;
 use fs_err as fs;
+use is_executable::IsExecutable;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
@@ -1975,48 +1976,91 @@ fn is_rustc_like<P: AsRef<Path>>(p: P) -> bool {
     )
 }
 
-/// Returns true if the given path looks like cudafe++
-fn is_nvidia_cudafe<P: AsRef<Path>>(p: P) -> bool {
-    matches!(
-        p.as_ref()
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_lowercase())
-            .as_deref(),
-        Some("cudafe++")
-    )
+/// Returns the tool name and nvcc version if the given
+/// path looks like cudafe++, cicc, ptxas, or tileiras.
+///
+/// First assumes each tool is located relative to nvcc
+/// in the standard CUDA toolkit layout, otherwise looks
+/// up the first nvcc on PATH.
+///
+async fn is_internal_nvcc_tool<T, P: AsRef<Path>>(
+    creator: T,
+    path: P,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    pool: &tokio::runtime::Handle,
+) -> Option<(String, String)>
+where
+    T: CommandCreatorSync,
+{
+    let mut path = path.as_ref().to_path_buf();
+
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    let (name, nvcc) = if stem.starts_with("cudafe++") {
+        // nvcc is typically a sibling of cudafe++
+        // (/usr/local/cuda/bin/cudafe++)
+        path.set_file_name("nvcc");
+        ("cudafe++", path)
+    } else if stem.starts_with("cicc") {
+        // nvcc is typically one level up and over from cicc
+        // (/usr/local/cuda/nvvm/bin/cicc)
+        path.pop();
+        path.pop();
+        path.push("bin");
+        path.push("nvcc");
+        ("cicc", path)
+    } else if stem.starts_with("ptxas") {
+        // nvcc is typically a sibling of ptxas
+        // (/usr/local/cuda/bin/ptxas)
+        path.set_file_name("nvcc");
+        ("ptxas", path)
+    } else if stem.starts_with("tileiras") {
+        // nvcc is typically a sibling of tileiras
+        // (/usr/local/cuda/bin/tileiras)
+        path.set_file_name("nvcc");
+        ("tileiras", path)
+    } else {
+        // Path is not an nvcc internal tool
+        return None;
+    };
+
+    let nvcc = if nvcc.is_executable() {
+        Some(nvcc)
+    } else {
+        let env_path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.as_os_str());
+
+        which::which_in("nvcc", env_path, cwd).ok()
+    }
+    // Resolve compiler avoiding ccache wrappers to prevent double-caching.
+    .map(|nvcc| resolve_compiler_avoiding_wrapper(&nvcc, env));
+
+    let version = if let Some(nvcc) = nvcc {
+        if let Ok(nvcc) = detect_c_compiler(creator, nvcc, &[], env, pool.clone()).await {
+            nvcc.version().unwrap_or_else(|| "unknown".to_owned())
+        } else {
+            "unknown".to_owned()
+        }
+    } else {
+        "unknown".to_owned()
+    };
+
+    Some((name.to_owned(), version))
 }
 
-/// Returns true if the given path looks like cicc
-fn is_nvidia_cicc<P: AsRef<Path>>(p: P) -> bool {
-    matches!(
-        p.as_ref()
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_lowercase())
-            .as_deref(),
-        Some("cicc")
-    )
-}
-
-/// Returns true if the given path looks like ptxas
-fn is_nvidia_ptxas<P: AsRef<Path>>(p: P) -> bool {
-    matches!(
-        p.as_ref()
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_lowercase())
-            .as_deref(),
-        Some("ptxas")
-    )
-}
-
-/// Returns true if the given path looks like tileiras
-fn is_nvidia_tileiras<P: AsRef<Path>>(p: P) -> bool {
-    matches!(
-        p.as_ref()
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_lowercase())
-            .as_deref(),
-        Some("tileiras")
-    )
+/// Returns true if the given path looks like llc
+fn is_llvm_llc<P: AsRef<Path>>(p: P) -> bool {
+    p.as_ref()
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .filter(|s| s.starts_with("llc"))
+        .is_some()
 }
 
 /// Returns true if the given path looks like a c compiler program
@@ -2056,10 +2100,13 @@ async fn detect_compiler<T>(
 where
     T: CommandCreatorSync,
 {
+    // Resolve compiler avoiding ccache wrappers to prevent double-caching.
+    let executable = resolve_compiler_avoiding_wrapper(executable, env);
+
     // First, see if this looks like rustc.
 
-    let maybe_rustc_executable = if is_rustc_like(executable) {
-        Some(executable.to_path_buf())
+    let maybe_rustc_executable = if is_rustc_like(&executable) {
+        Some(executable.as_path())
     } else if env.iter().any(|(k, _)| k == OsStr::new("CARGO")) {
         // If not, detect the scenario where cargo is configured to wrap rustc with something other than sccache.
         // This happens when sccache is used as a `RUSTC_WRAPPER` and another tool is used as a
@@ -2070,7 +2117,7 @@ where
         args.iter()
             .next()
             .filter(|arg1| is_rustc_like(arg1))
-            .map(PathBuf::from)
+            .map(Path::new)
     } else {
         None
     };
@@ -2079,67 +2126,95 @@ where
 
     let rustc_executable = if let Some(ref rustc_executable) = maybe_rustc_executable {
         rustc_executable
-    } else if is_nvidia_cudafe(executable) {
-        trace!("Found cudafe++");
+    } else if let Some((name, nvcc_version)) =
+        is_internal_nvcc_tool(creator.clone(), &executable, cwd, env, &pool).await
+    {
+        trace!("Found {name} (version: {nvcc_version})");
+        match name.as_str() {
+            "cudafe++" => {
+                return CCompiler::new(
+                    CudaFE {
+                        version: Some(nvcc_version),
+                    },
+                    executable,
+                    vec![],
+                )
+                .await
+                .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
+            }
+            "cicc" => {
+                return CCompiler::new(
+                    Cicc {
+                        version: Some(nvcc_version),
+                    },
+                    executable,
+                    vec![],
+                )
+                .await
+                .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
+            }
+            "ptxas" => {
+                return CCompiler::new(
+                    Ptxas {
+                        version: Some(nvcc_version),
+                    },
+                    executable,
+                    vec![],
+                )
+                .await
+                .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
+            }
+            "tileiras" => {
+                return CCompiler::new(
+                    Tileiras {
+                        version: Some(nvcc_version),
+                    },
+                    executable,
+                    vec![],
+                )
+                .await
+                .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
+            }
+            _ => unreachable!(),
+        }
+    } else if is_llvm_llc(&executable) {
+        let mut cmd = creator.clone().new_command_sync(&executable);
+        cmd.arg("--version");
+
+        let output = run_input_output(cmd, None).await?;
+
+        let stdout = match str::from_utf8(&output.stdout) {
+            Ok(s) => s,
+            Err(_) => bail!("Failed to parse output"),
+        };
+
+        let version = stdout.lines().next().unwrap_or("unknown").to_string();
+
+        trace!("Found llc  (version: {version})");
+
         return CCompiler::new(
-            CudaFE {
-                // TODO: Use nvcc --version
-                version: Some(String::new()),
+            Llc {
+                version: Some(version),
             },
-            executable.to_owned(),
+            executable,
             vec![],
         )
         .await
         .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
-    } else if is_nvidia_cicc(executable) {
-        trace!("Found cicc");
-        return CCompiler::new(
-            Cicc {
-                // TODO: Use nvcc --version
-                version: Some(String::new()),
-            },
-            executable.to_owned(),
-            vec![],
-        )
-        .await
-        .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
-    } else if is_nvidia_ptxas(executable) {
-        trace!("Found ptxas");
-        return CCompiler::new(
-            Ptxas {
-                // TODO: Use nvcc --version
-                version: Some(String::new()),
-            },
-            executable.to_owned(),
-            vec![],
-        )
-        .await
-        .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
-    } else if is_nvidia_tileiras(executable) {
-        trace!("Found tileiras");
-        return CCompiler::new(
-            Tileiras {
-                // TODO: Use nvcc --version
-                version: Some(String::new()),
-            },
-            executable.to_owned(),
-            vec![],
-        )
-        .await
-        .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
-    } else if is_known_c_compiler(executable) {
-        let cc = detect_c_compiler(creator, executable, args, env.to_vec(), pool).await;
-        return cc.map(|c| (c, None));
+    } else if is_known_c_compiler(&executable) {
+        return detect_c_compiler(creator, executable, args, env, pool)
+            .await
+            .map(|c| (c, None));
     } else {
         // Even if it does not look like rustc like it might still be rustc driver
         // so we do full check
-        executable
+        executable.as_path()
     };
 
     match resolve_rust_compiler(
         creator.clone(),
-        executable,
-        rustc_executable.to_path_buf(),
+        executable.as_path(),
+        rustc_executable,
         env,
         cwd.to_path_buf(),
         dist_archive,
@@ -2151,9 +2226,9 @@ where
         Err(e) => {
             // in case we attempted to test for rustc while it didn't look like it, fallback to c compiler detection one last time
             if maybe_rustc_executable.is_none() {
-                let executable = executable.to_path_buf();
-                let cc = detect_c_compiler(creator, executable, args, env.to_vec(), pool).await;
-                cc.map(|c| (c, None))
+                detect_c_compiler(creator, executable, args, env, pool)
+                    .await
+                    .map(|c| (c, None))
             } else {
                 Err(e)
             }
@@ -2166,7 +2241,7 @@ where
 async fn resolve_rust_compiler<T>(
     creator: T,
     executable: &Path,
-    rustc_executable: PathBuf,
+    rustc_executable: &Path,
     env: &[(OsString, OsString)],
     cwd: PathBuf,
     dist_archive: Option<PathBuf>,
@@ -2179,7 +2254,7 @@ where
     // We're wrapping rustc if the executable doesn't match the detected rustc_executable. In this case the wrapper
     // expects rustc as the first argument.
     if rustc_executable != executable {
-        child.arg(&rustc_executable);
+        child.arg(rustc_executable);
     }
 
     child.env_clear().envs(env.to_vec()).args(&["-vV"]);
@@ -2196,10 +2271,8 @@ where
     // rustc -vV verification status
     match rustc_vv {
         Ok(rustc_verbose_version) => {
-            let rustc_executable2 = rustc_executable.clone();
-
             let proxy = RustupProxy::find_proxy_executable::<T>(
-                &rustc_executable2,
+                rustc_executable,
                 "rustup",
                 creator.clone(),
                 env,
@@ -2218,17 +2291,17 @@ where
                             }
                             Err(e) => {
                                 trace!("Could not resolve compiler with rustup proxy: {e}");
-                                Ok((None, rustc_executable))
+                                Ok((None, rustc_executable.to_path_buf()))
                             }
                         }
                     }
                     Ok(None) => {
                         trace!("Did not find rustup");
-                        Ok((None, rustc_executable))
+                        Ok((None, rustc_executable.to_path_buf()))
                     }
                     Err(e) => {
                         trace!("Did not find rustup due to {e}, compiling without proxy");
-                        Ok((None, rustc_executable))
+                        Ok((None, rustc_executable.to_path_buf()))
                     }
                 }
             });
@@ -2245,7 +2318,7 @@ where
                 })
                 .unwrap_or_else(|_e| {
                     trace!("Compiling rust without proxy");
-                    (None, rustc_executable2)
+                    (None, rustc_executable.to_path_buf())
                 });
 
             debug!("Using rustc at path: {resolved_rustc:?}");
@@ -2315,7 +2388,7 @@ async fn detect_c_compiler<T, P>(
     mut creator: T,
     executable: P,
     arguments: &[OsString],
-    env: Vec<(OsString, OsString)>,
+    env: &[(OsString, OsString)],
     pool: tokio::runtime::Handle,
 ) -> Result<Box<dyn Compiler<T>>>
 where
@@ -2386,8 +2459,7 @@ compiler_version=__VERSION__
     .to_vec();
     let (tempdir, src) = write_temp_file(&pool, "testfile.c".as_ref(), test).await?;
 
-    // Resolve compiler avoiding ccache wrappers to prevent double-caching.
-    let executable = resolve_compiler_avoiding_wrapper(executable.as_ref(), &env);
+    let executable = executable.as_ref().to_owned();
 
     let mut cmd = creator.clone().new_command_sync(&executable);
     cmd.stdout(Stdio::piped())
@@ -2455,10 +2527,10 @@ compiler_version=__VERSION__
             "gcc" | "g++" => {
                 trace!("Found {kind} (version: {})", version.as_ref().unwrap());
                 let specfiles =
-                    Gcc::read_implicit_specfiles(&mut creator, &executable, arguments, &env, "-v")
+                    Gcc::read_implicit_specfiles(&mut creator, &executable, arguments, env, "-v")
                         .await?;
 
-                let native_archs = Gcc::read_native_arch(&mut creator, &executable, &env).await;
+                let native_archs = Gcc::read_native_arch(&mut creator, &executable, env).await;
 
                 return CCompiler::new(
                     Gcc {
@@ -2524,21 +2596,21 @@ compiler_version=__VERSION__
                     &mut creator,
                     &executable,
                     arguments,
-                    &env,
+                    env,
                     "-Xcompiler=-v",
                 )
                 .await?;
 
                 let archs_all =
-                    Nvcc::read_all_archs(&mut creator, &executable, &env, &host_compiler)
+                    Nvcc::read_all_archs(&mut creator, &executable, env, &host_compiler)
                         .await
                         .unwrap_or_default();
                 let archs_major =
-                    Nvcc::read_major_archs(&mut creator, &executable, &env, &host_compiler)
+                    Nvcc::read_major_archs(&mut creator, &executable, env, &host_compiler)
                         .await
                         .unwrap_or_default();
                 let archs_native =
-                    Nvcc::read_native_archs(&mut creator, &executable, &env, &host_compiler)
+                    Nvcc::read_native_archs(&mut creator, &executable, env, &host_compiler)
                         .await
                         .unwrap_or_default();
 
@@ -2561,7 +2633,7 @@ compiler_version=__VERSION__
             "nvhpc" => {
                 let version = version.map(|s| s.replace(' ', ""));
                 trace!("Found {kind} (version: {})", version.as_ref().unwrap());
-                let native_arch = Nvhpc::read_native_arch(&mut creator, &executable, &env).await;
+                let native_arch = Nvhpc::read_native_arch(&mut creator, &executable, env).await;
                 return CCompiler::new(
                     Nvhpc {
                         nvcplusplus: kind == "nvc++",

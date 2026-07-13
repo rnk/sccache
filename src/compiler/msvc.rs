@@ -204,7 +204,7 @@ pub async fn detect_showincludes_prefix<T>(
     creator: &T,
     exe: &OsStr,
     is_clang: bool,
-    env: Vec<(OsString, OsString)>,
+    env: &[(OsString, OsString)],
     pool: &tokio::runtime::Handle,
 ) -> Result<String>
 where
@@ -1617,7 +1617,7 @@ mod test {
         next_command(&creator, Ok(MockChild::new(exit_status(0), stdout, stderr)));
         assert_eq!(
             "blah: ",
-            detect_showincludes_prefix(&creator, "cl.exe".as_ref(), false, Vec::new(), &pool)
+            detect_showincludes_prefix(&creator, "cl.exe".as_ref(), false, &[], &pool)
                 .wait()
                 .unwrap()
         );
