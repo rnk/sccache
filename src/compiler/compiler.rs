@@ -26,6 +26,7 @@ use crate::{
         cudafe::CudaFE,
         diab::Diab,
         gcc::Gcc,
+        llc::Llc,
         msvc::{self, Msvc},
         nvcc::{Nvcc, NvccHostCompiler},
         nvhpc::Nvhpc,
@@ -532,6 +533,7 @@ impl CompilerKind {
             CompilerKind::C(CCompilerKind::Nvhpc) => textual_lang + " [nvhpc]",
             CompilerKind::C(CCompilerKind::TaskingVX) => textual_lang + " [taskingvx]",
             CompilerKind::C(CCompilerKind::Tileiras) => textual_lang + " [tileiras]",
+            CompilerKind::C(CCompilerKind::Llc) => textual_lang + " [llc]",
             CompilerKind::Rust => textual_lang,
         }
     }

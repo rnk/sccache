@@ -267,6 +267,8 @@ pub enum CCompilerKind {
     TaskingVX,
     /// NVIDIA CUDA Tile IR assembler
     Tileiras,
+    // LLVM system compiler
+    Llc,
 }
 
 impl From<&str> for CCompilerKind {
@@ -282,6 +284,8 @@ impl From<&str> for CCompilerKind {
             "ptxas" => CCompilerKind::Ptxas,
             "nvc" | "nvc++" => CCompilerKind::Nvhpc,
             "taskingvx" => CCompilerKind::TaskingVX,
+            "tileiras" => CCompilerKind::Tileiras,
+            "llc" => CCompilerKind::Llc,
             _ => unreachable!(),
         }
     }
