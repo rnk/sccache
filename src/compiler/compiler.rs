@@ -1346,22 +1346,23 @@ where
         let mut has_inputs = false;
         let mut job = None;
 
-        let mut should_retry = |err: &Error, job_id: Option<&str>| {
+        let mut should_retry = |err: &Error, job_id: Option<&str>, server_id: Option<&str>| {
+            use itertools::Itertools;
+
+            let out_pretty = Some(out_pretty.as_str())
+                .iter()
+                .chain(job_id.iter())
+                .chain(server_id.iter())
+                .join(", ");
+
             if num_dist_attempts < dist_retry_limit {
-                debug!(
+                info!(
                     "[{out_pretty}]: Distributed compilation error ({num_dist_attempts} of {dist_retry_limit}), retrying: {err:#}"
                 );
                 num_dist_attempts += 1.0;
                 true
             } else {
-                warn!(
-                    "[{}]: Could not run distributed compilation job: {err}",
-                    if let Some(job_id) = job_id {
-                        [out_pretty, job_id].join(", ")
-                    } else {
-                        out_pretty.to_owned()
-                    }
-                );
+                warn!("[{out_pretty}]: Could not run distributed compilation job: {err}");
                 false
             }
         };
@@ -1377,23 +1378,19 @@ where
             let timeout: u32;
 
             macro_rules! retry_or_bail {
-                ($err:ident, $job_id:expr) => {{
-                    if should_retry(&$err, $job_id) {
+                ($err:ident, $job_id:expr, $server_id:expr) => {{
+                    if should_retry(&$err, $job_id, $server_id) {
                         tokio::time::sleep(retry_delay.next().unwrap()).await;
                         continue;
                     }
                     break Err($err);
                 }};
+                ($err:expr, $job_id:expr, $server_id:expr) => {{
+                    let err = $err;
+                    retry_or_bail!(err, $job_id, $server_id);
+                }};
                 ($err:expr, $job_id:expr) => {{
-                    let err = $err;
-                    retry_or_bail!(err, $job_id);
-                }};
-                ($err:expr) => {{
-                    let err = $err;
-                    retry_or_bail!(err, Some(job_id));
-                }};
-                ($err:ident) => {{
-                    retry_or_bail!($err, Some(job_id));
+                    retry_or_bail!($err, $job_id, None);
                 }};
             }
 
@@ -1429,7 +1426,7 @@ where
                         has_inputs = true;
                     }
                     // Maybe retry network errors
-                    Err(err) => retry_or_bail!(err),
+                    Err(err) => retry_or_bail!(err, Some(job_id.as_str())),
                 }
             }
 
@@ -1443,10 +1440,10 @@ where
                         has_toolchain = true;
                     }
                     Ok(dist::SubmitToolchainResult::Error { message }) => {
-                        retry_or_bail!(anyhow!(message));
+                        retry_or_bail!(anyhow!(message), Some(job_id.as_str()));
                     }
                     // Maybe retry network errors
-                    Err(err) => retry_or_bail!(err),
+                    Err(err) => retry_or_bail!(err, Some(job_id.as_str())),
                 }
             }
 
@@ -1491,7 +1488,11 @@ where
                     debug!(
                         "[{out_pretty}, {job_id}, {server_id}]: Distributed compilation failed (retryable): {message:?}"
                     );
-                    retry_or_bail!(anyhow!("{message:?}"));
+                    retry_or_bail!(
+                        anyhow!(message),
+                        Some(job_id.as_str()),
+                        Some(server_id.as_str())
+                    );
                 }
                 // Missing inputs (S3 cleared, Redis rebooted, etc.)
                 // Can be retried.
@@ -1501,7 +1502,11 @@ where
                     debug!(
                         "[{out_pretty}, {job_id}, {server_id}]: Missing distributed compilation job inputs"
                     );
-                    retry_or_bail!(anyhow!("Missing distributed compilation job inputs"));
+                    retry_or_bail!(
+                        anyhow!("Missing distributed compilation job inputs"),
+                        Some(job_id.as_str()),
+                        Some(server_id.as_str())
+                    );
                 }
                 // Missing toolchain (S3 cleared, Redis rebooted, etc.)
                 // Can be retried.
@@ -1511,7 +1516,11 @@ where
                     debug!(
                         "[{out_pretty}, {job_id}, {server_id}]: Missing distributed compilation job toolchain"
                     );
-                    retry_or_bail!(anyhow!("Missing distributed compilation job toolchain"));
+                    retry_or_bail!(
+                        anyhow!("Missing distributed compilation job toolchain"),
+                        Some(job_id.as_str()),
+                        Some(server_id.as_str())
+                    );
                 }
                 // Missing result (S3 cleared, Redis rebooted, etc.),
                 // or build server failed to write the job result due
@@ -1521,11 +1530,15 @@ where
                     debug!(
                         "[{out_pretty}, {job_id}, {server_id}]: Missing distributed compilation job result"
                     );
-                    retry_or_bail!(anyhow!("Missing distributed compilation job result"));
+                    retry_or_bail!(
+                        anyhow!("Missing distributed compilation job result"),
+                        Some(job_id.as_str()),
+                        Some(server_id.as_str())
+                    );
                 }
                 // Other (e.g. client network, timeout, etc.) errors
                 // Can be retried.
-                Err(err) => retry_or_bail!(anyhow!(err)),
+                Err(err) => retry_or_bail!(anyhow!(err), Some(job_id.as_str())),
             };
 
             debug!(
@@ -1558,7 +1571,7 @@ where
             // an output, we can clean up everything that's been written so far.
             let unpack_result = build_outputs.map(|(path, data)| {
                 let path = path_transformer.to_local(&path).with_context(|| {
-                    format!("[{out_pretty}, {job_id}]: unable to transform output path {path}")
+                    format!("[{out_pretty}, {job_id}, {server_id}]: unable to transform output path {path}")
                 });
 
                 let path = match path {
@@ -1665,13 +1678,15 @@ where
                     if let Err(e) = tokio::fs::remove_file(path).await
                         && e.kind() != io::ErrorKind::NotFound
                     {
-                        debug!("[{out_pretty}, {job_id}]: {e} while attempting to remove {path:?}");
+                        debug!(
+                            "[{out_pretty}, {job_id}, {server_id}]: {e} while attempting to remove {path:?}"
+                        );
                     }
                 }
 
                 if err.downcast_ref::<UnexpectedFileSize>().is_some() {
-                    debug!("[{out_pretty}]: {err:?}");
-                    retry_or_bail!(err);
+                    debug!("[{out_pretty}, {job_id}, {server_id}]: {err:?}");
+                    retry_or_bail!(err, Some(job_id.as_str()), Some(server_id.as_str()));
                 } else {
                     break Err(err);
                 }
