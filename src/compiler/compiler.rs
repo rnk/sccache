@@ -2021,6 +2021,7 @@ where
         // (/usr/local/cuda/nvvm/bin/cicc)
         path.pop();
         path.pop();
+        path.pop();
         path.push("bin");
         path.push("nvcc");
         ("cicc", path)
@@ -2053,7 +2054,7 @@ where
     .map(|nvcc| resolve_compiler_avoiding_wrapper(&nvcc, env));
 
     let version = if let Some(nvcc) = nvcc {
-        if let Ok(nvcc) = detect_c_compiler(creator, nvcc, &[], env, pool.clone()).await {
+        if let Ok(nvcc) = detect_c_compiler(creator, nvcc, &[], cwd, env, pool.clone()).await {
             nvcc.version().unwrap_or_else(|| "unknown".to_owned())
         } else {
             "unknown".to_owned()
@@ -2213,7 +2214,7 @@ where
         .await
         .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
     } else if is_known_c_compiler(&executable) {
-        return detect_c_compiler(creator, executable, args, env, pool)
+        return detect_c_compiler(creator, executable, args, cwd, env, pool)
             .await
             .map(|c| (c, None));
     } else {
@@ -2237,7 +2238,7 @@ where
         Err(e) => {
             // in case we attempted to test for rustc while it didn't look like it, fallback to c compiler detection one last time
             if maybe_rustc_executable.is_none() {
-                detect_c_compiler(creator, executable, args, env, pool)
+                detect_c_compiler(creator, executable, args, cwd, env, pool)
                     .await
                     .map(|c| (c, None))
             } else {
@@ -2399,6 +2400,7 @@ async fn detect_c_compiler<T, P>(
     mut creator: T,
     executable: P,
     arguments: &[OsString],
+    cwd: &Path,
     env: &[(OsString, OsString)],
     pool: tokio::runtime::Handle,
 ) -> Result<Box<dyn Compiler<T>>>
@@ -2537,7 +2539,8 @@ compiler_version=__VERSION__
             }
             "gcc" | "g++" => {
                 trace!("Found {kind} (version: {})", version.as_ref().unwrap());
-                let specfiles =
+                // Include gcc's implicit specfiles in the object hash
+                let extra_hash_files =
                     Gcc::read_implicit_specfiles(&mut creator, &executable, arguments, env, "-v")
                         .await?;
 
@@ -2546,12 +2549,11 @@ compiler_version=__VERSION__
                 return CCompiler::new(
                     Gcc {
                         gplusplus: kind == "g++",
-                        specfiles: specfiles.clone(),
                         version,
                         native_archs,
                     },
                     executable,
-                    specfiles,
+                    extra_hash_files,
                 )
                 .await
                 .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
@@ -2602,7 +2604,8 @@ compiler_version=__VERSION__
                     host_compiler_version.as_ref().unwrap()
                 );
 
-                let specfiles = Nvcc::read_implicit_specfiles(
+                // Include gcc's implicit specfiles in the object hash
+                let mut extra_hash_files = Nvcc::read_implicit_specfiles(
                     &host_compiler,
                     &mut creator,
                     &executable,
@@ -2611,6 +2614,44 @@ compiler_version=__VERSION__
                     "-Xcompiler=-v",
                 )
                 .await?;
+
+                // Include cudafe++, cicc, ptxas, tileiras, and fatbinary
+                // in the hash in case the nvcc binary doesn't change but
+                // one of its subcomponents does.
+                extra_hash_files.extend(
+                    [
+                        executable.with_file_name("cudafe++"),
+                        {
+                            let mut cicc = executable.clone();
+                            cicc.pop();
+                            cicc.pop();
+                            cicc.push("nvvm");
+                            cicc.push("bin");
+                            cicc.push("cicc");
+                            cicc
+                        },
+                        executable.with_file_name("ptxas"),
+                        executable.with_file_name("tileiras"),
+                        executable.with_file_name("fatbinary"),
+                    ]
+                    .into_iter()
+                    .filter_map(|path| {
+                        if path.is_executable() {
+                            Some(path)
+                        } else if let Some(name) = path.file_name() {
+                            let env_path = env
+                                .iter()
+                                .find(|(k, _)| k == "PATH")
+                                .map(|(_, v)| v.as_os_str());
+
+                            which::which_in(name, env_path, cwd).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    // Resolve compiler avoiding ccache wrappers to prevent double-caching.
+                    .map(|path| resolve_compiler_avoiding_wrapper(&path, env)),
+                );
 
                 let archs_all =
                     Nvcc::read_all_archs(&mut creator, &executable, env, &host_compiler)
@@ -2633,10 +2674,9 @@ compiler_version=__VERSION__
                         host_compiler,
                         version,
                         host_compiler_version,
-                        specfiles,
                     },
                     executable,
-                    vec![],
+                    extra_hash_files,
                 )
                 .await
                 .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
