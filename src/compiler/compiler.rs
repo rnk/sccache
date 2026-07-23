@@ -1290,8 +1290,6 @@ where
             ..
         } = self;
 
-        let pending = service.increment_pending_compilations();
-
         // Ensure the dependency file exists
         compilation.generate_dependencies(creator).await?;
 
@@ -1319,8 +1317,6 @@ where
 
             job_inputs
         };
-
-        drop(pending);
 
         trace!("[{out_pretty}]: Identifying dist toolchain for {executable:?}");
 
