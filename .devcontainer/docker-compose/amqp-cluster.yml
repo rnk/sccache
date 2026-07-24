@@ -4,7 +4,7 @@ services:
     hostname: rabbitmq1
     image: rabbitmq:management
     environment: {RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-setcookie 12345"}
-    volumes: ["./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro"]
+    volumes: ["./rabbitmq-cluster.conf:/etc/rabbitmq/rabbitmq.conf:ro"]
 
   rabbitmq2:
     <<: *rabbitmq_svc

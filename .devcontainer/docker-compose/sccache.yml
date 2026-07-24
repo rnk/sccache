@@ -56,7 +56,7 @@ services:
       SCCACHE_DIST_BUILDER_TYPE: "overlay"
       SCCACHE_DIST_BUILD_DIR: "/sccache/server-1"
       SCCACHE_DIST_BWRAP_PATH: "/usr/bin/bwrap"
-      SCCACHE_THREADS_PERCENT: "0.5"
+      SCCACHE_THREADS_PERCENT: "50"
       SCCACHE_DIST_MAX_PER_CORE_LOAD: "1"
       SCCACHE_DIST_MAX_PER_CORE_PREFETCH: "1"
       SCCACHE_DIST_SERVER_CACHE_DIR: "/sccache/server-1"
