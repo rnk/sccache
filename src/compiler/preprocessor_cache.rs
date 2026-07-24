@@ -470,7 +470,7 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
 pub async fn preprocessor_cache_entry_hash_key(
     compiler_digest: &str,
     parsed_args: &ParsedArguments,
-    extra_hashes: &[String],
+    extra_hashes: &[&str],
     env_vars: &[(OsString, OsString)],
     cwd: &Path,
     plusplus: bool,

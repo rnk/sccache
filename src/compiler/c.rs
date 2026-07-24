@@ -66,6 +66,7 @@ where
     pub executable_digest: String,
     #[cfg(not(test))]
     executable_digest: String,
+    extra_hashes: Vec<String>,
     compiler: I,
     // cache for hashed preprocessor dependencies
     preprocessor_dependencies_cache: Arc<Mutex<LruCache<PathBuf, Arc<Result<CachedIncludeEntry>>>>>,
@@ -81,6 +82,7 @@ where
     executable: PathBuf,
     executable_digest: String,
     compiler: I,
+    extra_hashes: Vec<String>,
     // cache for hashed preprocessor dependencies
     preprocessor_dependencies_cache: Arc<Mutex<LruCache<PathBuf, Arc<Result<CachedIncludeEntry>>>>>,
 }
@@ -474,6 +476,7 @@ where
             compiler,
             executable,
             executable_digest,
+            extra_hashes: vec![],
             preprocessor_dependencies_cache: Arc::new(Mutex::new(LruCache::new(
                 // TODO: capacity chosen arbitrarily, should measure instead
                 10_000,
@@ -536,6 +539,11 @@ where
     pub fn compiler(&self) -> &I {
         &self.compiler
     }
+
+    pub fn with_extra_hashes(mut self, extra_hashes: Vec<String>) -> Self {
+        self.extra_hashes.extend(extra_hashes);
+        self
+    }
 }
 
 impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
@@ -590,6 +598,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
                     executable: self.executable.clone(),
                     executable_digest: self.executable_digest.clone(),
                     compiler: self.compiler.clone(),
+                    extra_hashes: self.extra_hashes.clone(),
                     preprocessor_dependencies_cache: self.preprocessor_dependencies_cache.clone(),
                 }))
             }
@@ -623,7 +632,7 @@ where
         &self,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
-        extra_hashes: &[String],
+        extra_hashes: &[&str],
         cache_control: &CacheControl,
         storage: &dyn Storage,
     ) -> Result<PreprocessorCacheLookup> {
@@ -759,11 +768,13 @@ where
             });
         }
 
-        let extra_hashes = if parsed_args.extra_hash_files.is_empty() {
-            vec![]
-        } else {
-            hash_all(&parsed_args.extra_hash_files).await?
-        };
+        let extra_hashes = hash_all(&parsed_args.extra_hash_files).await?;
+        let extra_hashes = self
+            .extra_hashes
+            .iter()
+            .chain(extra_hashes.iter())
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>();
 
         let kind = compiler.kind().into();
         let lang = <CCompilerHasher<I> as CompilerHasher<T>>::language(&*self);
@@ -1008,7 +1019,7 @@ struct Preprocess<'a, T: Send, I> {
     env_vars: &'a [(OsString, OsString)],
     exe: &'a Path,
     executable_digest: &'a str,
-    extra_hashes: &'a [String],
+    extra_hashes: &'a [&'a str],
     generate_dependencies: bool,
     include_line_numbers: bool,
     out_pretty: Cow<'a, str>,
@@ -1074,7 +1085,7 @@ where
     }
 
     /// Sets additional hash data to include in the cache key.
-    fn with_extra_hashes(mut self, extra_hashes: &'a [String]) -> Self {
+    fn with_extra_hashes(mut self, extra_hashes: &'a [&'a str]) -> Self {
         self.extra_hashes = extra_hashes;
         self
     }
@@ -2088,7 +2099,7 @@ pub struct HashKeyParams<'a> {
     compiler_digest: &'a str,
     parsed_args: &'a ParsedArguments,
     preprocessor_output: Pin<Box<ProcessOutputStream>>,
-    extra_hashes: &'a [String],
+    extra_hashes: &'a [&'a str],
     env_vars: &'a [(OsString, OsString)],
     plusplus: bool,
     basedirs: &'a [Vec<u8>],
@@ -2120,7 +2131,7 @@ impl<'a> HashKeyParams<'a> {
     }
 
     /// Sets additional hash data to include in the cache key.
-    pub fn with_extra_hashes(mut self, extra_hashes: &'a [String]) -> Self {
+    pub fn with_extra_hashes(mut self, extra_hashes: &'a [&'a str]) -> Self {
         self.extra_hashes = extra_hashes;
         self
     }
@@ -2454,7 +2465,7 @@ mod test {
             language: Language::C,
             ..Default::default()
         };
-        let extra_data = stringvec!["hello", "world"];
+        let extra_data = vec!["hello", "world"];
         const PREPROCESSED: &[u8] = b"hello world";
 
         let h1 = HashKeyParams::new("abcd", &args, into_process_output_stream(PREPROCESSED))

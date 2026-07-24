@@ -48,6 +48,7 @@ use async_trait::async_trait;
 use filetime::FileTime;
 use fs::File;
 use fs_err as fs;
+use futures::TryFutureExt;
 use is_executable::IsExecutable;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -1368,7 +1369,7 @@ where
             .map(tokio_retry2::strategy::jitter);
 
         let dist_compile_res = loop {
-            use futures::{TryFutureExt, TryStreamExt};
+            use futures::TryStreamExt;
 
             let job_id: &String;
             let timeout: u32;
@@ -2054,7 +2055,7 @@ where
     .map(|nvcc| resolve_compiler_avoiding_wrapper(&nvcc, env));
 
     let version = if let Some(nvcc) = nvcc {
-        if let Ok(nvcc) = detect_c_compiler(creator, nvcc, &[], cwd, env, pool.clone()).await {
+        if let Ok(nvcc) = detect_c_compiler(creator, nvcc, &[], env, pool.clone()).await {
             nvcc.version().unwrap_or_else(|| "unknown".to_owned())
         } else {
             "unknown".to_owned()
@@ -2214,7 +2215,7 @@ where
         .await
         .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
     } else if is_known_c_compiler(&executable) {
-        return detect_c_compiler(creator, executable, args, cwd, env, pool)
+        return detect_c_compiler(creator, executable, args, env, pool)
             .await
             .map(|c| (c, None));
     } else {
@@ -2238,7 +2239,7 @@ where
         Err(e) => {
             // in case we attempted to test for rustc while it didn't look like it, fallback to c compiler detection one last time
             if maybe_rustc_executable.is_none() {
-                detect_c_compiler(creator, executable, args, cwd, env, pool)
+                detect_c_compiler(creator, executable, args, env, pool)
                     .await
                     .map(|c| (c, None))
             } else {
@@ -2289,7 +2290,6 @@ where
                 creator.clone(),
                 env,
             );
-            use futures::TryFutureExt;
             let creator1 = creator.clone();
             let res = proxy.and_then(move |proxy| async move {
                 match proxy {
@@ -2400,7 +2400,6 @@ async fn detect_c_compiler<T, P>(
     mut creator: T,
     executable: P,
     arguments: &[OsString],
-    cwd: &Path,
     env: &[(OsString, OsString)],
     pool: tokio::runtime::Handle,
 ) -> Result<Box<dyn Compiler<T>>>
@@ -2606,11 +2605,11 @@ compiler_version=__VERSION__
 
                 // Include gcc's implicit specfiles in the object hash
                 let mut extra_hash_files = Nvcc::read_implicit_specfiles(
-                    &host_compiler,
                     &mut creator,
                     &executable,
                     arguments,
                     env,
+                    &host_compiler,
                     "-Xcompiler=-v",
                 )
                 .await?;
@@ -2618,39 +2617,31 @@ compiler_version=__VERSION__
                 // Include cudafe++, cicc, ptxas, tileiras, and fatbinary
                 // in the hash in case the nvcc binary doesn't change but
                 // one of its subcomponents does.
-                extra_hash_files.extend(
-                    [
-                        executable.with_file_name("cudafe++"),
-                        {
-                            let mut cicc = executable.clone();
-                            cicc.pop();
-                            cicc.pop();
-                            cicc.push("nvvm");
-                            cicc.push("bin");
-                            cicc.push("cicc");
-                            cicc
-                        },
-                        executable.with_file_name("ptxas"),
-                        executable.with_file_name("tileiras"),
-                        executable.with_file_name("fatbinary"),
-                    ]
-                    .into_iter()
-                    .filter_map(|path| {
-                        if path.is_executable() {
-                            Some(path)
-                        } else if let Some(name) = path.file_name() {
-                            let env_path = env
-                                .iter()
-                                .find(|(k, _)| k == "PATH")
-                                .map(|(_, v)| v.as_os_str());
+                let nvcc_tools =
+                    // >= CUDA 13.3: Try with `--enable-tile` so we find tileiras
+                    Nvcc::find_internal_tools(
+                        &mut creator,
+                        &executable,
+                        &["--enable-tile".into()],
+                        env,
+                        &host_compiler,
+                    )
+                    .await;
 
-                            which::which_in(name, env_path, cwd).ok()
-                        } else {
-                            None
-                        }
-                    })
-                    // Resolve compiler avoiding ccache wrappers to prevent double-caching.
-                    .map(|path| resolve_compiler_avoiding_wrapper(&path, env)),
+                let nvcc_tools = if let Ok(nvcc_tools) = nvcc_tools {
+                    nvcc_tools
+                } else {
+                    // <= CUDA 13.2: Fallback without `--enable-tile`
+                    Nvcc::find_internal_tools(&mut creator, &executable, &[], env, &host_compiler)
+                        .await
+                        .unwrap_or_default()
+                };
+
+                extra_hash_files.extend(
+                    nvcc_tools
+                        .iter()
+                        // Resolve compiler avoiding ccache wrappers to prevent double-caching.
+                        .map(|path| resolve_compiler_avoiding_wrapper(path, env)),
                 );
 
                 let archs_all =
@@ -2676,8 +2667,13 @@ compiler_version=__VERSION__
                         host_compiler_version,
                     },
                     executable,
-                    extra_hash_files,
+                    vec![],
                 )
+                .and_then(|nvcc| async move {
+                    crate::util::hash_all(&extra_hash_files)
+                        .await
+                        .map(|extra_hashes| nvcc.with_extra_hashes(extra_hashes))
+                })
                 .await
                 .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }

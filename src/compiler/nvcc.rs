@@ -94,11 +94,11 @@ pub struct Nvcc {
 
 impl Nvcc {
     pub async fn read_implicit_specfiles<T>(
-        host_compiler: &NvccHostCompiler,
         creator: &mut T,
         exe: &Path,
         arguments: &[OsString],
         env_vars: &[(OsString, OsString)],
+        host_compiler: &NvccHostCompiler,
         v_flag: &str,
     ) -> Result<Vec<PathBuf>>
     where
@@ -195,6 +195,49 @@ impl Nvcc {
             )))
         })
         .try_collect()
+    }
+
+    pub async fn find_internal_tools<T>(
+        creator: &mut T,
+        exe: &Path,
+        arguments: &[OsString],
+        env_vars: &[(OsString, OsString)],
+        host_compiler: &NvccHostCompiler,
+    ) -> Result<Vec<PathBuf>>
+    where
+        T: CommandCreatorSync,
+    {
+        let mut args = arguments.to_vec();
+        let mut env_vars = env_vars.to_vec();
+        let mut nvcc_internal_files = HashMap::<String, String>::new();
+        args.extend([
+            "-x".into(),
+            "cu".into(),
+            "-c".into(),
+            "x.cu".into(),
+            "-o".into(),
+            "x.cu.o".into(),
+        ]);
+        select_nvcc_subcommands(
+            creator,
+            exe,
+            Path::new("."),
+            &mut env_vars,
+            &args,
+            &NvccCompileFlag::Device,
+            host_compiler,
+            &mut nvcc_internal_files,
+            Path::new("x.cu.o"),
+            is_nvcc_exe,
+        )
+        .await
+        .map(|cmds| {
+            cmds.into_iter()
+                .map(|(_, exe, _)| exe)
+                .sorted()
+                .dedup()
+                .collect()
+        })
     }
 }
 
