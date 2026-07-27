@@ -1342,12 +1342,12 @@ where
         .split();
         let mut sink = sink.sink_err_into::<Error>();
 
-        let (incoming, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let (reqs_tx, mut reqs_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let me = Arc::new(self);
 
         let _handle = util::spawn(async move {
-            while let Some(req) = requests.recv().await {
+            while let Some(req) = reqs_rx.recv().await {
                 match req {
                     Ok(req) => {
                         let res = match util::spawn(me.clone().call(req)).await? {
@@ -1382,7 +1382,7 @@ where
         while let Some(req) = stream.next().await {
             match req {
                 Ok(req) => {
-                    incoming.send(Ok(req))?;
+                    reqs_tx.send(Ok(req))?;
                 }
                 Err(err) => {
                     return Err(err);
