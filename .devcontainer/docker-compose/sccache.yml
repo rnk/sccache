@@ -33,12 +33,19 @@ services:
     volumes:
       - /tmp/sccache:/sccache:z
       - ../../target/${CARGO_BUILD_TARGET:-x86_64-unknown-linux-musl}/${BUILD_TYPE:-release}/sccache-dist:/sccache-dist:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}\n' 0.0.0.0:10500/api/v2/status | grep -q 401"]
+      interval: "10s"
+      timeout: "10s"
+      retries: "3"
+      start_period: "30s"
+      start_interval: "5s"
     command: >
       bash -c "
       sleep 10;
       set -o errexit;
       umask 000;
-      apt update && apt install -y --no-install-recommends ca-certificates;
+      apt update && apt install -y --no-install-recommends ca-certificates curl;
       rm -rf '$$SCCACHE_DIST_TOOLCHAINS_DIR';
       mkdir -p '$$SCCACHE_DIST_TOOLCHAINS_DIR';
       exec /sccache-dist scheduler;"
@@ -68,11 +75,11 @@ services:
       - /tmp/sccache:/sccache:z
       - ../../target/${CARGO_BUILD_TARGET:-x86_64-unknown-linux-musl}/${BUILD_TYPE:-release}/sccache-dist:/sccache-dist:ro
     healthcheck: &sccache_server_healthcheck
-      test: ["CMD", "curl", "0.0.0.0:9091"]
-      interval: "30s"
+      test: ["CMD", "curl", "0.0.0.0:9001"]
+      interval: "10s"
       timeout: "10s"
       retries: "3"
-      start_period: "60s"
+      start_period: "30s"
       start_interval: "5s"
     command: >
       bash -c "
@@ -102,7 +109,7 @@ services:
       - ../../target/${CARGO_BUILD_TARGET:-x86_64-unknown-linux-musl}/${BUILD_TYPE:-release}/sccache-dist:/sccache-dist:ro
     healthcheck:
       <<: *sccache_server_healthcheck
-      test: ["CMD", "curl", "0.0.0.0:9092"]
+      test: ["CMD", "curl", "0.0.0.0:9002"]
     command: >
       bash -c "
       sleep 10;
