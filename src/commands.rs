@@ -174,7 +174,7 @@ fn create_error_log() -> Result<File> {
     let f = match OpenOptions::new().create(true).append(true).open(&name) {
         Ok(f) => f,
         Err(_) => {
-            bail!("Cannot open/write log file '{}'", &name);
+            bail!("Cannot open/write log file '{}'", name);
         }
     };
     Ok(f)

@@ -589,10 +589,7 @@ where
                 .context("Failed to parse output of rustup which rustc")?;
 
             let proxied_compiler = PathBuf::from(stdout.trim());
-            trace!(
-                "proxy: rustup which rustc produced: {:?}",
-                &proxied_compiler
-            );
+            trace!("proxy: rustup which rustc produced: {:?}", proxied_compiler);
             // TODO: Delegate FS access to a thread pool if possible
             let attr = fs::metadata(proxied_compiler.as_path())
                 .context("Failed to obtain metadata of the resolved, true rustc")?;
@@ -729,7 +726,7 @@ impl RustupProxy {
                 let stdout = bytes_to_string(rustup_candidate_check.stdout)
                     .map_err(|_e| anyhow!("Response of `rustup --version` is not valid UTF-8"))?;
                 Ok(if stdout.trim().starts_with("rustup ") {
-                    trace!("PROXY rustup --version produced: {}", &stdout);
+                    trace!("PROXY rustup --version produced: {}", stdout);
                     Self::new(&proxy_executable).map(Some)
                 } else {
                     Err(anyhow!("Unexpected output or `rustup --version`"))
@@ -2427,7 +2424,7 @@ src/bin/sccache-dist/token_check.rs:
         dep_info: Some(depinfo_file.clone()),
     });
     let () = ror
-        .handle_outputs(&pt, &[depinfo_file.as_path()], &[])
+        .handle_outputs(&pt, std::slice::from_ref(&depinfo_file), &[])
         .unwrap();
 
     let mut s = String::new();
