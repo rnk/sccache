@@ -879,6 +879,8 @@ impl From<(StorageKind, Vec<Vec<u8>>, S3CacheConfig)> for StorageBuilder {
             no_credentials,
             region,
             server_side_encryption,
+            server_side_encryption_aws_kms,
+            server_side_encryption_kms_key_id,
             use_ssl,
             preprocessor_cache_mode,
             rw_mode,
@@ -896,6 +898,8 @@ impl From<(StorageKind, Vec<Vec<u8>>, S3CacheConfig)> for StorageBuilder {
                 .with_endpoint(endpoint.clone())
                 .with_use_ssl(use_ssl)
                 .with_server_side_encryption(server_side_encryption)
+                .with_server_side_encryption_aws_kms(server_side_encryption_aws_kms)
+                .with_server_side_encryption_kms_key_id(server_side_encryption_kms_key_id.clone())
                 .with_enable_virtual_host_style(enable_virtual_host_style)
                 .build()
                 .map(|storage| Arc::new(RemoteStorage::new(storage, basedirs.clone())) as Arc<dyn Storage>)
