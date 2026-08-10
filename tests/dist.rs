@@ -155,7 +155,9 @@ async fn rust_compile(client: &SccacheClient, tmpdir: &Path) -> Result<Output> {
         version = "0.1.0"
         edition = "2021"
         [dependencies]
-        libc = "=0.2.186""#,
+        # Pinned: the point of this test is that distributed compilation works,
+        # not that it keeps up with whatever libc published most recently.
+        libc = "=0.2.169""#,
     );
     write_source(
         &cargo_path,
