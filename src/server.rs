@@ -1834,7 +1834,7 @@ where
             if let Some(cache_write) = cache_write {
                 match cache_write.await {
                     Err(e) => {
-                        warn!("[{out_pretty}]: Error executing cache write: {e}");
+                        debug!("[{out_pretty}]: Error executing cache write: {e}");
                         me.stats.lock().await.cache_write_errors += 1;
                     }
                     //TODO: save cache stats!
