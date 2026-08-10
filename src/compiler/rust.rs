@@ -2424,7 +2424,7 @@ src/bin/sccache-dist/token_check.rs:
         dep_info: Some(depinfo_file.clone()),
     });
     let () = ror
-        .handle_outputs(&pt, std::slice::from_ref(&depinfo_file), &[])
+        .handle_outputs(&pt, &[depinfo_file.as_path()], &[])
         .unwrap();
 
     let mut s = String::new();
