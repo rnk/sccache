@@ -18,8 +18,9 @@ use crate::{
         ArtifactDescriptor, CCompilerImpl, CCompilerKind, DepfilePath, ParsedArguments,
         PreprocessorOutput,
     },
-    compiler::{Cacheable, CompilerArguments, Language, SingleCompileCommand},
-    compiler::{CompileCommandImpl, args::*},
+    compiler::{
+        Cacheable, CompileCommandImpl, CompilerArguments, Language, SingleCompileCommand, args::*,
+    },
     counted_array, dist,
     errors::*,
     mock_command::CommandCreatorSync,
@@ -403,3 +404,67 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("-prec_sqrt", OsString, Concatenated(b'='), PassThrough),
     take_arg!("-t", OsString, Concatenated, PassThrough),
 ]);
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::compiler::ptxas;
+
+    fn os_strings(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn test_parse_cicc_input_before_simt_only() {
+        let args = os_strings(&[
+            "--device-c",
+            "-arch",
+            "compute_80",
+            "--module_id_file_name",
+            "kernel.module_id",
+            "kernel.cpp1.ii",
+            "--simt-only",
+            "-o",
+            "kernel.ptx",
+        ]);
+
+        let parsed = match parse_arguments(&args, ".".as_ref(), Language::Ptx, &ARGS[..]) {
+            CompilerArguments::Ok(parsed) => parsed,
+            other => panic!("Got unexpected parse result: {:?}", other),
+        };
+
+        assert_eq!(PathBuf::from("kernel.cpp1.ii"), parsed.input);
+        assert_eq!(
+            Some(&ArtifactDescriptor {
+                path: PathBuf::from(".").join("kernel.ptx"),
+                optional: false
+            }),
+            parsed.outputs.get("obj")
+        );
+    }
+
+    #[test]
+    fn test_parse_ptxas_input_by_ptx_extension() {
+        let args = os_strings(&[
+            "-arch=sm_80",
+            "kernel.ptx",
+            "--some-new-flag",
+            "-o",
+            "kernel.cubin",
+        ]);
+
+        let parsed = match parse_arguments(&args, ".".as_ref(), Language::Cubin, &ptxas::ARGS[..]) {
+            CompilerArguments::Ok(parsed) => parsed,
+            other => panic!("Got unexpected parse result: {:?}", other),
+        };
+
+        assert_eq!(PathBuf::from("kernel.ptx"), parsed.input);
+        assert_eq!(
+            Some(&ArtifactDescriptor {
+                path: PathBuf::from(".").join("kernel.cubin"),
+                optional: false
+            }),
+            parsed.outputs.get("obj")
+        );
+    }
+}
