@@ -779,8 +779,6 @@ impl SchedulerService for Scheduler {
             } else {
                 tracing::trace!("Received server failure: {status:?}");
             }
-        } else {
-            tracing::trace!("Received server status: {status:?}");
         }
 
         let mut servers = self.servers.lock().await;

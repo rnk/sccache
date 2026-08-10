@@ -249,6 +249,7 @@ fn run(command: Command) -> Result<()> {
 
                     let job_queue = Arc::new(tokio::sync::Semaphore::new(occupancy));
 
+                    let should_inflate_toolchains = !matches!(builder, BuilderType::Docker { .. });
                     let builder = init_builder(builder, job_queue.clone()).await?;
 
                     let toolchains = Arc::new(ServerToolchains::new(
@@ -256,6 +257,7 @@ fn run(command: Command) -> Result<()> {
                         toolchain_cache_size,
                         toolchains,
                         metrics.clone(),
+                        should_inflate_toolchains,
                     ));
 
                     let tasks = tasks::Tasks::server(
@@ -301,8 +303,12 @@ async fn init_builder(
 ) -> Result<Arc<dyn BuilderIncoming>> {
     match config {
         #[cfg(not(target_os = "freebsd"))]
-        BuilderType::Docker => Ok(Arc::new(
-            build::DockerBuilder::new(job_queue.clone())
+        BuilderType::Docker {
+            image,
+            run_cmd,
+            exec_cmd,
+        } => Ok(Arc::new(
+            build::DockerBuilder::new(image, run_cmd, exec_cmd, job_queue.clone())
                 .await
                 .context("Docker builder failed to start")?,
         ) as Arc<dyn BuilderIncoming>),

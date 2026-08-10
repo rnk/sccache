@@ -389,6 +389,10 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
     fn plusplus(&self) -> bool;
     /// Return the compiler version reported by the compiler executable.
     fn version(&self) -> Option<String>;
+    /// Return paths to extra files that should be included in the dist toolchain.
+    fn extra_dist_files(&self) -> impl Iterator<Item = PathBuf> {
+        std::iter::empty()
+    }
     /// Determine whether `arguments` are supported by this compiler.
     fn parse_arguments(
         &self,
@@ -558,8 +562,9 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
         Box::new(CToolchainPackager {
             env_vars: vec![],
             executable: self.executable.clone(),
+            extra_files: self.compiler.extra_dist_files().collect(),
             kind: self.compiler.kind(),
-            parsed_args: Default::default(),
+            parsed_args: ParsedArguments::default(),
         })
     }
     fn parse_arguments(
@@ -1432,9 +1437,10 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<T,
         );
 
         let toolchain_packager = Box::new(CToolchainPackager {
-            kind: self.compiler.kind(),
             env_vars: self.env_vars.clone(),
             executable: self.executable.clone(),
+            extra_files: self.compiler.extra_dist_files().collect(),
+            kind: self.compiler.kind(),
             parsed_args: self.parsed_args.clone(),
         });
 
@@ -1473,7 +1479,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> pkg::InputsPackager for CCompilati
         path_transformer: &mut dist::PathTransformer,
         compressor: Box<dyn InputsWriter>,
     ) -> Result<()> {
-        use std::collections::BTreeMap;
+        use std::collections::{BTreeMap, BTreeSet};
 
         let CCompilation {
             service,
@@ -1526,83 +1532,129 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> pkg::InputsPackager for CCompilati
             parsed_args.common_args = common_args;
         }
 
-        let mut symlinks = BTreeMap::new();
-        let mut builder = tar::Builder::new(compressor);
-        let mut path_transformer = path_transformer.clone();
+        // Clone the path transformer so the clone can be used in spawn_blocking
+        let mut pt = path_transformer.clone();
 
-        let (mut builder, mut symlinks, mut path_transformer) =
-            tokio::task::spawn_blocking(move || {
-                // Find symlinks and simplify the input path first
-                let input_path = cwd.join(&parsed_args.input);
-                let input_path = pkg::tarify_path(&mut symlinks, &input_path)?;
-                let dist_path = if !parsed_args.language.needs_c_preprocessing() {
-                    path_transformer.as_dist(&input_path)
-                } else {
-                    path_transformer.as_dist_input_path(&input_path)
-                }
-                .with_context(|| format!("unable to transform input path {input_path:?}"))?;
+        // Add the input file, symlinks, dependencies, and extra files
+        let (builder, pt) = tokio::task::spawn_blocking(move || {
+            let mut builder = tar::Builder::new(compressor);
+            let mut dirs_set = BTreeSet::new();
+            let mut symlinks = BTreeMap::new();
+            let mut simplifier = pkg::SimplifyPath {
+                dirs: Some(&mut dirs_set),
+                resolved_symlinks: Some(&mut symlinks),
+            };
 
-                let (mut header, dist_path) = pkg::make_tar_header(&input_path, &dist_path)?;
-                // The current size is from the non-preprocessed path, so set the actual size.
-                header.set_size(preprocessor_output.len() as u64);
-                header.set_cksum();
-                builder.append_data(&mut header, dist_path, &preprocessor_output[..])?;
+            // Find symlinks and simplify the input path first
+            let input_path = cwd.join(&parsed_args.input);
+            let input_path = simplifier.simplify(&input_path)?;
+            let dist_path = if !parsed_args.language.needs_c_preprocessing() {
+                input_path.clone()
+            } else {
+                pt.with_dist_extension(&input_path)
+            };
 
-                Ok::<_, anyhow::Error>((builder, symlinks, path_transformer))
-            })
-            .await??;
+            let dist_path = pt
+                .as_dist(&dist_path)
+                .with_context(|| format!("Unable to transform input path {input_path:?}"))?;
 
-        // Add the dependencies and extra files
-        let builder = tokio::task::spawn_blocking(move || {
-            // Find and add symlinks to the tar archive before the files.
-            // This ensures the symlinks are unpacked by the receiver before
-            // files which may traverse them.
-            let tarified_extra_paths = [
+            // Add the preprocessor output to the tar archive
+            let (mut header, dist_path) = pkg::make_tar_header(&input_path, &dist_path)?;
+            // The current size is from the non-preprocessed path, so set the actual size.
+            header.set_size(preprocessor_output.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, dist_path, &preprocessor_output[..])?;
+            drop(preprocessor_output);
+
+            // Simplify and transform the extra files first, so we record
+            // intermediate directories and any traversed symlinks. Those
+            // must be added to the archive first, so they're unpacked by
+            // the receiver before the files which may traverse them.
+            let extra_files = [
                 &dependencies[..],
                 &parsed_args.extra_dist_files[..],
                 &parsed_args.extra_hash_files[..],
             ]
             .into_iter()
             .flatten()
-            .map(|path| pkg::tarify_path(&mut symlinks, path))
-            .try_collect::<_, Vec<_>, _>()?;
+            .map(|src_path| {
+                let src_path = simplifier.simplify(src_path)?;
 
-            for (from_path, to_path) in symlinks.iter() {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(0);
-                header.set_mtime(0);
-                header.set_entry_type(tar::EntryType::Symlink);
-                // Leave `to_path` as absolute, assuming the tar will
-                // be used in a chroot-like environment.
-                builder.append_link(&mut header, pkg::tar_safe_path(from_path), to_path)?;
-            }
-
-            for path in tarified_extra_paths {
                 if !super::CAN_DIST_DYLIBS
-                    && path
+                    && src_path
                         .extension()
                         .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION)
                 {
-                    bail!(
-                        "Cannot distribute dylib input {} on this platform",
-                        path.display()
-                    )
-                }
-
-                builder.append_path_with_name(
-                    &path,
-                    path_transformer
-                        .as_dist(&path)
+                    bail!("Cannot distribute dylib input {src_path:?} on this platform")
+                } else {
+                    pt.as_dist(&src_path)
+                        .with_context(|| format!("Unable to transform input path {src_path:?}"))
+                        // Strip the leading slash
                         .map(pkg::tar_safe_path)
-                        .with_context(|| {
-                            format!("unable to transform input path {}", path.display())
-                        })?,
-                )?;
+                        .map(|tar_path| (tar_path, src_path))
+                }
+            })
+            .try_collect::<_, BTreeMap<PathBuf, PathBuf>, _>()
+            .context("Failed transforming input paths")?;
+
+            dirs_set
+                .into_iter()
+                .map(|dir_path| {
+                    pt.as_dist(&dir_path)
+                        .with_context(|| format!("Unable to transform directory path {dir_path:?}"))
+                        // Strip the leading slash
+                        .map(pkg::tar_safe_path)
+                        .map(|tar_path| (tar_path, dir_path))
+                })
+                .try_collect::<_, BTreeMap<PathBuf, PathBuf>, _>()
+                .context("Failed transforming intermediate directory paths")?
+                .into_iter()
+                .try_for_each(|(tar_path, dir_path)| {
+                    // Record each directory in the archive
+                    builder.append_dir(tar_path, dir_path)
+                })
+                .context("Failed adding intermediate directories to archive")?;
+
+            symlinks
+                .into_iter()
+                .map(|(src_path, dst_path)| {
+                    pt.as_dist(&src_path)
+                        .with_context(|| format!("Unable to transform symlink path {src_path:?}"))
+                        // Strip the leading slash
+                        .map(pkg::tar_safe_path)
+                        .map(|tar_path| {
+                            (
+                                tar_path,
+                                // Leave `dst_path` as absolute, assuming the tar will
+                                // be used in a chroot-like environment.
+                                dst_path,
+                            )
+                        })
+                })
+                .try_collect::<_, BTreeMap<PathBuf, PathBuf>, _>()
+                .context("Failed transforming symlink paths")?
+                .into_iter()
+                .try_for_each(|(src_path, dst_path)| {
+                    // Record each symlink in the archive
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(0);
+                    header.set_mtime(0);
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    builder.append_link(&mut header, src_path, dst_path)
+                })
+                .context("Failed adding symlinks to archive")?;
+
+            // Now add the extra files
+            for (tar_path, src_path) in extra_files {
+                builder.append_path_with_name(src_path, tar_path)?;
             }
 
-            Ok::<_, anyhow::Error>(builder)
+            Ok::<_, anyhow::Error>((builder, pt))
         })
         .await??;
+
+        // Move the modified path transformer clone to the original
+        *path_transformer = pt;
 
         // Finish archive
         let _ = builder.into_inner()?.finish()?;
@@ -1617,6 +1669,7 @@ struct CToolchainPackager {
     executable: PathBuf,
     kind: CCompilerKind,
     parsed_args: ParsedArguments,
+    extra_files: Vec<PathBuf>,
 }
 
 #[cfg(all(
@@ -1624,6 +1677,10 @@ struct CToolchainPackager {
     any(
         all(
             target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "windows",
             any(target_arch = "x86_64", target_arch = "aarch64")
         ),
         target_os = "freebsd"
@@ -1637,20 +1694,39 @@ struct CToolchainPackager {
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
         ),
+        all(
+            target_os = "windows",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         target_os = "freebsd"
     )
 ))]
 impl pkg::ToolchainPackager for CToolchainPackager {
-    async fn package(&self) -> Result<Arc<dyn pkg::PackagedToolchain>> {
-        use std::os::unix::ffi::OsStringExt;
+    async fn package(
+        self: Box<Self>,
+        path_transformer: &mut dist::PathTransformer,
+    ) -> Result<Arc<dyn pkg::PackagedToolchain>> {
+        use crate::util::bytes_to_path;
         use tokio_util::compat::TokioAsyncReadCompatExt;
 
         debug!(
             "Packaging toolchain for executable {:?}",
             self.executable.display()
         );
-        let mut package_builder = pkg::ToolchainPackaged::new(self.executable.clone());
-        package_builder.add_common()?;
+        let mut package_builder =
+            pkg::ToolchainPackaged::new(self.executable.clone(), path_transformer);
+
+        // Add gcc implicit specfiles
+        for path in self.extra_files.iter() {
+            if path.is_dir() {
+                package_builder.add_dir(path)?;
+            } else if path.is_symlink() {
+                let target = path.read_link()?;
+                package_builder.add_link(&target, path)?;
+            } else if path.is_file() {
+                package_builder.add_file(&self.env_vars, path)?;
+            }
+        }
 
         // Helper to use -print-file-name and -print-prog-name to look up
         // files by path.
@@ -1677,7 +1753,7 @@ impl pkg::ToolchainPackager for CToolchainPackager {
 
             // Create our PathBuf from the raw bytes.  Assume that relative
             // paths can be found via PATH.
-            let path: PathBuf = OsString::from_vec(output.stdout).into();
+            let path = bytes_to_path(&output.stdout).ok()?;
             if path.is_absolute() {
                 Some(path)
             } else {
@@ -1687,13 +1763,13 @@ impl pkg::ToolchainPackager for CToolchainPackager {
 
         // Helper to add a named file/program by to the package.
         // We ignore the case where the file doesn't exist, as we don't need it.
-        let add_named_prog = |builder: &mut pkg::ToolchainPackaged, name: &str| -> Result<()> {
+        let add_named_prog = |builder: &mut pkg::ToolchainPackaged<'_>, name: &str| -> Result<()> {
             if let Some(path) = named_file(&format!("-print-prog-name={name}")) {
                 builder.add_executable_and_deps(&self.env_vars, &path)?;
             }
             Ok(())
         };
-        let add_named_file = |builder: &mut pkg::ToolchainPackaged, name: &str| -> Result<()> {
+        let add_named_file = |builder: &mut pkg::ToolchainPackaged<'_>, name: &str| -> Result<()> {
             if let Some(path) = named_file(&format!("-print-file-name={name}")) {
                 builder.add_file(&self.env_vars, path)?;
             }
@@ -1707,12 +1783,13 @@ impl pkg::ToolchainPackager for CToolchainPackager {
 
             // Linker configuration.
             if Path::new("/etc/ld.so.conf").is_file() {
-                package_builder.add_file(&self.env_vars, "/etc/ld.so.conf".into())?;
+                package_builder.add_file(&self.env_vars, "/etc/ld.so.conf")?;
             }
-            let ld_conf_dir = Path::new("/etc/ld.so.conf.d");
-            if ld_conf_dir.is_dir() {
-                package_builder.add_dir_contents(&self.env_vars, ld_conf_dir)?;
+
+            if Path::new("/etc/ld.so.conf.d").is_dir() {
+                package_builder.add_dir_contents(&self.env_vars, "/etc/ld.so.conf.d")?;
             }
+
             Ok(())
         };
 
@@ -1735,20 +1812,6 @@ impl pkg::ToolchainPackager for CToolchainPackager {
                 add_named_prog(&mut package_builder, "cc1")?;
                 add_named_prog(&mut package_builder, "cc1plus")?;
                 add_named_file(&mut package_builder, "liblto_plugin.so")?;
-                // Add gcc implicit specfiles
-                let jobserver = crate::jobserver::Client::new_num(1);
-                let mut creator = crate::mock_command::ProcessCommandCreator::new(&jobserver);
-                for path in crate::compiler::gcc::Gcc::read_implicit_specfiles(
-                    &mut creator,
-                    &self.executable,
-                    &[],
-                    &self.env_vars,
-                    "-v",
-                )
-                .await?
-                {
-                    package_builder.add_file(&self.env_vars, path)?;
-                }
             }
 
             CCompilerKind::Nvhpc => {
@@ -1777,7 +1840,7 @@ impl pkg::ToolchainPackager for CToolchainPackager {
                                     return Err(orig_err);
                                 }
                                 // Symlink `bin/mpic++` -> `bin/.bin/mpic++`
-                                package_builder.add_link(&real_exe, &self.executable)?;
+                                package_builder.add_link(&self.executable, &real_exe)?;
                                 package_builder
                                     .add_executable_and_deps(&self.env_vars, &real_exe)?;
                             }
@@ -2042,14 +2105,93 @@ impl pkg::ToolchainPackager for CToolchainPackager {
                 }
             }
 
+            CCompilerKind::Msvc => {
+                use crate::util::OsStrExt;
+                // cl.exe
+                package_builder.add_executable_and_deps(&self.env_vars, &self.executable)?;
+
+                if let Some(dir) = self.executable.parent() {
+                    // mspdbcmf.exe
+                    // mspdbsrv.exe
+                    for exe in [
+                        format!("mspdbcmf{}", std::env::consts::EXE_SUFFIX),
+                        format!("mspdbsrv{}", std::env::consts::EXE_SUFFIX),
+                    ] {
+                        package_builder.add_executable_and_deps(&self.env_vars, dir.join(exe))?;
+                    }
+
+                    // c1xx.dll
+                    // c2.dll
+                    // mspdbcore.dll
+                    // mspdbst.dll
+                    // tbbmalloc.dll
+                    // msobj140.dll
+                    // mspdb140.dll
+                    // msvcp140.dll
+                    // vcruntime140_1.dll
+                    // vcruntime140.dll
+
+                    let dll_prefixes = [
+                        "c1xx",
+                        "c2",
+                        "mspdbcore",
+                        "mspdbst",
+                        "tbbmalloc",
+                        // msobj140.dll
+                        "msobj",
+                        // mspdb140.dll
+                        "mspdb",
+                        // msvcp140.dll
+                        "msvcp",
+                        // vcruntime140.dll
+                        // vcruntime140_1.dll
+                        "vcruntime",
+                        // 1033/clui.dll
+                        "clui",
+                        // 1033/mspdbcmfui.dll
+                        "mspdbcmfui",
+                    ];
+
+                    let paths = walkdir::WalkDir::new(dir)
+                        .min_depth(1)
+                        .max_depth(2)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| {
+                            if e.file_type().is_file()
+                                && let file_name = e.file_name().to_ascii_lowercase()
+                                && file_name.ends_with(std::env::consts::DLL_SUFFIX)
+                            {
+                                Some((file_name, e.path().to_owned()))
+                            } else {
+                                None
+                            }
+                        })
+                        .filter_map(|(file_name, file_path)| {
+                            if dll_prefixes
+                                .iter()
+                                .any(|prefix| file_name.starts_with(prefix))
+                            {
+                                Some(file_path)
+                            } else {
+                                None
+                            }
+                        });
+
+                    for path in paths {
+                        package_builder.add_executable_and_deps(&self.env_vars, &path)?;
+                    }
+                }
+            }
+
             _ => {
                 package_builder.add_executable_and_deps(&self.env_vars, &self.executable)?;
             }
         }
 
         // Return the builder so the archive can be lazily created, depending
-        // on whether the scheduler reports it already has the toolchain or not
-        Ok(Arc::new(package_builder))
+        // on whether or not the scheduler reports it already has the toolchain
+        package_builder.build()
     }
 }
 

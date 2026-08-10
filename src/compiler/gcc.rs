@@ -22,14 +22,13 @@ use crate::{
             PreprocessorOutput,
         },
         clang,
-        msvc::from_local_codepage,
         preprocessor_cache::normalize_path,
     },
     counted_array, dist,
     errors::*,
     mock_command::{CommandCreatorSync, RunCommand},
     server::SccacheService,
-    util::{OsStrExt, run_input_output, run_input_stream_output, temppath},
+    util::{OsStrExt, bytes_to_string, run_input_output, run_input_stream_output, temppath},
 };
 
 use async_trait::async_trait;
@@ -51,6 +50,7 @@ pub struct Gcc {
     pub gplusplus: bool,
     pub version: Option<String>,
     pub native_archs: Option<(String, String)>,
+    pub specfiles: Vec<PathBuf>,
 }
 
 impl Gcc {
@@ -149,6 +149,9 @@ impl CCompilerImpl for Gcc {
     }
     fn version(&self) -> Option<String> {
         self.version.clone()
+    }
+    fn extra_dist_files(&self) -> impl Iterator<Item = PathBuf> {
+        self.specfiles.iter().cloned()
     }
     fn parse_arguments(
         &self,
@@ -880,7 +883,7 @@ where
     if language.needs_c_preprocessing() {
         // If the language needs preprocessing, include the source file in the dist inputs.
         // This ensures gcc embeds the correct source and line numbers in warnings/errors.
-        // See the docstring on the `PathTransformer::as_dist_input_path` impl for details.
+        // See the docstring on the `PathTransformer::with_dist_extension` impl for details.
         extra_dist_files.push(cwd.join(&input));
 
         if need_explicit_dep_target {
@@ -1322,7 +1325,7 @@ pub async fn parse_dependencies<P: AsRef<Path>>(
     let lines = tokio::fs::read(&depfile)
         .await
         // Avoid dropping Windows wide chars in paths
-        .and_then(from_local_codepage)
+        .and_then(bytes_to_string)
         .with_context(|| format!("{depfile:?}"))?;
 
     let lines = lines
@@ -1391,7 +1394,8 @@ pub fn generate_compile_commands(
 
     let out_pretty = parsed_args.output_pretty();
 
-    let out_file = match parsed_args.outputs.get("obj") {
+    let input = parsed_args.input.as_path();
+    let output = match parsed_args.outputs.get("obj") {
         Some(obj) => &obj.path,
         None => return Err(anyhow!("Missing object file output")),
     };
@@ -1407,7 +1411,7 @@ pub fn generate_compile_commands(
     arguments.extend(vec![
         parsed_args.compilation_flag.clone(),
         "-o".into(),
-        out_file.into(),
+        output.into(),
     ]);
 
     let mut common_args = parsed_args.common_args.clone();
@@ -1433,7 +1437,7 @@ pub fn generate_compile_commands(
     if parsed_args.double_dash_input {
         arguments.push("--".into());
     }
-    arguments.push(parsed_args.input.clone().into());
+    arguments.push(input.into());
 
     #[cfg(feature = "dist-client")]
     let has_verbose_flag = arguments.contains(&OsString::from("-v"))
@@ -1460,10 +1464,12 @@ pub fn generate_compile_commands(
         None
     } else {
         (|| {
+            use crate::util::{os_str_to_string, path_to_string};
+
             let command = dist::CompileCommand {
-                cwd: path_transformer.as_dist_abs(cwd)?,
+                cwd: path_to_string(cwd).ok()?,
                 env_vars: dist::osstring_tuples_to_strings(env_vars)?,
-                executable: path_transformer.as_dist(executable)?,
+                executable: path_to_string(executable).ok()?,
                 arguments: {
                     let mut language = language.map(|lang| lang.to_owned());
 
@@ -1557,18 +1563,20 @@ pub fn generate_compile_commands(
                             .collect::<Vec<_>>(),
                     );
 
-                    arguments.extend_from_slice(
-                        &[
-                            parsed_args.compilation_flag.clone().into_string().ok()?,
-                            if !parsed_args.language.needs_c_preprocessing() {
-                                path_transformer.as_dist(&parsed_args.input)?
-                            } else {
-                                path_transformer.as_dist_input_path(&parsed_args.input)?
-                            },
-                            "-o".into(),
-                            path_transformer.as_dist(out_file)?,
-                        ][..],
+                    arguments.push(os_str_to_string(&parsed_args.compilation_flag).ok()?);
+
+                    arguments.push(
+                        parsed_args
+                            .language
+                            .needs_c_preprocessing()
+                            .then(|| path_transformer.with_dist_extension(input))
+                            .as_deref()
+                            .or(Some(input))
+                            .and_then(|p| path_to_string(p).ok())?,
                     );
+
+                    arguments.push("-o".into());
+                    arguments.push(path_to_string(output).ok()?);
 
                     arguments
                 },

@@ -29,7 +29,9 @@ use crate::{
     errors::*,
     mock_command::{CommandCreatorSync, ProcessOutput, RunCommand},
     server::SccacheService,
-    util::{OsStrExt, path_to_bytes, run_input_output, temppath},
+    util::{
+        OsStrExt, bytes_to_string, os_str_to_string, path_to_bytes, run_input_output, temppath,
+    },
 };
 use async_trait::async_trait;
 use fs_err::File;
@@ -76,8 +78,7 @@ impl CCompilerImpl for Msvc {
         if let Some(prepend_flags) = env_vars
             .iter()
             .find(|(k, _)| k == "CL")
-            .and_then(|(_, v)| v.encode_to_bytes().ok())
-            .and_then(|b| from_local_codepage(b).ok())
+            .and_then(|(_, v)| os_str_to_string(v).ok())
         {
             // Parse the `CL` environment variable value as MSVC flags.
             arguments = [
@@ -92,8 +93,7 @@ impl CCompilerImpl for Msvc {
         if let Some(append_flags) = env_vars
             .iter()
             .find(|(k, _)| k == "_CL_")
-            .and_then(|(_, v)| v.encode_to_bytes().ok())
-            .and_then(|b| from_local_codepage(b).ok())
+            .and_then(|(_, v)| os_str_to_string(v).ok())
         {
             // Parse the `_CL_` environment variable value as MSVC flags.
             arguments.extend(
@@ -173,30 +173,8 @@ impl CCompilerImpl for Msvc {
         Option<dist::CompileCommand>,
         Cacheable,
     )> {
-        generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
-            |(cmd, _dist_cmd, cacheable)| {
-                // MSVC can't be dist-compiled
-                (cmd, None, cacheable)
-            },
-        )
+        generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars)
     }
-}
-
-#[cfg(not(windows))]
-pub fn from_local_codepage(multi_byte_str: Vec<u8>) -> io::Result<String> {
-    String::from_utf8(multi_byte_str).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
-}
-
-#[cfg(windows)]
-pub fn from_local_codepage(multi_byte_str: Vec<u8>) -> io::Result<String> {
-    use crate::util::multi_byte_to_wide_char;
-    use windows_sys::Win32::Globalization::{CP_OEMCP, MB_ERR_INVALID_CHARS};
-
-    multi_byte_to_wide_char(CP_OEMCP, MB_ERR_INVALID_CHARS, &multi_byte_str)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
-        .and_then(|buf| {
-            String::from_utf16(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
-        })
 }
 
 /// Detect the prefix included in the output of MSVC's -showIncludes output.
@@ -248,7 +226,7 @@ where
         bail!("Failed to detect showIncludes prefix ({:?})", output.status)
     }
 
-    let stderr = from_local_codepage(output.stderr)
+    let stderr = bytes_to_string(output.stderr)
         .context("Failed to convert compiler stderr while detecting showIncludes prefix")?;
     for line in stderr.lines() {
         if !line.ends_with("test.h") {
@@ -946,7 +924,13 @@ pub fn parse_arguments(
         );
     }
 
-    let extra_dist_files = vec![cwd.join(&input)];
+    let mut extra_dist_files = vec![];
+    if language.needs_c_preprocessing() {
+        // If the language needs preprocessing, include the source file in the dist inputs.
+        // This ensures gcc embeds the correct source and line numbers in warnings/errors.
+        // See the docstring on the `PathTransformer::with_dist_extension` impl for details.
+        extra_dist_files.push(cwd.join(&input));
+    }
 
     CompilerArguments::Ok(ParsedArguments {
         input: input.into(),
@@ -1111,7 +1095,7 @@ where
         )?;
         write!(f, " ")?;
         let stderr =
-            from_local_codepage(output.stderr).context("Failed to convert preprocessor stderr")?;
+            bytes_to_string(output.stderr).context("Failed to convert preprocessor stderr")?;
         let mut deps = HashSet::new();
         let mut stderr_bytes = vec![];
         for line in stderr.lines() {
@@ -1258,7 +1242,9 @@ fn generate_compile_commands(
     let _ = path_transformer;
 
     let out_pretty = parsed_args.output_pretty();
-    let out_file = match parsed_args.outputs.get("obj") {
+
+    let input = parsed_args.input.as_path();
+    let output = match parsed_args.outputs.get("obj") {
         Some(obj) => &obj.path,
         None => bail!("Missing object file output"),
     };
@@ -1278,7 +1264,7 @@ fn generate_compile_commands(
         });
 
     let mut fo = OsString::from("-Fo");
-    fo.push(out_file);
+    fo.push(output);
 
     let mut arguments: Vec<OsString> = vec![parsed_args.compilation_flag.clone(), fo];
     arguments.extend_from_slice(&parsed_args.preprocessor_args);
@@ -1288,7 +1274,7 @@ fn generate_compile_commands(
     if parsed_args.double_dash_input {
         arguments.push("--".into());
     }
-    arguments.push(parsed_args.input.clone().into());
+    arguments.push(input.into());
     let command = SingleCompileCommand {
         arguments,
         cwd: cwd.to_owned(),
@@ -1303,15 +1289,17 @@ fn generate_compile_commands(
     let dist_command = None;
     #[cfg(feature = "dist-client")]
     let dist_command = (|| {
+        use crate::util::path_to_string;
+
         let command = dist::CompileCommand {
-            cwd: path_transformer.as_dist(cwd)?,
+            cwd: path_to_string(cwd).ok()?,
             env_vars: dist::osstring_tuples_to_strings(&env_vars)?,
-            executable: path_transformer.as_dist(executable)?,
+            executable: path_to_string(executable).ok()?,
             arguments: {
                 // http://releases.llvm.org/6.0.0/tools/clang/docs/UsersManual.html#clang-cl
                 // TODO: Use /T... for language?
                 let mut fo = String::from("-Fo");
-                fo.push_str(&path_transformer.as_dist(out_file)?);
+                fo.push_str(&path_to_string(output).ok()?);
 
                 let mut arguments: Vec<String> =
                     vec![parsed_args.compilation_flag.clone().into_string().ok()?, fo];
@@ -1324,7 +1312,17 @@ fn generate_compile_commands(
                 if parsed_args.double_dash_input {
                     arguments.push("--".into());
                 }
-                arguments.push(path_transformer.as_dist_input_path(&parsed_args.input)?);
+
+                arguments.push(
+                    parsed_args
+                        .language
+                        .needs_c_preprocessing()
+                        .then(|| path_transformer.with_dist_extension(input))
+                        .as_deref()
+                        .or(Some(input))
+                        .and_then(|p| path_to_string(p).ok())?,
+                );
+
                 arguments
             },
         };
@@ -3209,39 +3207,5 @@ mod test {
             ovec![std::env::current_dir().unwrap().join("list.txt")],
             extra_hash_files
         );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn local_oem_codepage_conversions() {
-        use crate::util::wide_char_to_multi_byte;
-        use windows_sys::Win32::Globalization::GetOEMCP;
-
-        let current_oemcp = unsafe { GetOEMCP() };
-        // We don't control the local OEM codepage so test only if it is one of:
-        // United Stats, Latin-1 and Latin-1 + euro symbol
-        if current_oemcp == 437 || current_oemcp == 850 || current_oemcp == 858 {
-            // Non-ASCII characters
-            const INPUT_STRING: &str = "ÇüéâäàåçêëèïîìÄÅ";
-
-            // The characters in INPUT_STRING encoded per the OEM codepage
-            const INPUT_BYTES: [u8; 16] = [
-                128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143,
-            ];
-
-            // Test the conversion from the OEM codepage to UTF-8
-            assert_eq!(
-                from_local_codepage(INPUT_BYTES.to_vec()).unwrap(),
-                INPUT_STRING
-            );
-
-            // The characters in INPUT_STRING encoded in UTF-16
-            const INPUT_WORDS: [u16; 16] = [
-                199, 252, 233, 226, 228, 224, 229, 231, 234, 235, 232, 239, 238, 236, 196, 197,
-            ];
-
-            // Test the conversion from UTF-16 to the OEM codepage
-            assert_eq!(wide_char_to_multi_byte(&INPUT_WORDS).unwrap(), INPUT_BYTES);
-        }
     }
 }

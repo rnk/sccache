@@ -1140,10 +1140,12 @@ mod client {
 
         fn next(&self) -> &reqwest::Client {
             use std::sync::atomic::Ordering::SeqCst;
-            &self.clients[self
+            #[allow(deprecated)]
+            let idx = self
                 .index
                 .fetch_update(SeqCst, SeqCst, |i| Some((i + 1) % self.clients.len()))
-                .unwrap_or(0)]
+                .unwrap_or(0);
+            &self.clients[idx]
         }
 
         fn delete<U>(&self, url: U) -> reqwest::RequestBuilder
@@ -1336,14 +1338,20 @@ mod client {
             &self,
             compiler_path: &Path,
             weak_toolchain_key: &str,
-            toolchain_packager: &dyn ToolchainPackager,
+            toolchain_packager: Box<dyn ToolchainPackager>,
+            path_transformer: &mut dist::PathTransformer,
         ) -> Result<(
             Toolchain,
             Option<(String, PathBuf)>,
             Option<Arc<dyn PackagedToolchain>>,
         )> {
             self.tc_cache
-                .hash_toolchain(compiler_path, weak_toolchain_key, toolchain_packager)
+                .hash_toolchain(
+                    compiler_path,
+                    weak_toolchain_key,
+                    toolchain_packager,
+                    path_transformer,
+                )
                 .await
         }
 

@@ -94,7 +94,9 @@ fn sccache_server_cfg(message_broker: &MessageBroker) -> ServerConfig {
             build_dir: CONTAINER_EXTERNAL_PATH.into(),
             bwrap_path: DIST_IMAGE_BWRAP_PATH.into(),
         },
+        // Unpack toolchains inside each container
         cache_dir: Path::new(CONTAINER_INTERNAL_PATH).into(),
+        // Store job results outside the container
         jobs: sccache::config::CacheConfigs {
             disk: Some(DiskCacheConfig {
                 dir: Path::new(CONTAINER_EXTERNAL_PATH).join("jobs"),
@@ -102,6 +104,7 @@ fn sccache_server_cfg(message_broker: &MessageBroker) -> ServerConfig {
             }),
             ..Default::default()
         },
+        // Store toolchain archives outside the container
         toolchains: sccache::config::CacheConfigs {
             disk: Some(DiskCacheConfig {
                 dir: Path::new(CONTAINER_EXTERNAL_PATH).join("toolchains"),

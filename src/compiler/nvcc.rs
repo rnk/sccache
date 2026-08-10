@@ -22,14 +22,13 @@ use crate::{
             PreprocessorOutput,
         },
         gcc::{self, ArgData::*},
-        msvc::from_local_codepage,
     },
     counted_array, dist,
     errors::*,
     mock_command::{CommandCreatorSync, ProcessOutput, RunCommand},
     server::SccacheService,
     util::{
-        HASH_BUFFER_SIZE, OsStrExt, SCCACHE_TMPDIR, read_line_batches,
+        HASH_BUFFER_SIZE, OsStrExt, SCCACHE_TMPDIR, bytes_to_string, read_line_batches,
         resolve_compiler_avoiding_wrapper, run_input_output, split_quoted_shell_str, tempdir_in,
     },
 };
@@ -1874,7 +1873,7 @@ where
             #[cfg(windows)]
             let lines = output.stdout;
             // Avoid dropping Windows wide chars in paths
-            from_local_codepage(lines)?
+            bytes_to_string(lines)?
         }
         Err(err) => {
             match err.downcast::<ProcessError>() {

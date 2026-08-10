@@ -14,12 +14,16 @@ mod client {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use crate::config;
-    use crate::dist::Toolchain;
-    use crate::dist::pkg::{PackagedToolchain, ToolchainPackager};
-    use crate::lru_disk_cache::Error as LruError;
-    use crate::lru_disk_cache::LruDiskCache;
-    use crate::util::Digest;
+    use crate::{
+        config,
+        dist::{
+            PathTransformer, Toolchain,
+            pkg::{PackagedToolchain, ToolchainPackager},
+        },
+        lru_disk_cache::Error as LruError,
+        lru_disk_cache::LruDiskCache,
+        util::Digest,
+    };
 
     async fn path_key<T: AsRef<Path>>(path: T) -> Result<String> {
         Digest::from_file(path).await.map(|digest| digest.finish())
@@ -182,7 +186,8 @@ mod client {
             &self,
             compiler_path: &Path,
             weak_toolchain_key: &str,
-            toolchain_packager: &dyn ToolchainPackager,
+            toolchain_packager: Box<dyn ToolchainPackager>,
+            path_transformer: &mut PathTransformer,
         ) -> Result<(
             Toolchain,
             Option<(String, PathBuf)>,
@@ -232,7 +237,7 @@ mod client {
             debug!("Weak key appears to be new: {weak_toolchain_key:?}");
 
             let package = toolchain_packager
-                .package()
+                .package(path_transformer)
                 .await
                 .context("Could not package toolchain")?;
 
@@ -352,7 +357,7 @@ mod client {
         )
     ))]
     mod test_dist {
-        use crate::{config, errors::*, test::utils::create_file};
+        use crate::{config, dist::PathTransformer, errors::*, test::utils::create_file};
         use std::{io::Write, sync::Arc};
 
         use {
@@ -366,7 +371,10 @@ mod client {
 
         #[async_trait]
         impl ToolchainPackager for PanicToolchainPackager {
-            async fn package(&self) -> Result<Arc<dyn PackagedToolchain>> {
+            async fn package(
+                self: Box<Self>,
+                _: &mut PathTransformer,
+            ) -> Result<Arc<dyn PackagedToolchain>> {
                 panic!("should not have called packager")
             }
         }
@@ -393,7 +401,8 @@ mod client {
                 .hash_toolchain(
                     "/my/compiler".as_ref(),
                     "weak_key",
-                    &PanicToolchainPackager {},
+                    Box::new(PanicToolchainPackager),
+                    &mut PathTransformer::new(),
                 )
                 .await
                 .unwrap();
@@ -436,7 +445,8 @@ mod client {
                 .hash_toolchain(
                     "/my/compiler".as_ref(),
                     "weak_key",
-                    &PanicToolchainPackager {},
+                    Box::new(PanicToolchainPackager),
+                    &mut PathTransformer::new(),
                 )
                 .await
                 .unwrap();
@@ -445,7 +455,8 @@ mod client {
                 .hash_toolchain(
                     "/my/compiler2".as_ref(),
                     "weak_key",
-                    &PanicToolchainPackager {},
+                    Box::new(PanicToolchainPackager),
+                    &mut PathTransformer::new(),
                 )
                 .await
                 .unwrap();
@@ -454,7 +465,8 @@ mod client {
                 .hash_toolchain(
                     "/my/compiler3".as_ref(),
                     "weak_key",
-                    &PanicToolchainPackager {},
+                    Box::new(PanicToolchainPackager),
+                    &mut PathTransformer::new(),
                 )
                 .await
                 .unwrap();
@@ -479,7 +491,8 @@ mod client {
                     .hash_toolchain(
                         "/my/compiler".as_ref(),
                         "weak_key",
-                        &PanicToolchainPackager {}
+                        Box::new(PanicToolchainPackager),
+                        &mut PathTransformer::new(),
                     )
                     .await
                     .is_err()
@@ -602,6 +615,7 @@ mod server {
         cache: Arc<DiskCache>,
         store: Arc<dyn cache::Storage>,
         metrics: ServerToolchainsMetrics,
+        should_inflate_toolchains: bool,
     }
 
     #[async_trait]
@@ -630,6 +644,7 @@ mod server {
             max_size: u64,
             store: Arc<dyn cache::Storage>,
             metrics: Metrics,
+            should_inflate_toolchains: bool,
         ) -> Self {
             Self {
                 cache: Arc::new(DiskCache::new(
@@ -640,6 +655,7 @@ mod server {
                 )),
                 store,
                 metrics: ServerToolchainsMetrics::new(metrics),
+                should_inflate_toolchains,
             }
         }
 
@@ -649,7 +665,7 @@ mod server {
             // Load and cache the deflated toolchain.
             // Inflate, unpack, and cache it in a directory.
             // Return the path to the unpacked toolchain dir.
-            self.load_inflated_toolchain(tc).await.map_err(|err| {
+            self.load_toolchain(tc).await.map_err(|err| {
                 if !is_special_tokio_shutdown_io_error(&err) {
                     tracing::error!(
                         "[ServerToolchains({})]: Error loading toolchain: {err:?}",
@@ -660,7 +676,7 @@ mod server {
             })
         }
 
-        async fn load_inflated_toolchain(&self, tc: &Toolchain) -> Result<PathBuf> {
+        async fn load_toolchain(&self, tc: &Toolchain) -> Result<PathBuf> {
             // Record toolchain load_inflated time
             let _timer = self.metrics.load_inflated_timer();
             if let Ok((inflated_path, _)) = self.cache.entry(&tc.archive_id).await {
@@ -669,11 +685,15 @@ mod server {
             } else {
                 // Load the compressed toolchain
                 let (deflated_path, deflated_size) = self.load_deflated_toolchain(tc).await?;
-                // Inflate and unpack the toolchain archive
-                let inflated_path = self
-                    .unpack_inflated_toolchain(&deflated_path, deflated_size, &tc.archive_id)
-                    .await?;
-                Ok(inflated_path)
+                if !self.should_inflate_toolchains {
+                    Ok(deflated_path)
+                } else {
+                    // Inflate and unpack the toolchain archive
+                    let inflated_path = self
+                        .unpack_inflated_toolchain(&deflated_path, deflated_size, &tc.archive_id)
+                        .await?;
+                    Ok(inflated_path)
+                }
             }
         }
 

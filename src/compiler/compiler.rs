@@ -40,7 +40,8 @@ use crate::{
     mock_command::{CommandChild, CommandCreatorSync, ProcessOutput, RunCommand},
     server,
     util::{
-        fmt_duration_as_secs, resolve_compiler_avoiding_wrapper, run_input_output, strip_basedirs,
+        bytes_to_string, fmt_duration_as_secs, resolve_compiler_avoiding_wrapper, run_input_output,
+        strip_basedirs,
     },
 };
 
@@ -72,6 +73,10 @@ use tempfile::TempDir;
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
         ),
+        all(
+            target_os = "windows",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         target_os = "freebsd"
     )
 ))]
@@ -81,6 +86,10 @@ pub const CAN_DIST_DYLIBS: bool = true;
     not(any(
         all(
             target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(
+            target_os = "windows",
             any(target_arch = "x86_64", target_arch = "aarch64")
         ),
         target_os = "freebsd"
@@ -1278,18 +1287,23 @@ where
         service: &server::SccacheService<T>,
     ) -> Result<(DistType, ProcessOutput)> {
         use dist::RunJobResponse;
+        use itertools::Itertools;
         use std::io;
         use tokio_retry2::strategy::FibonacciBackoff;
 
         let Self {
             compilation,
             dist_client,
-            mut dist_compile_cmd,
+            dist_compile_cmd,
             ref out_pretty,
             mut path_transformer,
             weak_toolchain_key,
             ..
         } = self;
+
+        use crate::util::path_to_string;
+
+        let mut dist_compile_cmd = dist_compile_cmd.as_dist(&mut path_transformer)?;
 
         // Ensure the dependency file exists
         compilation.generate_dependencies(creator).await?;
@@ -1322,7 +1336,12 @@ where
         trace!("[{out_pretty}]: Identifying dist toolchain for {executable:?}");
 
         let (dist_toolchain, maybe_dist_compile_executable, packaged_toolchain) = dist_client
-            .hash_toolchain(executable, &weak_toolchain_key, toolchain_packager.as_ref())
+            .hash_toolchain(
+                executable,
+                &weak_toolchain_key,
+                toolchain_packager,
+                &mut path_transformer,
+            )
             .await?;
 
         let tc_archive =
@@ -1331,10 +1350,20 @@ where
                 archive_path
             });
 
-        let dist_output_paths: Vec<String> = outputs
+        let dist_output_paths = outputs
             .iter()
-            .map(|output| path_transformer.as_dist_abs(&output.path))
-            .collect::<Option<_>>()
+            .map(|output| {
+                path_transformer
+                    .as_dist_abs(&output.path)
+                    .with_context(|| {
+                        format!("Expected output path {:?} to be absolute", output.path)
+                    })
+                    .and_then(|p| {
+                        path_to_string(&p)
+                            .with_context(|| format!("Failed to serialize output path {p:?}"))
+                    })
+            })
+            .try_collect::<_, Vec<_>, _>()
             .context("Failed to adapt an output path for distributed compile")?;
 
         let dist_retry_limit = dist_client.max_retries() + 1.0;
@@ -2196,10 +2225,7 @@ where
 
         let output = run_input_output(cmd, None).await?;
 
-        let stdout = match str::from_utf8(&output.stdout) {
-            Ok(s) => s,
-            Err(_) => bail!("Failed to parse output"),
-        };
+        let stdout = bytes_to_string(output.stdout).context("Failed to parse output")?;
 
         let version = stdout.lines().next().unwrap_or("unknown").to_string();
 
@@ -2273,7 +2299,7 @@ where
     child.env_clear().envs(env.to_vec()).args(&["-vV"]);
 
     let rustc_vv = run_input_output(child, None).await.map(|output| {
-        if let Ok(stdout) = String::from_utf8(output.stdout.clone())
+        if let Ok(stdout) = bytes_to_string(output.stdout.clone())
             && stdout.starts_with("rustc ")
         {
             return Ok(stdout);
@@ -2489,10 +2515,9 @@ compiler_version=__VERSION__
 
     drop(tempdir);
 
-    let stdout = match str::from_utf8(&output.stdout) {
-        Ok(s) => s,
-        Err(_) => bail!("Failed to parse output"),
-    };
+    let status = output.desc();
+    let stdout = bytes_to_string(output.stdout).context("Failed to parse output")?;
+
     let mut lines = stdout.lines().filter_map(|line| {
         let line = line.trim();
         if let Some(compiler_id) = line.strip_prefix("compiler_id=") {
@@ -2550,6 +2575,7 @@ compiler_version=__VERSION__
                         gplusplus: kind == "g++",
                         version,
                         native_archs,
+                        specfiles: extra_hash_files.clone(),
                     },
                     executable,
                     extra_hash_files,
@@ -2703,12 +2729,12 @@ compiler_version=__VERSION__
         }
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = bytes_to_string(output.stderr).context("Failed to parse output")?;
     debug!("nothing useful in detection output {stdout:?}");
-    debug!("compiler status: {}", output.desc());
+    debug!("compiler status: {status}");
     debug!("compiler stderr:\n{stderr}");
 
-    bail!(stderr.into_owned())
+    bail!(stderr)
 }
 
 /// If `executable` is a known compiler, return a `Box<Compiler>` containing information about it.
@@ -4613,7 +4639,7 @@ mod test_dist {
         SubmitToolchainResult, Toolchain,
     };
     use crate::dist::{
-        BuildResult,
+        BuildResult, PathTransformer,
         pkg::{PackagedToolchain, ToolchainPackager},
     };
     use crate::mock_command::ProcessOutput;
@@ -4681,7 +4707,8 @@ mod test_dist {
             &self,
             _: &Path,
             _: &str,
-            _: &dyn ToolchainPackager,
+            _: Box<dyn ToolchainPackager>,
+            _: &mut PathTransformer,
         ) -> Result<(
             Toolchain,
             Option<(String, PathBuf)>,
@@ -4755,7 +4782,8 @@ mod test_dist {
             &self,
             _: &Path,
             _: &str,
-            _: &dyn ToolchainPackager,
+            _: Box<dyn ToolchainPackager>,
+            _: &mut PathTransformer,
         ) -> Result<(
             Toolchain,
             Option<(String, PathBuf)>,
@@ -4848,7 +4876,8 @@ mod test_dist {
             &self,
             _: &Path,
             _: &str,
-            _: &dyn ToolchainPackager,
+            _: Box<dyn ToolchainPackager>,
+            _: &mut PathTransformer,
         ) -> Result<(
             Toolchain,
             Option<(String, PathBuf)>,
@@ -4945,7 +4974,8 @@ mod test_dist {
             &self,
             _: &Path,
             _: &str,
-            _: &dyn ToolchainPackager,
+            _: Box<dyn ToolchainPackager>,
+            _: &mut PathTransformer,
         ) -> Result<(
             Toolchain,
             Option<(String, PathBuf)>,
@@ -5074,7 +5104,8 @@ mod test_dist {
             &self,
             _: &Path,
             _: &str,
-            _: &dyn ToolchainPackager,
+            _: Box<dyn ToolchainPackager>,
+            _: &mut PathTransformer,
         ) -> Result<(
             Toolchain,
             Option<(String, PathBuf)>,

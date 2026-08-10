@@ -288,12 +288,6 @@ pub fn generate_compile_commands(
     Option<dist::CompileCommand>,
     Cacheable,
 )> {
-    // Unused arguments
-    #[cfg(not(feature = "dist-client"))]
-    {
-        let _ = path_transformer;
-    }
-
     let language = parsed_args.language.as_str();
     let out_pretty = parsed_args.output_pretty();
 
@@ -320,6 +314,8 @@ pub fn generate_compile_commands(
 
     #[cfg(not(feature = "dist-client"))]
     {
+        // Unused arguments
+        let _ = path_transformer;
         Ok((command, None, Cacheable::Yes))
     }
     #[cfg(feature = "dist-client")]
@@ -327,6 +323,8 @@ pub fn generate_compile_commands(
         Ok((
             command,
             (|| {
+                use crate::util::path_to_string;
+
                 let command = dist::CompileCommand {
                     arguments: [
                         &dist::osstrings_to_strings(&parsed_args.common_args)?[..],
@@ -334,15 +332,23 @@ pub fn generate_compile_commands(
                         // &dist::osstrings_to_strings(&parsed_args.unhashed_args)?[..],
                         &[
                             output_flag.into(),
-                            path_transformer.as_dist(output)?,
-                            path_transformer.as_dist(input)?,
+                            path_to_string(output).ok()?,
+                            parsed_args
+                                .language
+                                .needs_c_preprocessing()
+                                .then(|| path_transformer.with_dist_extension(input))
+                                .as_deref()
+                                .or(Some(input))
+                                .and_then(|p| path_to_string(p).ok())?,
                         ],
                     ]
                     .concat(),
-                    cwd: path_transformer.as_dist_abs(cwd)?,
+                    cwd: path_to_string(cwd).ok()?,
                     env_vars: dist::osstring_tuples_to_strings(env_vars)?,
-                    executable: path_transformer
-                        .as_dist(dunce::canonicalize(executable).ok()?.as_path())?,
+                    // executable: path_to_string(executable).ok()?,
+                    executable: dunce::canonicalize(executable)
+                        .and_then(path_to_string)
+                        .ok()?,
                 };
 
                 trace!("[{out_pretty}]: {language} dist_command: {command}");

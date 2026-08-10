@@ -157,7 +157,7 @@ impl Compiler {
 
 // Test GCC + clang on non-OS X platforms.
 #[cfg(all(unix, not(target_os = "macos")))]
-pub const COMPILERS: &[&str] = &["gcc", "clang", "clang++", "nvc", "nvc++"];
+pub const COMPILERS: &[&str] = &["gcc", "clang", "clang++", "nvc", "nvc++", "mpic++"];
 
 // OS X ships a `gcc` that's just a clang wrapper, so only test clang there.
 #[cfg(target_os = "macos")]

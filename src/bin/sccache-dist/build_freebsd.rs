@@ -15,7 +15,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bytes::Buf;
-use flate2::read::ZlibDecoder;
 use futures::lock::Mutex;
 use itertools::Itertools;
 use sccache::dist::{
@@ -391,17 +390,15 @@ impl PotBuilder {
 
         {
             // Bail early if job_queue is closed while this job is running
-            drop(
-                job_queue
-                    .acquire()
-                    .await
-                    .map_err(|e| BuildError::Unknown(e.into()))?,
-            );
+            if job_queue.is_closed() {
+                return Err(BuildError::Cancelled);
+            }
+
             tracing::trace!("[perform_build({job_id})]: copying in inputs");
             let jail_root = pot_fs_root.join("jails").join(cid).join("m");
             tokio::task::spawn_blocking(move || {
                 // Copy inputs to jail_root
-                tar::Archive::new(ZlibDecoder::new(inputs.reader()))
+                tar::Archive::new(flate2::read::ZlibDecoder::new(inputs.reader()))
                     .unpack(&jail_root)
                     .context("Failed to unpack inputs to tempdir")
                     .map_err(BuildError::UnpackInputs)
@@ -421,12 +418,10 @@ impl PotBuilder {
 
         {
             // Bail early if job_queue is closed while this job is running
-            drop(
-                job_queue
-                    .acquire()
-                    .await
-                    .map_err(|e| BuildError::Unknown(e.into()))?,
-            );
+            if job_queue.is_closed() {
+                return Err(BuildError::Cancelled);
+            }
+
             tracing::trace!("[perform_build({job_id})]: creating output directories");
 
             let mut cmd = tokio::process::Command::new("jexec");
@@ -494,12 +489,9 @@ impl PotBuilder {
 
         let outputs = {
             // Bail early if job_queue is closed while this job is running
-            drop(
-                job_queue
-                    .acquire()
-                    .await
-                    .map_err(|e| BuildError::Unknown(e.into()))?,
-            );
+            if job_queue.is_closed() {
+                return Err(BuildError::Cancelled);
+            }
 
             let mut outputs = vec![];
 
@@ -567,12 +559,9 @@ impl BuilderIncoming for PotBuilder {
         outputs: Vec<String>,
     ) -> BuildResult {
         // Bail early if job_queue is closed while this job is running
-        drop(
-            self.job_queue
-                .acquire()
-                .await
-                .map_err(|e| BuildError::Unknown(e.into()))?,
-        );
+        if self.job_queue.is_closed() {
+            return Err(BuildError::Cancelled);
+        }
 
         tracing::debug!("[run_build({job_id})]: Finding container");
 

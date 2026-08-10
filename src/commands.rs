@@ -932,33 +932,28 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         #[cfg(feature = "dist-client")]
         Command::PackageToolchain(executable, out) => {
             use crate::compiler;
-            use crate::dist::Toolchain;
+            use crate::dist::{PathTransformer, Toolchain};
 
             trace!("Command::PackageToolchain({})", executable.display());
-            let runtime = new_client_runtime()?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(1)
+                .build()?;
             let jobserver = Client::new_num(1);
             let creator = ProcessCommandCreator::new(&jobserver);
-            let args: Vec<_> = env::args_os().collect();
             let env: Vec<_> = env::vars_os().collect();
             let mut out_file = File::create(out)?;
             let cwd = env::current_dir().expect("A current working dir should exist");
 
             let pool = runtime.handle().clone();
             runtime.block_on(async move {
-                let packaged = compiler::get_compiler_info(
-                    creator,
-                    &executable,
-                    &cwd,
-                    &args,
-                    &env,
-                    &pool,
-                    None,
-                )
-                .await?
-                .0
-                .get_toolchain_packager()
-                .package()
-                .await?;
+                let packaged =
+                    compiler::get_compiler_info(creator, &executable, &cwd, &[], &env, &pool, None)
+                        .await?
+                        .0
+                        .get_toolchain_packager()
+                        .package(&mut PathTransformer::new())
+                        .await?;
 
                 packaged
                     .write_tar_gz(

@@ -442,8 +442,6 @@ mod task_impls {
     pub async fn server_status(status: StatusUpdate) -> TaskResult<()> {
         let id = status.id.clone();
 
-        tracing::trace!("[server_status({id})]: {status:?}");
-
         scheduler_service()
             .map(|svc| svc.update_server_status(status, None))
             .unwrap_or_else(|err| futures::future::err(err).boxed())
@@ -459,8 +457,6 @@ mod task_impls {
     #[celery::task]
     pub async fn scheduler_status(status: StatusUpdate) -> TaskResult<()> {
         let id = status.id.clone();
-
-        tracing::trace!("[scheduler_status({id})]: {status:?}");
 
         server_service()
             .map(|svc| svc.update_scheduler_status(status))

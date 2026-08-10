@@ -891,6 +891,7 @@ impl SccacheGauge {
         F: FnMut(u64) -> bool,
     {
         let value = self.value.clone();
+        #[allow(deprecated)]
         value
             .fetch_update(
                 std::sync::atomic::Ordering::SeqCst,
@@ -918,6 +919,7 @@ pub struct SccacheGaugeIncrement {
 
 impl Drop for SccacheGaugeIncrement {
     fn drop(&mut self) {
+        #[allow(deprecated)]
         let _ = self.value.fetch_update(
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,

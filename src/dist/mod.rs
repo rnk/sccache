@@ -28,8 +28,7 @@ use std::{
     time::Duration,
 };
 
-use crate::errors::*;
-use crate::mock_command::ProcessOutput;
+use crate::{errors::*, mock_command::ProcessOutput};
 
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 mod cache;
@@ -143,10 +142,9 @@ mod pkg {
     pub trait InputsPackager {}
 }
 
-#[cfg(target_os = "windows")]
 mod path_transform {
     use std::collections::HashMap;
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::path::{Component, Components, Path, PathBuf, Prefix, PrefixComponent};
     use std::str;
 
@@ -163,18 +161,20 @@ mod path_transform {
         Some(pc)
     }
 
-    fn transform_prefix_component(pc: PrefixComponent<'_>) -> Option<String> {
+    fn transform_prefix_component(pc: PrefixComponent<'_>) -> Option<OsString> {
         match pc.kind() {
             // Transforming these to the same place means these may flip-flop
             // in the tracking map, but they're equivalent so not really an
             // issue
             Prefix::Disk(diskchar) | Prefix::VerbatimDisk(diskchar) => {
                 assert!(diskchar.is_ascii_alphabetic());
-                let diskchar = diskchar.to_ascii_uppercase();
-                Some(format!(
-                    "/prefix/disk-{}",
-                    str::from_utf8(&[diskchar]).expect("invalid disk char")
-                ))
+                let diskchar = diskchar.to_ascii_lowercase();
+                let mut path = OsString::new();
+                path.push(OsStr::new("/prefix/drive_"));
+                path.push(OsStr::new(
+                    str::from_utf8(&[diskchar]).expect("invalid disk char"),
+                ));
+                Some(path)
             }
             Prefix::Verbatim(_)
             | Prefix::VerbatimUNC(_, _)
@@ -185,7 +185,7 @@ mod path_transform {
 
     #[derive(Debug, Clone)]
     pub struct PathTransformer {
-        dist_to_local_path: HashMap<String, PathBuf>,
+        dist_to_local_path: HashMap<OsString, PathBuf>,
     }
 
     impl PathTransformer {
@@ -193,189 +193,6 @@ mod path_transform {
             PathTransformer {
                 dist_to_local_path: HashMap::new(),
             }
-        }
-        pub fn as_dist_input_path(&mut self, input_path: &Path) -> Option<String> {
-            self.as_dist(
-                &(if let Some(ext) = input_path.extension() {
-                    input_path.with_extension([OsStr::new("dist"), ext].join(OsStr::new(".")))
-                } else {
-                    input_path.with_extension("dist")
-                }),
-            )
-        }
-        pub fn as_dist_abs(&mut self, p: &Path) -> Option<String> {
-            if !p.is_absolute() {
-                return None;
-            }
-            self.as_dist(p)
-        }
-        pub fn as_dist(&mut self, p: &Path) -> Option<String> {
-            let mut components = p.components();
-
-            // Extract the prefix (e.g. "C:/") if present
-            let maybe_dist_prefix = if p.is_absolute() {
-                let pc =
-                    take_prefix(&mut components).expect("could not take prefix from absolute path");
-                Some(transform_prefix_component(pc)?)
-            } else {
-                None
-            };
-
-            // Reconstruct the path (minus the prefix) as a Linux path
-            let mut dist_suffix = String::new();
-            for component in components {
-                let part = match component {
-                    Component::Prefix(_) | Component::RootDir => {
-                        // On Windows there is such a thing as a path like C:file.txt
-                        // It's not clear to me what the semantics of such a path are,
-                        // so give up.
-                        error!("unexpected part in path {p:?}");
-                        return None;
-                    }
-                    Component::Normal(osstr) => osstr.to_str()?,
-                    // TODO: should be forbidden
-                    Component::CurDir => ".",
-                    Component::ParentDir => "..",
-                };
-                if !dist_suffix.is_empty() {
-                    dist_suffix.push('/');
-                }
-                dist_suffix.push_str(part);
-            }
-
-            let dist_path = if let Some(mut dist_prefix) = maybe_dist_prefix {
-                dist_prefix.push('/');
-                dist_prefix.push_str(&dist_suffix);
-                dist_prefix
-            } else {
-                dist_suffix
-            };
-            self.dist_to_local_path
-                .insert(dist_path.clone(), p.to_owned());
-            Some(dist_path)
-        }
-        pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> {
-            let mut normal_mappings = HashMap::new();
-            let mut verbatim_mappings = HashMap::new();
-            for (_dist_path, local_path) in self.dist_to_local_path.iter() {
-                if !local_path.is_absolute() {
-                    continue;
-                }
-                let mut components = local_path.components();
-                let local_prefix =
-                    take_prefix(&mut components).expect("could not take prefix from absolute path");
-                let local_prefix_component = Component::Prefix(local_prefix);
-                let local_prefix_path: &Path = local_prefix_component.as_ref();
-                let mappings = if let Prefix::VerbatimDisk(_) = local_prefix.kind() {
-                    &mut verbatim_mappings
-                } else {
-                    &mut normal_mappings
-                };
-                if mappings.contains_key(local_prefix_path) {
-                    continue;
-                }
-                let dist_prefix = transform_prefix_component(local_prefix)
-                    .expect("prefix already in tracking map could not be transformed");
-                mappings.insert(local_prefix_path.to_owned(), dist_prefix);
-            }
-            // Prioritise normal mappings for the same disk, as verbatim mappings can
-            // look odd to users
-            normal_mappings.into_iter().chain(verbatim_mappings)
-        }
-        pub fn to_local(&self, p: &str) -> Option<PathBuf> {
-            self.dist_to_local_path.get(p).cloned()
-        }
-    }
-
-    #[test]
-    fn test_basic() {
-        let mut pt = PathTransformer::new();
-        assert_eq!(pt.as_dist(Path::new("C:/a")).unwrap(), "/prefix/disk-C/a");
-        assert_eq!(
-            pt.as_dist(Path::new(r#"C:\a\b.c"#)).unwrap(),
-            "/prefix/disk-C/a/b.c"
-        );
-        assert_eq!(
-            pt.as_dist(Path::new("X:/other.c")).unwrap(),
-            "/prefix/disk-X/other.c"
-        );
-        let mut disk_mappings: Vec<_> = pt.disk_mappings().collect();
-        disk_mappings.sort();
-        assert_eq!(
-            disk_mappings,
-            &[
-                (Path::new("C:").into(), "/prefix/disk-C".into()),
-                (Path::new("X:").into(), "/prefix/disk-X".into()),
-            ]
-        );
-        assert_eq!(pt.to_local("/prefix/disk-C/a").unwrap(), Path::new("C:/a"));
-        assert_eq!(
-            pt.to_local("/prefix/disk-C/a/b.c").unwrap(),
-            Path::new("C:/a/b.c")
-        );
-        assert_eq!(
-            pt.to_local("/prefix/disk-X/other.c").unwrap(),
-            Path::new("X:/other.c")
-        );
-    }
-
-    #[test]
-    fn test_relative_paths() {
-        let mut pt = PathTransformer::new();
-        assert_eq!(pt.as_dist(Path::new("a/b")).unwrap(), "a/b");
-        assert_eq!(pt.as_dist(Path::new(r#"a\b"#)).unwrap(), "a/b");
-        assert_eq!(pt.to_local("a/b").unwrap(), Path::new("a/b"));
-    }
-
-    #[test]
-    fn test_verbatim_disks() {
-        let mut pt = PathTransformer::new();
-        assert_eq!(
-            pt.as_dist(Path::new("X:/other.c")).unwrap(),
-            "/prefix/disk-X/other.c"
-        );
-        pt.as_dist(Path::new(r#"\\?\X:\out\other.o"#));
-        assert_eq!(
-            pt.to_local("/prefix/disk-X/other.c").unwrap(),
-            Path::new("X:/other.c")
-        );
-        assert_eq!(
-            pt.to_local("/prefix/disk-X/out/other.o").unwrap(),
-            Path::new(r#"\\?\X:\out\other.o"#)
-        );
-        let disk_mappings: Vec<_> = pt.disk_mappings().collect();
-        // Verbatim disks should come last
-        assert_eq!(
-            disk_mappings,
-            &[
-                (Path::new("X:").into(), "/prefix/disk-X".into()),
-                (Path::new(r#"\\?\X:"#).into(), "/prefix/disk-X".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_slash_directions() {
-        let mut pt = PathTransformer::new();
-        assert_eq!(pt.as_dist(Path::new("C:/a")).unwrap(), "/prefix/disk-C/a");
-        assert_eq!(pt.as_dist(Path::new("C:\\a")).unwrap(), "/prefix/disk-C/a");
-        assert_eq!(pt.to_local("/prefix/disk-C/a").unwrap(), Path::new("C:/a"));
-        assert_eq!(pt.disk_mappings().count(), 1);
-    }
-}
-
-#[cfg(unix)]
-mod path_transform {
-    use std::ffi::OsStr;
-    use std::iter;
-    use std::path::{Path, PathBuf};
-
-    #[derive(Debug, Clone)]
-    pub struct PathTransformer;
-
-    impl PathTransformer {
-        pub fn new() -> Self {
-            PathTransformer
         }
         ///
         /// Remove the extension so preprocessed file doesn't have the same name as
@@ -410,30 +227,277 @@ mod path_transform {
         /// >       |                   const char*
         /// ```
         ///
-        pub fn as_dist_input_path(&mut self, input_path: &Path) -> Option<String> {
-            self.as_dist(
-                &(if let Some(ext) = input_path.extension() {
-                    input_path.with_extension([OsStr::new("dist"), ext].join(OsStr::new(".")))
-                } else {
-                    input_path.with_extension("dist")
-                }),
-            )
+        pub fn with_dist_extension(&mut self, input_path: &Path) -> PathBuf {
+            if let Some(ext) = input_path.extension() {
+                input_path.with_extension([OsStr::new("dist"), ext].join(OsStr::new(".")))
+            } else {
+                input_path.with_extension("dist")
+            }
         }
-        pub fn as_dist_abs(&mut self, p: &Path) -> Option<String> {
+        pub fn as_dist_abs<P: AsRef<Path>>(&mut self, p: P) -> Option<PathBuf> {
+            let p = p.as_ref();
             if !p.is_absolute() {
                 return None;
             }
             self.as_dist(p)
         }
-        pub fn as_dist(&mut self, p: &Path) -> Option<String> {
-            p.as_os_str().to_str().map(Into::into)
+        pub fn as_dist<P: AsRef<Path>>(&mut self, p: P) -> Option<PathBuf> {
+            let p = p.as_ref();
+
+            let mut components = p.components();
+
+            // Extract the prefix (e.g. "C:/") if present
+            let maybe_dist_prefix = if p.is_absolute() {
+                if let Some(pc) = take_prefix(&mut components) {
+                    Some(transform_prefix_component(pc)?)
+                } else {
+                    Some(OsString::new())
+                }
+            } else {
+                None
+            };
+
+            // Reconstruct the path as a Linux path
+            let mut component = components.next();
+            let mut dist_path = maybe_dist_prefix
+                .map(|mut dist_prefix| {
+                    if component.is_some() || dist_prefix.is_empty() {
+                        dist_prefix.push(OsStr::new("/"));
+                    }
+                    dist_prefix
+                })
+                .unwrap_or_default();
+            loop {
+                if let Some(part) = component {
+                    dist_path.push(part);
+                    component = components.next();
+                }
+                if component.is_some() {
+                    dist_path.push("/");
+                } else {
+                    break;
+                }
+            }
+
+            self.dist_to_local_path
+                .insert(dist_path.clone(), p.to_owned());
+
+            Some(dist_path.into())
         }
-        pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> {
-            iter::empty()
+        pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, PathBuf)> {
+            let mut normal_mappings = HashMap::new();
+            let mut verbatim_mappings = HashMap::new();
+
+            for local_path in self.dist_to_local_path.values() {
+                if !local_path.is_absolute() {
+                    continue;
+                }
+                let mut components = local_path.components();
+                let (local_prefix_component, mappings) =
+                    if let Some(local_prefix) = take_prefix(&mut components) {
+                        (
+                            Component::Prefix(local_prefix),
+                            if let Prefix::VerbatimDisk(_) = local_prefix.kind() {
+                                &mut verbatim_mappings
+                            } else {
+                                &mut normal_mappings
+                            },
+                        )
+                    } else {
+                        (Component::RootDir, &mut normal_mappings)
+                    };
+
+                let local_prefix_path: &Path = local_prefix_component.as_ref();
+
+                if mappings.contains_key(local_prefix_path) {
+                    continue;
+                }
+
+                if let Component::Prefix(local_prefix) = local_prefix_component {
+                    let dist_prefix = transform_prefix_component(local_prefix)
+                        .expect("prefix already in tracking map could not be transformed");
+
+                    mappings.insert(local_prefix_path.to_owned(), dist_prefix);
+                } else {
+                    mappings.insert(
+                        local_prefix_path.to_owned(),
+                        local_prefix_path.as_os_str().to_owned(),
+                    );
+                }
+            }
+
+            // Prioritise normal mappings for the same disk, as verbatim mappings can
+            // look odd to users
+            normal_mappings
+                .into_iter()
+                .chain(verbatim_mappings)
+                .map(|(a, b)| (a, b.into()))
         }
-        pub fn to_local(&self, p: &str) -> Option<PathBuf> {
-            Some(PathBuf::from(p))
+        pub fn to_local<P: AsRef<Path>>(&self, p: P) -> Option<PathBuf> {
+            self.dist_to_local_path.get(p.as_ref().as_os_str()).cloned()
         }
+    }
+
+    #[test]
+    fn test_basic() {
+        #[cfg(not(target_os = "windows"))]
+        let (a, b, c, d) = {
+            (
+                (Path::new("/a"), Path::new("/a")),
+                (Path::new("/a/b.c"), Path::new("/a/b.c")),
+                (Path::new("/other.c"), Path::new("/other.c")),
+                vec![(Path::new("/"), Path::new("/"))],
+            )
+        };
+
+        #[cfg(target_os = "windows")]
+        let (a, b, c, d) = {
+            (
+                (Path::new("C:/a"), Path::new("/prefix/drive_c/a")),
+                (Path::new(r#"C:\a\b.c"#), Path::new("/prefix/drive_c/a/b.c")),
+                (
+                    Path::new("X:/other.c"),
+                    Path::new("/prefix/drive_x/other.c"),
+                ),
+                vec![
+                    (Path::new("C:"), Path::new("/prefix/drive_c")),
+                    (Path::new("X:"), Path::new("/prefix/drive_x")),
+                ],
+            )
+        };
+
+        let mut pt = PathTransformer::new();
+
+        // a
+        assert_eq!(pt.as_dist(a.0).unwrap(), a.1);
+        assert_eq!(pt.to_local(a.1).unwrap(), a.0);
+
+        // b
+        assert_eq!(pt.as_dist(b.0).unwrap(), b.1);
+        assert_eq!(pt.to_local(b.1).unwrap(), b.0);
+
+        // c
+        assert_eq!(pt.as_dist(c.0).unwrap(), c.1);
+        assert_eq!(pt.to_local(c.1).unwrap(), c.0);
+
+        let mut disk_mappings: Vec<_> = pt.disk_mappings().collect();
+        disk_mappings.sort();
+        let disk_mappings = disk_mappings
+            .iter()
+            .map(|(a, b)| (a.as_path(), b.as_path()))
+            .collect::<Vec<_>>();
+
+        // d
+        assert_eq!(disk_mappings, d);
+    }
+
+    #[test]
+    fn test_relative_paths() {
+        #[cfg(not(target_os = "windows"))]
+        let (a, b) = {
+            (
+                (Path::new("a/b"), Path::new("a/b")),
+                (Path::new("a/b"), Path::new("a/b")),
+            )
+        };
+
+        #[cfg(target_os = "windows")]
+        let (a, b) = {
+            (
+                (Path::new("a/b"), Path::new("a/b")),
+                (Path::new(r#"a\b"#), Path::new("a/b")),
+            )
+        };
+
+        let mut pt = PathTransformer::new();
+
+        // a
+        assert_eq!(pt.as_dist(a.0).unwrap(), a.1);
+        assert_eq!(pt.to_local(a.1).unwrap(), a.0);
+        // b
+        assert_eq!(pt.as_dist(b.0).unwrap(), b.1);
+        assert_eq!(pt.to_local(b.1).unwrap(), b.0);
+    }
+
+    #[test]
+    fn test_verbatim_disks() {
+        #[cfg(not(target_os = "windows"))]
+        let (a, b, c) = {
+            (
+                (Path::new("/other.c"), Path::new("/other.c")),
+                (Path::new("/out/other.o"), Path::new("/out/other.o")),
+                vec![(Path::new("/"), Path::new("/"))],
+            )
+        };
+
+        #[cfg(target_os = "windows")]
+        let (a, b, c) = {
+            (
+                (
+                    Path::new("X:/other.c"),
+                    Path::new("/prefix/drive_x/other.c"),
+                ),
+                (
+                    Path::new(r#"\\?\X:\out\other.o"#),
+                    Path::new("/prefix/drive_x/out/other.o"),
+                ),
+                vec![
+                    (Path::new("X:"), Path::new("/prefix/drive_x")),
+                    (Path::new(r#"\\?\X:"#), Path::new("/prefix/drive_x")),
+                ],
+            )
+        };
+
+        let mut pt = PathTransformer::new();
+
+        // a
+        assert_eq!(pt.as_dist(a.0).unwrap(), a.1);
+        assert_eq!(pt.to_local(a.1).unwrap(), a.0);
+
+        // b
+        assert_eq!(pt.as_dist(b.0).unwrap(), b.1);
+        assert_eq!(pt.to_local(b.1).unwrap(), b.0);
+
+        // Verbatim disks should come last
+        let disk_mappings: Vec<_> = pt.disk_mappings().collect();
+        let disk_mappings = disk_mappings
+            .iter()
+            .map(|(a, b)| (a.as_path(), b.as_path()))
+            .collect::<Vec<_>>();
+
+        // c
+        assert_eq!(disk_mappings, c);
+    }
+
+    #[test]
+    fn test_slash_directions() {
+        #[cfg(not(target_os = "windows"))]
+        let (a, b) = {
+            (
+                (Path::new("/a"), Path::new("/a")),
+                (Path::new("/a"), Path::new("/a")),
+            )
+        };
+
+        #[cfg(target_os = "windows")]
+        let (a, b) = {
+            (
+                (Path::new("C:/a"), Path::new("/prefix/drive_c/a")),
+                (Path::new("C:\\a"), Path::new("/prefix/drive_c/a")),
+            )
+        };
+
+        let mut pt = PathTransformer::new();
+
+        // a
+        assert_eq!(pt.as_dist(a.0).unwrap(), a.1);
+        assert_eq!(pt.to_local(a.1).unwrap(), a.0);
+
+        // b
+        assert_eq!(pt.as_dist(b.0).unwrap(), b.1);
+        assert_eq!(pt.to_local(b.1).unwrap(), a.0);
+
+        assert_eq!(pt.disk_mappings().count(), 1);
     }
 }
 
@@ -520,6 +584,7 @@ pub enum BuildError {
     MakeOverlayDir(PathBuf, std::io::Error),
     MountOverlayFS(Error),
     UnpackInputs(Error),
+    CopyOutputDir(PathBuf, Error),
     MakeOutputDir(PathBuf, std::io::Error),
     SpawnChildProcess(std::io::Error),
     ReadChildOutput(std::io::Error),
@@ -540,6 +605,7 @@ impl fmt::Debug for BuildError {
             Self::MakeOverlayDir(p, e) => write!(f, "Failed to create overlay dir {p:?}: {e:?}"),
             Self::MountOverlayFS(e) => write!(f, "Failed to mount overlay FS: {e:?}"),
             Self::UnpackInputs(e) => write!(f, "Failed to unpack inputs to overlay: {e:?}"),
+            Self::CopyOutputDir(p, e) => write!(f, "Failed to copy output dir {p:?}: {e:?}"),
             Self::MakeOutputDir(p, e) => write!(f, "Failed to create output dir {p:?}: {e:?}"),
             Self::SpawnChildProcess(e) => write!(f, "Failed to spawn build process: {e:?}"),
             Self::ReadChildOutput(e) => write!(f, "Failed to read process output: {e:?}"),
@@ -562,6 +628,7 @@ impl fmt::Display for BuildError {
             Self::MakeOverlayDir(p, e) => write!(f, "Failed to create overlay dir {p:?}: {e}"),
             Self::MountOverlayFS(e) => write!(f, "Failed to mount overlay FS: {e}"),
             Self::UnpackInputs(e) => write!(f, "Failed to unpack inputs to overlay: {e}"),
+            Self::CopyOutputDir(p, e) => write!(f, "Failed to copy output dir {p:?}: {e}"),
             Self::MakeOutputDir(p, e) => write!(f, "Failed to create output dir {p:?}: {e}"),
             Self::SpawnChildProcess(e) => write!(f, "Failed to spawn build process: {e}"),
             Self::ReadChildOutput(e) => write!(f, "Failed to read process output: {e}"),
@@ -590,6 +657,16 @@ pub struct CompileCommand {
     pub arguments: Vec<String>,
     pub env_vars: Vec<(String, String)>,
     pub cwd: String,
+}
+
+impl CompileCommand {
+    pub fn as_dist(self, path_transformer: &mut PathTransformer) -> Result<Self> {
+        let cwd = path_transformer
+            .as_dist_abs(&self.cwd)
+            .map(|p| crate::util::path_to_string(p).map_err(Into::into))
+            .unwrap_or_else(|| bail!("Failed to translate cwd {:?}", self.cwd))?;
+        Ok(Self { cwd, ..self })
+    }
 }
 
 impl fmt::Display for CompileCommand {
@@ -916,7 +993,8 @@ pub trait Client: Send + Sync {
         &self,
         compiler_path: &Path,
         weak_toolchain_key: &str,
-        toolchain_packager: &dyn pkg::ToolchainPackager,
+        toolchain_packager: Box<dyn pkg::ToolchainPackager>,
+        path_transformer: &mut PathTransformer,
     ) -> Result<(
         Toolchain,
         Option<(String, PathBuf)>,

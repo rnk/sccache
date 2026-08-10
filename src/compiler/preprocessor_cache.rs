@@ -945,6 +945,20 @@ fn remember_include_file(
     let meta = match fs_impl.metadata(&include_path) {
         Ok(meta) => meta,
         Err(e) => {
+            if include_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| {
+                    // e.g. nvcc_internal_extended_lambda_implementation
+                    (name.starts_with("nvcc_internal_") && name.ends_with("_implementation")) ||
+                    // e.g. __nv_cuda_kernel_impl
+                    (name.starts_with("__nv_cuda_") && name.ends_with("_impl"))
+                })
+                .is_some()
+            {
+                trace!("nvcc internal implementation {include_path:?}");
+                return Ok(true);
+            }
             debug!("Failed to stat include file {include_path:?}: {e}");
             return Ok(false);
         }

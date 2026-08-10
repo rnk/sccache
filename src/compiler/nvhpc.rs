@@ -19,12 +19,11 @@ use crate::{
         args::*,
         c::{CCompilerImpl, CCompilerKind, DepfilePath, ParsedArguments, PreprocessorOutput},
         gcc::{self, ArgData::*},
-        msvc::from_local_codepage,
     },
     errors::*,
     mock_command::{CommandCreatorSync, RunCommand},
     server::SccacheService,
-    util::run_input_output,
+    util::{bytes_to_string, run_input_output},
 };
 use crate::{counted_array, dist};
 use async_trait::async_trait;
@@ -63,7 +62,7 @@ impl Nvhpc {
         let exe = if let Ok(out) = run_input_output(cmd, None).await {
             which::which(
                 // Remove the trailing newlines (if present)
-                from_local_codepage(out.stdout).ok()?.trim(),
+                bytes_to_string(out.stdout).ok()?.trim(),
             )
             .ok()
             .unwrap_or_else(|| exe.to_path_buf())

@@ -1082,30 +1082,56 @@ impl OsStrExt for OsStr {
     }
 }
 
-pub fn split_quoted_shell_str(s: &str) -> Option<Vec<String>> {
+pub fn split_quoted_shell_str<S: AsRef<str>>(s: S) -> Option<Vec<String>> {
     #[cfg(unix)]
-    let args = shlex::split(s);
+    let args = shlex::split(s.as_ref());
     #[cfg(windows)]
-    let args = Some(winsplit::split(s));
+    let args = Some(winsplit::split(s.as_ref()));
     args
 }
 
-pub fn bytes_to_path(bytes: &[u8]) -> std::io::Result<PathBuf> {
-    Ok(bytes_to_os_string(bytes)?.into())
+pub fn bytes_to_path<B: AsRef<[u8]>>(buf: B) -> std::io::Result<PathBuf> {
+    Ok(bytes_to_os_string(buf)?.into())
 }
 
-pub fn path_to_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
-    os_str_to_bytes(path.as_os_str())
+pub fn path_to_bytes<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<u8>> {
+    os_str_to_bytes(path.as_ref().as_os_str())
+}
+
+pub fn path_to_string<P: AsRef<Path>>(path: P) -> std::io::Result<String> {
+    os_str_to_string(path.as_ref().as_os_str())
+}
+
+pub fn os_str_to_string<S: AsRef<OsStr>>(s: S) -> std::io::Result<String> {
+    os_str_to_bytes(s.as_ref()).and_then(bytes_to_string)
 }
 
 #[cfg(unix)]
-pub fn bytes_to_os_string(buf: &[u8]) -> std::io::Result<OsString> {
-    use std::os::unix::prelude::*;
-    Ok(OsStr::from_bytes(buf).into())
+pub fn bytes_to_string(multi_byte_str: Vec<u8>) -> std::io::Result<String> {
+    String::from_utf8(multi_byte_str)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
 }
 
 #[cfg(windows)]
-pub fn bytes_to_os_string(buf: &[u8]) -> std::io::Result<OsString> {
+pub fn bytes_to_string(multi_byte_str: Vec<u8>) -> std::io::Result<String> {
+    use windows_sys::Win32::Globalization::{CP_OEMCP, MB_ERR_INVALID_CHARS};
+
+    multi_byte_to_wide_char(CP_OEMCP, MB_ERR_INVALID_CHARS, &multi_byte_str)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        .and_then(|buf| {
+            String::from_utf16(&buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })
+}
+
+#[cfg(unix)]
+fn bytes_to_os_string<B: AsRef<[u8]>>(buf: B) -> std::io::Result<OsString> {
+    use std::os::unix::prelude::*;
+    Ok(OsStr::from_bytes(buf.as_ref()).into())
+}
+
+#[cfg(windows)]
+fn bytes_to_os_string<B: AsRef<[u8]>>(buf: B) -> std::io::Result<OsString> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Globalization::{CP_OEMCP, MB_ERR_INVALID_CHARS};
 
@@ -1178,17 +1204,19 @@ pub fn wide_char_to_multi_byte(wide_char_str: &[u16]) -> std::io::Result<Vec<u8>
     }
 }
 
-#[cfg(windows)]
 /// Wrapper for MultiByteToWideChar.
 ///
 /// See https://msdn.microsoft.com/en-us/library/windows/desktop/dd319072(v=vs.85).aspx
 /// for more details.
-pub fn multi_byte_to_wide_char(
+#[cfg(windows)]
+fn multi_byte_to_wide_char<B: AsRef<[u8]>>(
     codepage: u32,
     flags: u32,
-    multi_byte_str: &[u8],
+    multi_byte_str: B,
 ) -> std::io::Result<Vec<u16>> {
     use windows_sys::Win32::Globalization::MultiByteToWideChar;
+
+    let multi_byte_str = multi_byte_str.as_ref();
 
     if multi_byte_str.is_empty() {
         return Ok(vec![]);
@@ -2645,5 +2673,36 @@ mod tests {
         let h1 = Digest::from_file(t1.path()).await.unwrap().finish();
         let h2 = Digest::from_file(t2.path()).await.unwrap().finish();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn local_oem_codepage_conversions() {
+        use crate::util::{bytes_to_string, wide_char_to_multi_byte};
+        use windows_sys::Win32::Globalization::GetOEMCP;
+
+        let current_oemcp = unsafe { GetOEMCP() };
+        // We don't control the local OEM codepage so test only if it is one of:
+        // United States, Latin-1 and Latin-1 + euro symbol
+        if current_oemcp == 437 || current_oemcp == 850 || current_oemcp == 858 {
+            // Non-ASCII characters
+            const INPUT_STRING: &str = "ÇüéâäàåçêëèïîìÄÅ";
+
+            // The characters in INPUT_STRING encoded per the OEM codepage
+            const INPUT_BYTES: [u8; 16] = [
+                128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143,
+            ];
+
+            // Test the conversion from the OEM codepage to UTF-8
+            assert_eq!(bytes_to_string(INPUT_BYTES.to_vec()).unwrap(), INPUT_STRING);
+
+            // The characters in INPUT_STRING encoded in UTF-16
+            const INPUT_WORDS: [u16; 16] = [
+                199, 252, 233, 226, 228, 224, 229, 231, 234, 235, 232, 239, 238, 236, 196, 197,
+            ];
+
+            // Test the conversion from UTF-16 to the OEM codepage
+            assert_eq!(wide_char_to_multi_byte(&INPUT_WORDS).unwrap(), INPUT_BYTES);
+        }
     }
 }

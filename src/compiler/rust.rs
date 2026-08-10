@@ -41,8 +41,10 @@ use crate::{
     errors::*,
     mock_command::{CommandCreatorSync, RunCommand},
     server::SccacheService,
-    util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output},
-    util::{HashToDigest, OsStrExt},
+    util::{
+        Digest, HashToDigest, OsStrExt, bytes_to_string, fmt_duration_as_secs, hash_all,
+        hash_all_archives, path_to_string, run_input_output,
+    },
 };
 use async_trait::async_trait;
 use filetime::FileTime;
@@ -389,7 +391,7 @@ where
     trace!("get_compiler_outputs: {cmd:?}");
     let outputs = run_input_output(cmd, None).await?;
 
-    let outstr = String::from_utf8(outputs.stdout).context("Error parsing rustc output")?;
+    let outstr = bytes_to_string(outputs.stdout).context("Error parsing rustc output")?;
     trace!("get_compiler_outputs: {outstr:?}");
     Ok(outstr.lines().map(|l| l.to_owned()).collect())
 }
@@ -427,7 +429,7 @@ impl Rust {
         let sysroot_and_libs = async move {
             let output = run_input_output(cmd, None).await?;
             //debug!("output.and_then: {}", output);
-            let outstr = String::from_utf8(output.stdout).context("Error parsing sysroot")?;
+            let outstr = bytes_to_string(output.stdout).context("Error parsing sysroot")?;
             let sysroot = PathBuf::from(outstr.trim_end());
             let libs_path = sysroot.join(LIBS_DIR);
             let mut libs = fs::read_dir(&libs_path)
@@ -583,7 +585,7 @@ where
                 .await
                 .context("Failed to execute rustup which rustc")?;
 
-            let stdout = String::from_utf8(output.stdout)
+            let stdout = bytes_to_string(output.stdout)
                 .context("Failed to parse output of rustup which rustc")?;
 
             let proxied_compiler = PathBuf::from(stdout.trim());
@@ -724,7 +726,7 @@ impl RustupProxy {
                 child.env_clear().envs(env.to_vec()).args(&["--version"]);
                 let rustup_candidate_check = run_input_output(child, None).await?;
 
-                let stdout = String::from_utf8(rustup_candidate_check.stdout)
+                let stdout = bytes_to_string(rustup_candidate_check.stdout)
                     .map_err(|_e| anyhow!("Response of `rustup --version` is not valid UTF-8"))?;
                 Ok(if stdout.trim().starts_with("rustup ") {
                     trace!("PROXY rustup --version produced: {}", &stdout);
@@ -1718,7 +1720,7 @@ where
 impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
     fn generate_compile_commands(
         &self,
-        path_transformer: &mut dist::PathTransformer,
+        _path_transformer: &mut dist::PathTransformer,
         _rewrite_includes_only: bool,
         _hash_key: &str,
     ) -> Result<(
@@ -1740,7 +1742,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         // Ignore unused variables
         #[cfg(not(feature = "dist-client"))]
         {
-            let _ = path_transformer;
+            let _ = _path_transformer;
             let _ = host;
             let _ = sysroot;
         }
@@ -1779,7 +1781,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 
             // flat_map would be nice but the lifetimes don't work out
             for argument in arguments.iter() {
-                let path_transformer_fn = &mut |p: &Path| path_transformer.as_dist(p);
+                let path_transformer_fn = &mut |p: &Path| path_to_string(p).ok();
                 if let Argument::Raw(input_path) = argument {
                     // Need to explicitly handle the input argument as it's not parsed as a path
                     let input_path = Path::new(input_path).to_owned();
@@ -1804,50 +1806,11 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 
             // Convert the paths of some important environment variables
             let mut env_vars = dist::osstring_tuples_to_strings(env_vars)?;
-            let mut changed_out_dir: Option<PathBuf> = None;
             for (k, v) in env_vars.iter_mut() {
-                match k.as_str() {
-                    // We round-tripped from path to string and back to path, but it should be lossless
-                    "OUT_DIR" => {
-                        let dist_out_dir = path_transformer.as_dist(Path::new(v))?;
-                        if dist_out_dir != *v {
-                            changed_out_dir = Some(v.to_owned().into());
-                        }
-                        *v = dist_out_dir;
-                    }
-                    "TMPDIR" => {
-                        // The server will need to find its own tempdir.
-                        *v = String::new();
-                    }
-                    "CARGO" | "CARGO_MANIFEST_DIR" => {
-                        *v = path_transformer.as_dist(Path::new(v))?;
-                    }
-                    _ => (),
+                if k.as_str() == "TMPDIR" {
+                    // The server will need to find its own tempdir.
+                    *v = String::new();
                 }
-            }
-            // OUT_DIR was changed during transformation, check if this compilation is relying on anything
-            // inside it - if so, disallow distributed compilation (there are sometimes hardcoded paths present)
-            if let Some(out_dir) = changed_out_dir
-                && self.inputs.iter().any(|input| input.starts_with(&out_dir))
-            {
-                return None;
-            }
-
-            // Add any necessary path transforms - although we haven't packaged up inputs yet, we've
-            // probably seen all drives (e.g. on Windows), so let's just transform those rather than
-            // trying to do every single path.
-            let mut remapped_disks = HashSet::new();
-            for (local_path, dist_path) in get_path_mappings(path_transformer) {
-                let local_path = local_path.to_str()?;
-                // "The from=to parameter is scanned from right to left, so from may contain '=', but to may not."
-                if local_path.contains('=') {
-                    return None;
-                }
-                if remapped_disks.contains(&dist_path) {
-                    continue;
-                }
-                dist_arguments.push(format!("--remap-path-prefix={}={}", &dist_path, local_path));
-                remapped_disks.insert(dist_path);
             }
 
             let sysroot_executable = sysroot
@@ -1857,9 +1820,9 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 
             let command = dist::CompileCommand {
                 arguments: dist_arguments,
-                cwd: path_transformer.as_dist_abs(cwd)?,
+                cwd: path_to_string(cwd).ok()?,
                 env_vars,
-                executable: path_transformer.as_dist(&sysroot_executable)?,
+                executable: path_to_string(sysroot_executable).ok()?,
             };
 
             trace!("[{crate_name}]: dist command: {command}");
@@ -1923,7 +1886,9 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 fn get_path_mappings(
     path_transformer: &dist::PathTransformer,
 ) -> impl Iterator<Item = (PathBuf, String)> {
-    path_transformer.disk_mappings()
+    path_transformer
+        .disk_mappings()
+        .map(|(local_path, dist_path)| (local_path, path_to_string(dist_path).unwrap()))
 }
 
 #[cfg(feature = "dist-client")]
@@ -2246,6 +2211,10 @@ struct RustToolchainPackager {
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
         ),
+        all(
+            target_os = "windows",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         target_os = "freebsd"
     )
 ))]
@@ -2257,32 +2226,39 @@ struct RustToolchainPackager {
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
         ),
+        all(
+            target_os = "windows",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         target_os = "freebsd"
     )
 ))]
 impl pkg::ToolchainPackager for RustToolchainPackager {
-    async fn package(&self) -> Result<Arc<dyn pkg::PackagedToolchain>> {
+    async fn package(
+        self: Box<Self>,
+        path_transformer: &mut dist::PathTransformer,
+    ) -> Result<Arc<dyn pkg::PackagedToolchain>> {
         debug!(
             "Packaging Rust compiler for sysroot {:?}",
             self.sysroot.display()
         );
-        let RustToolchainPackager { sysroot } = self;
 
-        let bins_path = sysroot.join(BINS_DIR);
+        let bins_path = self.sysroot.join(BINS_DIR);
         let sysroot_executable = bins_path.join("rustc").with_extension(EXE_EXTENSION);
-        let mut package_builder = pkg::ToolchainPackaged::new(sysroot_executable.clone());
-        package_builder.add_common()?;
+        let mut package_builder =
+            pkg::ToolchainPackaged::new(sysroot_executable.clone(), path_transformer);
+
         package_builder.add_executable_and_deps(&[], &sysroot_executable)?;
 
         package_builder.add_dir_contents(&[], &bins_path)?;
         if BINS_DIR != LIBS_DIR {
-            let libs_path = sysroot.join(LIBS_DIR);
+            let libs_path = self.sysroot.join(LIBS_DIR);
             package_builder.add_dir_contents(&[], &libs_path)?;
         }
 
         // Return the builder so the archive can be lazily created, depending
-        // on whether the scheduler reports it already has the toolchain or not
-        Ok(Arc::new(package_builder))
+        // on whether or not the scheduler reports it already has the toolchain
+        package_builder.build()
     }
 }
 
@@ -2305,9 +2281,11 @@ impl OutputsRewriter for RustOutputsRewriter {
         // remap-path-prefix is documented to only apply to 'inputs'.
         trace!("Pondering on rewriting dep file {:?}", self.dep_info);
         if let Some(dep_info) = self.dep_info.as_ref() {
-            let extra_input_str = extra_inputs
-                .iter()
-                .fold(String::new(), |s, p| s + " " + &p.to_string_lossy());
+            let extra_input_str = extra_inputs.iter().fold(String::new(), |mut s, p| {
+                s.push(' ');
+                s.push_str(&p.display().to_string());
+                s
+            });
             for dep_info_local_path in output_paths {
                 trace!("Comparing with {}", dep_info_local_path.display());
                 if dep_info == dep_info_local_path {
@@ -2326,7 +2304,7 @@ impl OutputsRewriter for RustOutputsRewriter {
                                 local_path.display()
                             )
                         })?;
-                        error!("RE replacing {re_str} with {local_path_str} in {deps}");
+                        debug!("RE replacing {re_str} with {local_path_str} in {deps}");
                         let re = regex::Regex::new(&re_str).expect("Invalid regex");
                         deps = re.replace_all(&deps, local_path_str).into_owned();
                     }
@@ -2352,13 +2330,14 @@ impl OutputsRewriter for RustOutputsRewriter {
 fn test_rust_outputs_rewriter() {
     use crate::compiler::compiler::OutputsRewriter;
     use crate::test::utils::create_file;
+    use crate::util::path_to_string;
     use std::io::Write;
 
     let mut pt = dist::PathTransformer::new();
     pt.as_dist(Path::new("c:\\")).unwrap();
     let mappings: Vec<_> = pt.disk_mappings().collect();
     assert!(mappings.len() == 1);
-    let linux_prefix = &mappings[0].1;
+    let linux_prefix = path_to_string(&mappings[0].1).unwrap();
 
     let depinfo_data = format!("{linux_prefix}/sccache/target/x86_64-unknown-linux-gnu/debug/deps/sccache_dist-c6f3229b9ef0a5c3.rmeta: src/bin/sccache-dist/main.rs src/bin/sccache-dist/build.rs src/bin/sccache-dist/token_check.rs
 
@@ -2596,7 +2575,7 @@ impl RlibDepReader {
             )
         }
 
-        let stdout = String::from_utf8(stdout).context("Error parsing rustc -Z ls output")?;
+        let stdout = bytes_to_string(stdout).context("Error parsing rustc -Z ls output")?;
         let deps: Vec<_> = parse_rustc_z_ls(&stdout)
             .map(|deps| deps.into_iter().map(|dep| dep.to_owned()).collect())?;
 

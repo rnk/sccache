@@ -2978,7 +2978,7 @@ pub mod scheduler {
 pub mod server {
     use super::{
         CacheConfigs, MessageBroker, MetricsConfigs, PrometheusMetricsConfig, config_from_env,
-        default_disk_cache_dir, number_from_env_var, try_read_config_file,
+        default_disk_cache_dir, number_from_env_var, string_from_env_var, try_read_config_file,
     };
     use serde::{Deserialize, Serialize};
     use std::{env, net::SocketAddr, path::PathBuf, str::FromStr};
@@ -3014,13 +3014,37 @@ pub mod server {
             .collect()
     }
 
-    #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+    fn default_docker_image() -> String {
+        "ubuntu:latest".into()
+    }
+
+    fn default_docker_run_cmd() -> Vec<String> {
+        ["sh", "-c", "while true; do sleep 365d && true; done"]
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    fn default_docker_exec_cmd() -> Vec<String> {
+        vec![]
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     #[serde(tag = "type")]
     #[serde(deny_unknown_fields)]
     pub enum BuilderType {
-        #[default]
         #[serde(rename = "docker")]
-        Docker,
+        Docker {
+            // Name of the image to run
+            #[serde(default = "default_docker_image")]
+            image: String,
+            // Command to pass to `docker run <image>`
+            #[serde(default = "default_docker_run_cmd")]
+            run_cmd: Vec<String>,
+            // Command to pass to `docker exec <container>`
+            #[serde(default = "default_docker_exec_cmd")]
+            exec_cmd: Vec<String>,
+        },
         #[serde(rename = "overlay")]
         Overlay {
             build_dir: PathBuf,
@@ -3039,8 +3063,21 @@ pub mod server {
         },
     }
 
+    impl Default for BuilderType {
+        fn default() -> Self {
+            Self::Docker {
+                image: default_docker_image(),
+                run_cmd: default_docker_run_cmd(),
+                exec_cmd: default_docker_exec_cmd(),
+            }
+        }
+    }
+
     impl BuilderType {
         pub fn with_env_or_config(self) -> Self {
+            let mut docker_image = None;
+            let mut docker_run_cmd = None;
+            let mut docker_exec_cmd = None;
             let mut overlay_build_dir = None;
             let mut overlay_bwrap_path = None;
             let mut pot_clone_from = None;
@@ -3049,6 +3086,15 @@ pub mod server {
             let mut pot_fs_root = None;
 
             match self {
+                BuilderType::Docker {
+                    image,
+                    run_cmd,
+                    exec_cmd,
+                } => {
+                    docker_image = Some(image);
+                    docker_run_cmd = Some(run_cmd);
+                    docker_exec_cmd = Some(exec_cmd);
+                }
                 BuilderType::Overlay {
                     build_dir,
                     bwrap_path,
@@ -3067,12 +3113,13 @@ pub mod server {
                     pot_cmd = Some(cmd);
                     pot_clone_args = Some(clone_args);
                 }
-                _ => {}
             }
 
             match env::var("SCCACHE_DIST_BUILDER_TYPE")
                 .ok()
                 .as_deref()
+                .filter(|&val| matches!(val, "docker" | "overlay" | "pot"))
+                .or(docker_image.as_ref().map(|_| "docker"))
                 .or(overlay_build_dir.as_ref().map(|_| "overlay"))
                 .or(pot_clone_from.as_ref().map(|_| "pot"))
             {
@@ -3091,22 +3138,35 @@ pub mod server {
                         .map(Into::into)
                         .or(pot_fs_root)
                         .unwrap_or_else(default_pot_fs_root),
-                    clone_from: env::var("SCCACHE_DIST_POT_CLONE_FROM")
-                        .ok()
+                    clone_from: string_from_env_var("SCCACHE_DIST_POT_CLONE_FROM")
                         .or(pot_clone_from)
                         .unwrap_or_else(default_pot_clone_from),
                     pot_cmd: env::var_os("SCCACHE_DIST_POT_CMD")
                         .map(Into::into)
                         .or(pot_cmd)
                         .unwrap_or_else(default_pot_cmd),
-                    pot_clone_args: env::var("SCCACHE_DIST_POT_CLONE_ARGS")
-                        .ok()
+                    pot_clone_args: string_from_env_var("SCCACHE_DIST_POT_CLONE_ARGS")
                         .as_deref()
                         .and_then(shlex::split)
                         .or(pot_clone_args)
                         .unwrap_or_else(default_pot_clone_args),
                 },
-                _ => BuilderType::Docker,
+                Some("docker") => BuilderType::Docker {
+                    image: string_from_env_var("SCCACHE_DIST_DOCKER_IMAGE")
+                        .or(docker_image)
+                        .unwrap_or_else(default_docker_image),
+                    run_cmd: string_from_env_var("SCCACHE_DIST_DOCKER_RUN_CMD")
+                        .as_deref()
+                        .and_then(shlex::split)
+                        .or(docker_run_cmd)
+                        .unwrap_or_else(default_docker_run_cmd),
+                    exec_cmd: string_from_env_var("SCCACHE_DIST_DOCKER_EXEC_CMD")
+                        .as_deref()
+                        .and_then(shlex::split)
+                        .or(docker_exec_cmd)
+                        .unwrap_or_else(default_docker_exec_cmd),
+                },
+                _ => BuilderType::default(),
             }
         }
     }
@@ -3142,7 +3202,7 @@ pub mod server {
     impl Default for FileConfig {
         fn default() -> Self {
             Self {
-                builder: BuilderType::Docker,
+                builder: BuilderType::default(),
                 cache_dir: Config::default_cache_dir(),
                 health_check_bind_addr: None,
                 heartbeat_interval_ms: Config::default_heartbeat_interval_ms(),
