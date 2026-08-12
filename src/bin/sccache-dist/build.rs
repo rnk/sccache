@@ -664,8 +664,6 @@ impl DockerBuilder {
             return Err(BuildError::Unknown(anyhow!("Output paths is empty")));
         }
 
-        // Do as much asyncio work as possible before acquiring a job slot
-
         // Should automatically get deleted when host_temp goes out of scope
         let host_temp = sccache::util::temp_dir().map_err(BuildError::Unknown)?;
         let host_root = host_temp.path();
@@ -808,11 +806,10 @@ impl DockerBuilder {
         }
 
         let output: ProcessOutput = {
-            // Guard compiling until we get a token from the job queue
-            let _job_slot = job_queue
-                .acquire()
-                .await
-                .map_err(|e| BuildError::Unknown(e.into()))?;
+            // Bail early if job_queue is closed while this job is running
+            if job_queue.is_closed() {
+                return Err(BuildError::Cancelled);
+            }
 
             tracing::trace!("[perform_build({job_id})]: creating compile command");
 
@@ -971,10 +968,12 @@ impl BuilderIncoming for DockerBuilder {
         command: CompileCommand,
         outputs: Vec<String>,
     ) -> BuildResult {
-        // Bail early if job_queue is closed while this job is running
-        if self.job_queue.is_closed() {
-            return Err(BuildError::Cancelled);
-        }
+        // Guard compiling until we get a token from the job queue
+        let _job_slot = self
+            .job_queue
+            .acquire()
+            .await
+            .map_err(|e| BuildError::Unknown(e.into()))?;
 
         tracing::debug!("[run_build({job_id})]: Performing build in container");
         let c_name = format!("sccache-builder-{job_id}");
