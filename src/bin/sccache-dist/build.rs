@@ -146,6 +146,7 @@ impl OverlayBuilder {
 
         let out = cmd
             .arg("--version")
+            .kill_on_drop(true)
             .check_stdout_trim()
             .await
             .context("Failed to execute bwrap for version check")?;
@@ -358,7 +359,7 @@ impl OverlayBuilder {
 
                 for (k, v) in env_vars {
                     if k.contains('=') {
-                        tracing::warn!(
+                        tracing::debug!(
                             "[perform_build({job_id})]: Skipping environment variable: {k:?}"
                         );
                         continue;
@@ -575,6 +576,9 @@ impl BuilderIncoming for OverlayBuilder {
         )
         .await;
 
+        // Clean up the build resources
+        self.finish_build(job_id).await;
+
         tracing::debug!("[run_build({job_id})]: Returning result");
 
         res
@@ -697,6 +701,7 @@ impl DockerBuilder {
             cmd.args(["run", "--init", "-d", "--name", c_name])
                 .arg(image)
                 .args(run_cmd)
+                .kill_on_drop(true)
                 .check_stdout_trim()
                 .await
                 .context("Failed to create docker container")
@@ -719,6 +724,7 @@ impl DockerBuilder {
                 // Always create the CWD even if it's not in the toolchain, inputs, or outputs
                 .arg(cwd)
                 .args(&container_absolute_output_dirs)
+                .kill_on_drop(true)
                 .check_run()
                 .await
                 .context("Failed to copy toolchain into container")
@@ -747,6 +753,7 @@ impl DockerBuilder {
                     "-C",
                     "/",
                 ])
+                .kill_on_drop(true)
                 .check_piped(|mut stdin| async move {
                     let inputs = async_compression::futures::bufread::ZlibDecoder::new(
                         futures::io::BufReader::new(futures::io::AllowStdIo::new(inputs.reader())),
@@ -781,6 +788,7 @@ impl DockerBuilder {
                     "-C",
                     "/",
                 ])
+                .kill_on_drop(true)
                 .check_piped(|mut stdin| async move {
                     tracing::trace!(
                         "[perform_build({job_id})]: opening compressed toolchain {toolchain_tgz:?}"
@@ -823,7 +831,7 @@ impl DockerBuilder {
                 // Define envvars
                 .args(env_vars.iter().flat_map(|(k, v)| {
                     if k.contains('=') {
-                        tracing::warn!(
+                        tracing::debug!(
                             "[perform_build({job_id})]: Skipping environment variable: {k:?}"
                         );
                         vec![]
@@ -837,7 +845,8 @@ impl DockerBuilder {
                 .args(exec_cmd)
                 // Finally, the executable and arguments
                 .arg(&executable)
-                .args(arguments);
+                .args(arguments)
+                .kill_on_drop(true);
 
             tracing::trace!("[perform_build({job_id})]: performing compile");
             tracing::trace!("[perform_build({job_id})]: {:?}", cmd.as_std());
@@ -902,6 +911,7 @@ impl DockerBuilder {
                         .arg("--follow-link")
                         .arg(format!("{c_name}:{}", container_path.display()))
                         .arg(host_path)
+                        .kill_on_drop(true)
                         .check_run()
                         .await
                         .context("Failed to copy output directory from container")
@@ -947,6 +957,7 @@ impl DockerBuilder {
     async fn finish_container(job_id: &str, c_name: &str) {
         if let Err(err) = tokio::process::Command::new("docker")
             .args(["rm", "-f", c_name])
+            .kill_on_drop(true)
             .check_run()
             .await
         {
@@ -996,6 +1007,9 @@ impl BuilderIncoming for DockerBuilder {
             self.job_queue.as_ref(),
         )
         .await;
+
+        // Clean up the build resources
+        self.finish_build(job_id).await;
 
         tracing::debug!("[run_build({job_id})]: Returning result");
 

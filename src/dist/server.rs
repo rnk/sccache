@@ -956,6 +956,8 @@ impl ServerService for Server {
     }
 
     async fn on_failure(&self, job_id: &str, reply_to: &str, job_err: RunJobError) -> Result<()> {
+        // Clean up the build resources
+        self.builder.finish_build(job_id).await;
         // Remove job and increment the job_finished counter
         if self.state.jobs.lock().unwrap().remove(job_id).is_some() {
             let server_id = self.state.id.clone();
@@ -979,10 +981,7 @@ impl ServerService for Server {
             tracing::warn!("[on_failure({job_id})]: {job_res:?}");
 
             // Store the job result and notify the interested scheduler
-            let res = self.job_finished(job_id, reply_to, &job_res).await;
-            // Clean up the build resources
-            self.builder.finish_build(job_id).await;
-            res
+            self.job_finished(job_id, reply_to, &job_res).await
         } else {
             Ok(())
         }
@@ -994,13 +993,12 @@ impl ServerService for Server {
         reply_to: &str,
         job_res: &RunJobResponse,
     ) -> Result<()> {
+        // Clean up the build resources
+        self.builder.finish_build(job_id).await;
         // Remove job and increment the job_finished counter
         if self.state.jobs.lock().unwrap().remove(job_id).is_some() {
             // Store the job result and notify the interested scheduler
-            let res = self.job_finished(job_id, reply_to, job_res).await;
-            // Clean up the build resources
-            self.builder.finish_build(job_id).await;
-            res
+            self.job_finished(job_id, reply_to, job_res).await
         } else {
             Ok(())
         }

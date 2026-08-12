@@ -97,6 +97,7 @@ fn list_files(root: &Path) -> Vec<PathBuf> {
 async fn pot_rm(cid: &str, pot_cmd: &Path) -> Result<()> {
     let mut cmd = tokio::process::Command::new(pot_cmd);
     cmd.args(["destroy", "-F", "-p", cid])
+        .kill_on_drop(true)
         .check_run()
         .await
         .context("Failed to force delete container")
@@ -144,6 +145,7 @@ impl PotBuilder {
         let mut cmd = tokio::process::Command::new(&self.pot_cmd);
         let mut to_remove = cmd
             .args(["ls", "-q"])
+            .kill_on_drop(true)
             .check_stdout_trim()
             .await
             .context("Failed to force delete container")?
@@ -208,18 +210,21 @@ impl PotBuilder {
     async fn clean_container(cid: &str) -> Result<()> {
         let mut cmd = tokio::process::Command::new("pot");
         cmd.args(["stop", "-p", cid])
+            .kill_on_drop(true)
             .check_run()
             .await
             .context("Failed to stop container")?;
 
         let mut cmd = tokio::process::Command::new("pot");
         cmd.args(["revert", "-p", cid])
+            .kill_on_drop(true)
             .check_run()
             .await
             .context("Failed to revert container")?;
 
         let mut cmd = tokio::process::Command::new("pot");
         cmd.args(["start", "-p", cid])
+            .kill_on_drop(true)
             .check_run()
             .await
             .context("Failed to (re)start container")?;
@@ -283,6 +288,7 @@ impl PotBuilder {
         clone_args.append(&mut pot_clone_args.iter().map(|s| s as &str).collect());
         let mut cmd = tokio::process::Command::new(pot_cmd);
         cmd.args(&clone_args)
+            .kill_on_drop(true)
             .check_run()
             .await
             .context("Failed to create pot container")?;
@@ -328,6 +334,7 @@ impl PotBuilder {
 
         let mut cmd = tokio::process::Command::new(pot_cmd);
         cmd.args(["snapshot", "-p", &imagename])
+            .kill_on_drop(true)
             .check_run()
             .await
             .context("Failed to snapshot container after build")?;
@@ -345,18 +352,21 @@ impl PotBuilder {
         clone_args.append(&mut pot_clone_args.iter().map(|s| s as &str).collect());
         let mut cmd = tokio::process::Command::new(pot_cmd);
         cmd.args(&clone_args)
+            .kill_on_drop(true)
             .check_run()
             .await
             .context("Failed to create pot container")?;
 
         let mut cmd = tokio::process::Command::new(pot_cmd);
         cmd.args(["snapshot", "-p", &cid])
+            .kill_on_drop(true)
             .check_run()
             .await
             .context("Failed to snapshotpot container")?;
 
         let mut cmd = tokio::process::Command::new(pot_cmd);
         cmd.args(["start", "-p", &cid])
+            .kill_on_drop(true)
             .check_run()
             .await
             .context("Failed to start container")?;
@@ -385,8 +395,6 @@ impl PotBuilder {
         if output_paths.is_empty() {
             return Err(BuildError::Unknown(anyhow!("Output paths is empty")));
         }
-
-        // Do as much asyncio work as possible before acquiring a job slot
 
         {
             // Bail early if job_queue is closed while this job is running
@@ -426,7 +434,7 @@ impl PotBuilder {
 
             let mut cmd = tokio::process::Command::new("jexec");
 
-            cmd.args([cid, "mkdir", "-p"]).arg(cwd);
+            cmd.args([cid, "mkdir", "-p"]).arg(cwd).kill_on_drop(true);
 
             for path in output_paths_absolute.iter() {
                 // If it doesn't have a parent, nothing needs creating
@@ -447,11 +455,10 @@ impl PotBuilder {
         }
 
         let output: ProcessOutput = {
-            // Guard compiling until we get a token from the job queue
-            let _job_slot = job_queue
-                .acquire()
-                .await
-                .map_err(|e| BuildError::Unknown(e.into()))?;
+            // Bail early if job_queue is closed while this job is running
+            if job_queue.is_closed() {
+                return Err(BuildError::Cancelled);
+            }
 
             tracing::trace!("[perform_build({job_id})]: creating compile command");
 
@@ -461,7 +468,7 @@ impl PotBuilder {
             cmd.arg("env");
             for (k, v) in env_vars {
                 if k.contains('=') {
-                    tracing::warn!(
+                    tracing::debug!(
                         "[perform_build({job_id})]: Skipping environment variable: {k:?}"
                     );
                     continue;
@@ -477,6 +484,7 @@ impl PotBuilder {
             cmd.arg(cwd);
             cmd.arg(&executable);
             cmd.args(&arguments);
+            cmd.kill_on_drop(true);
 
             tracing::trace!("[perform_build({job_id})]: performing compile");
             tracing::trace!("[perform_build({job_id})]: {:?}", cmd.as_std());
@@ -513,6 +521,7 @@ impl PotBuilder {
                     let output = tokio::process::Command::new("jexec")
                         .args([cid, "cat"])
                         .arg(&abs_path)
+                        .kill_on_drop(true)
                         .output()
                         .await;
 
@@ -558,10 +567,12 @@ impl BuilderIncoming for PotBuilder {
         command: CompileCommand,
         outputs: Vec<String>,
     ) -> BuildResult {
-        // Bail early if job_queue is closed while this job is running
-        if self.job_queue.is_closed() {
-            return Err(BuildError::Cancelled);
-        }
+        // Guard compiling until we get a token from the job queue
+        let _job_slot = self
+            .job_queue
+            .acquire()
+            .await
+            .map_err(|e| BuildError::Unknown(e.into()))?;
 
         tracing::debug!("[run_build({job_id})]: Finding container");
 
@@ -588,6 +599,9 @@ impl BuilderIncoming for PotBuilder {
             self.job_queue.as_ref(),
         )
         .await;
+
+        // Clean up the build resources
+        self.finish_build(job_id).await;
 
         tracing::debug!("[run_build({job_id})]: Returning result");
 
