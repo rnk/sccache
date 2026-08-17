@@ -316,10 +316,20 @@ async fn init_builder(
         BuilderType::Overlay {
             bwrap_path,
             build_dir,
+            exec_cmd,
+            lower_dirs,
+            overlay_env,
         } => Ok(Arc::new(
-            build::OverlayBuilder::new(bwrap_path, build_dir, job_queue.clone())
-                .await
-                .context("Overlay builder failed to start")?,
+            build::OverlayBuilder::new(
+                bwrap_path,
+                build_dir,
+                exec_cmd.unwrap_or_default(),
+                lower_dirs.unwrap_or_default(),
+                overlay_env.unwrap_or_default(),
+                job_queue.clone(),
+            )
+            .await
+            .context("Overlay builder failed to start")?,
         ) as Arc<dyn BuilderIncoming>),
         #[cfg(target_os = "freebsd")]
         BuilderType::Pot {

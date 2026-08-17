@@ -126,16 +126,24 @@ pub struct OverlayBuilder {
     bubblewrap: PathBuf,
     children: Arc<OverlayChildren>,
     dir: PathBuf,
+    exec_cmd: Arc<Vec<String>>,
     job_queue: Arc<tokio::sync::Semaphore>,
+    lower_dirs: Arc<Vec<PathBuf>>,
+    overlay_env: Arc<HashMap<String, String>>,
 }
 
 impl OverlayBuilder {
     pub async fn new(
         bubblewrap: PathBuf,
         build_dir: PathBuf,
+        exec_cmd: Vec<String>,
+        lower_dirs: Vec<PathBuf>,
+        overlay_env: HashMap<String, String>,
         job_queue: Arc<tokio::sync::Semaphore>,
     ) -> Result<Self> {
-        tracing::info!("Creating overlay builder with dir {build_dir:?}");
+        tracing::info!(
+            "Creating overlay builder with: bubblewrap={bubblewrap:?}, build_dir={build_dir:?}, exec_cmd={exec_cmd:?}, lower_dirs={lower_dirs:?}, overlay_env={overlay_env:?}"
+        );
 
         if !nix::unistd::getuid().is_root() && !nix::unistd::geteuid().is_root() {
             // Not root, or a setuid binary - haven't put enough thought into supporting this, bail
@@ -180,6 +188,9 @@ impl OverlayBuilder {
             children: Default::default(),
             dir,
             job_queue,
+            exec_cmd: Arc::new(exec_cmd),
+            lower_dirs: Arc::new(lower_dirs),
+            overlay_env: Arc::new(overlay_env),
         };
         ret.cleanup().await?;
         tokio::fs::create_dir_all(&ret.dir)
@@ -223,6 +234,9 @@ impl OverlayBuilder {
     async fn perform_build(
         job_id: &str,
         bubblewrap: PathBuf,
+        exec_cmd: Arc<Vec<String>>,
+        lower_dirs: Arc<Vec<PathBuf>>,
+        overlay_env: Arc<HashMap<String, String>>,
         CompileCommand {
             executable,
             arguments,
@@ -253,7 +267,44 @@ impl OverlayBuilder {
                 let job_id = job_id_1.clone();
                 let job_id_1 = job_id.clone();
                 let build_dir = overlay_1.build_dir;
+                let inputs_dir = build_dir.join("inputs");
                 let toolchain_dir = overlay_1.toolchain_dir;
+
+                tracing::trace!("[perform_build({job_id})]: copying in inputs");
+                // Note that we don't unpack directly into the upperdir since there overlayfs has some
+                // special marker files that we don't want to create by accident (or malicious intent)
+                tar::Archive::new(flate2::read::ZlibDecoder::new(inputs.reader()))
+                    .unpack(&inputs_dir)
+                    .context("Failed to unpack inputs to overlay")
+                    .map_err(BuildError::UnpackInputs)?;
+
+                let cwd = Path::new(&cwd);
+
+                tracing::trace!("[perform_build({job_id})]: creating output directories");
+
+                // Canonicalize output path as either absolute or relative to cwd
+                let output_paths_absolute = output_paths
+                    .iter()
+                    .map(|path| cwd.join(Path::new(path)))
+                    .collect::<Vec<_>>();
+
+                {
+                    let h_cwd = join_suffix(&inputs_dir, cwd);
+                    tracing::trace!("[perform_build({job_id})]: creating dir: {h_cwd:?}");
+                    fs::create_dir_all(&h_cwd).map_err(|e| BuildError::MakeOutputDir(h_cwd, e))?;
+                }
+
+                for path in output_paths_absolute.iter() {
+                    // If it doesn't have a parent, nothing needs creating
+                    if let Some(path) = path.parent() {
+                        let h_path = join_suffix(&inputs_dir, path);
+                        tracing::trace!("[perform_build({job_id})]: creating dir: {h_path:?}");
+                        fs::create_dir_all(&h_path)
+                            .map_err(|e| BuildError::MakeOutputDir(h_path, e))?;
+                    }
+                }
+
+                tracing::trace!("[perform_build({job_id})]: Creating overlayfs");
 
                 // Automatically unmount or destroy file system mounts when this thread dies
                 nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)
@@ -270,58 +321,30 @@ impl OverlayBuilder {
                 .map_err(BuildError::MountNsRoot)?;
 
                 let work_dir = build_dir.join("work");
-                let upper_dir = build_dir.join("upper");
+                let output_dir = build_dir.join("output");
                 let target_dir = build_dir.join("target");
                 fs::create_dir_all(&work_dir)
                     .map_err(|e| BuildError::MakeOverlayDir(work_dir.clone(), e))?;
-                fs::create_dir_all(&upper_dir)
-                    .map_err(|e| BuildError::MakeOverlayDir(upper_dir.clone(), e))?;
+                fs::create_dir_all(&output_dir)
+                    .map_err(|e| BuildError::MakeOverlayDir(output_dir.clone(), e))?;
                 fs::create_dir_all(&target_dir)
                     .map_err(|e| BuildError::MakeOverlayDir(target_dir.clone(), e))?;
 
                 let () = Overlay::writable(
-                    std::iter::once(toolchain_dir.as_path()),
-                    upper_dir,
-                    work_dir,
-                    &target_dir,
+                    // Inputs and toolchain first so they're the leftmost lower
+                    // dirs i.e. will take precedence over the other lower dirs
+                    [inputs_dir]
+                        .iter()
+                        .chain([&toolchain_dir])
+                        .chain(lower_dirs.iter())
+                        .map(|p| p.as_path()),
+                    &output_dir, // upper dir
+                    &work_dir,   // overlayfs scratch dir
+                    &target_dir, // dir for bubblewrap bind mount
                 )
                 .mount()
                 // This error is unfortunately not Send+Sync
                 .map_err(|e| BuildError::MountOverlayFS(anyhow!("{e}")))?;
-
-                tracing::trace!("[perform_build({job_id})]: copying in inputs");
-                // Note that we don't unpack directly into the upperdir since there overlayfs has some
-                // special marker files that we don't want to create by accident (or malicious intent)
-                tar::Archive::new(flate2::read::ZlibDecoder::new(inputs.reader()))
-                    .unpack(&target_dir)
-                    .context("Failed to unpack inputs to overlay")
-                    .map_err(BuildError::UnpackInputs)?;
-
-                let cwd = Path::new(&cwd);
-
-                tracing::trace!("[perform_build({job_id})]: creating output directories");
-
-                // Canonicalize output path as either absolute or relative to cwd
-                let output_paths_absolute = output_paths
-                    .iter()
-                    .map(|path| cwd.join(Path::new(path)))
-                    .collect::<Vec<_>>();
-
-                {
-                    let h_cwd = join_suffix(&target_dir, cwd);
-                    tracing::trace!("[perform_build({job_id})]: creating dir: {h_cwd:?}");
-                    fs::create_dir_all(&h_cwd).map_err(|e| BuildError::MakeOutputDir(h_cwd, e))?;
-                }
-
-                for path in output_paths_absolute.iter() {
-                    // If it doesn't have a parent, nothing needs creating
-                    if let Some(path) = path.parent() {
-                        let h_path = join_suffix(&target_dir, path);
-                        tracing::trace!("[perform_build({job_id})]: creating dir: {h_path:?}");
-                        fs::create_dir_all(&h_path)
-                            .map_err(|e| BuildError::MakeOutputDir(h_path, e))?;
-                    }
-                }
 
                 tracing::trace!("[perform_build({job_id})]: creating compile command");
 
@@ -348,6 +371,7 @@ impl OverlayBuilder {
                         "--unshare-pid",
                         "--unshare-net",
                         "--unshare-uts",
+                        "--new-session",
                     ])
                     .arg("--bind")
                     .arg(&target_dir)
@@ -366,7 +390,13 @@ impl OverlayBuilder {
                     }
                     cmd.arg("--setenv").arg(k).arg(v);
                 }
+
+                for (k, v) in overlay_env.as_ref() {
+                    cmd.arg("--setenv").arg(k).arg(v);
+                }
+
                 cmd.arg("--");
+                cmd.args(exec_cmd.as_ref());
                 cmd.arg(&executable);
                 cmd.args(arguments);
                 cmd.stdout(Stdio::piped());
@@ -456,7 +486,7 @@ impl OverlayBuilder {
                     tracing::trace!("[perform_build({job_id})]: retrieving {output_paths:?}");
 
                     for (path, abs_path) in output_paths.into_iter().zip(output_paths_absolute) {
-                        let host_path = join_suffix(&target_dir, &abs_path);
+                        let host_path = join_suffix(&output_dir, &abs_path);
                         match fs::File::open(&host_path) {
                             Ok(file) => match OutputData::try_from_reader(file) {
                                 Ok(data) => outputs.push((path, data)),
@@ -567,6 +597,9 @@ impl BuilderIncoming for OverlayBuilder {
         let res = Self::perform_build(
             job_id,
             self.bubblewrap.clone(),
+            self.exec_cmd.clone(),
+            self.lower_dirs.clone(),
+            self.overlay_env.clone(),
             command,
             inputs,
             outputs,

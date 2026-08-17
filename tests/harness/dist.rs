@@ -93,6 +93,9 @@ fn sccache_server_cfg(message_broker: &MessageBroker) -> ServerConfig {
         builder: BuilderType::Overlay {
             build_dir: CONTAINER_EXTERNAL_PATH.into(),
             bwrap_path: DIST_IMAGE_BWRAP_PATH.into(),
+            exec_cmd: None,
+            lower_dirs: None,
+            overlay_env: None,
         },
         // Unpack toolchains inside each container
         cache_dir: Path::new(CONTAINER_INTERNAL_PATH).into(),

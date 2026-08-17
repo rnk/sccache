@@ -2989,7 +2989,7 @@ pub mod server {
         default_disk_cache_dir, number_from_env_var, string_from_env_var, try_read_config_file,
     };
     use serde::{Deserialize, Serialize};
-    use std::{env, net::SocketAddr, path::PathBuf, str::FromStr};
+    use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, str::FromStr};
 
     use crate::errors::*;
 
@@ -3057,6 +3057,9 @@ pub mod server {
         Overlay {
             build_dir: PathBuf,
             bwrap_path: PathBuf,
+            exec_cmd: Option<Vec<String>>,
+            lower_dirs: Option<Vec<PathBuf>>,
+            overlay_env: Option<HashMap<String, String>>,
         },
         #[serde(rename = "pot")]
         Pot {
@@ -3086,8 +3089,11 @@ pub mod server {
             let mut docker_image = None;
             let mut docker_run_cmd = None;
             let mut docker_exec_cmd = None;
+            let mut overlay_exec_cmd = None;
             let mut overlay_build_dir = None;
             let mut overlay_bwrap_path = None;
+            let mut overlay_lower_dirs = None;
+            let mut overlay_env_vars = None;
             let mut pot_clone_from = None;
             let mut pot_clone_args = None;
             let mut pot_cmd = None;
@@ -3106,9 +3112,15 @@ pub mod server {
                 BuilderType::Overlay {
                     build_dir,
                     bwrap_path,
+                    exec_cmd,
+                    lower_dirs,
+                    overlay_env,
                 } => {
                     overlay_build_dir = Some(build_dir);
                     overlay_bwrap_path = Some(bwrap_path);
+                    overlay_exec_cmd = exec_cmd;
+                    overlay_lower_dirs = lower_dirs;
+                    overlay_env_vars = overlay_env;
                 }
                 BuilderType::Pot {
                     pot_fs_root: fs_root,
@@ -3140,6 +3152,21 @@ pub mod server {
                         .map(Into::into)
                         .or(overlay_bwrap_path)
                         .unwrap(),
+                    exec_cmd: string_from_env_var("SCCACHE_DIST_OVERLAY_EXEC_CMD")
+                        .as_deref()
+                        .and_then(shlex::split)
+                        .or(overlay_exec_cmd),
+                    lower_dirs: env::var_os("SCCACHE_DIST_OVERLAY_DIRS")
+                        .map(|s| std::env::split_paths(&s).collect::<Vec<_>>())
+                        .or(overlay_lower_dirs),
+                    overlay_env: string_from_env_var("SCCACHE_DIST_OVERLAY_ENV")
+                        .map(|s| {
+                            s.split(std::path::MAIN_SEPARATOR_STR)
+                                .filter_map(|s| s.split_once("="))
+                                .map(|(key, val)| (key.to_owned(), val.to_owned()))
+                                .collect::<HashMap<_, _>>()
+                        })
+                        .or(overlay_env_vars),
                 },
                 Some("pot") => BuilderType::Pot {
                     pot_fs_root: env::var_os("SCCACHE_DIST_BUILD_DIR")
@@ -4600,6 +4627,9 @@ key_prefix = "sccache-dist-toolchains"
             builder: BuilderType::Overlay {
                 build_dir: PathBuf::from("/tmp/build"),
                 bwrap_path: PathBuf::from("/usr/bin/bwrap"),
+                exec_cmd: None,
+                lower_dirs: None,
+                overlay_env: None,
             },
             cache_dir: PathBuf::from("/tmp/toolchains"),
             max_per_core_load: 1.25,
