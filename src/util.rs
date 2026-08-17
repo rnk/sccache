@@ -90,12 +90,14 @@ impl Digest {
     /// See [`TimeMacroFinder`] for more details.
     pub async fn from_file_with_time_macros<T>(
         path: T,
-        env_vars: &[(OsString, OsString)],
+        compile_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<(Self, TimeMacroFinder)>
     where
         T: AsRef<Path>,
     {
-        Self::new().with_file_and_time_macros(path, env_vars).await
+        Self::new()
+            .with_file_and_time_macros(path, compile_timestamp)
+            .await
     }
 
     /// Calculate the BLAKE3 digest of the contents read from `reader`, calling
@@ -154,7 +156,7 @@ impl Digest {
     pub async fn with_file_and_time_macros<T>(
         self,
         path: T,
-        env_vars: &[(OsString, OsString)],
+        compile_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<(Self, TimeMacroFinder)>
     where
         T: AsRef<Path>,
@@ -175,17 +177,7 @@ impl Digest {
         if finder.found_date() {
             debug!("found __DATE__ in {path:?}");
             digest.delimiter(b"date");
-            // If the compiler has support for it, the expansion of __DATE__ will change
-            // according to the value of SOURCE_DATE_EPOCH. If the compiler doesn't support
-            // it (i.e. MSVC), this envvar shouldn't be defined.
-            let date = env_vars
-                .iter()
-                .find(|(k, _)| k == "SOURCE_DATE_EPOCH")
-                .and_then(|(_, v)| v.as_os_str().to_str())
-                .and_then(|v| v.parse().ok())
-                .and_then(chrono::DateTime::from_timestamp_secs)
-                .unwrap_or_else(chrono::Utc::now)
-                .date_naive();
+            let date = compile_timestamp.date_naive();
             digest.update(&date.year().to_le_bytes());
             digest.update(&date.month().to_le_bytes());
             digest.update(&date.day().to_le_bytes());
@@ -195,7 +187,7 @@ impl Digest {
             debug!("found __TIMESTAMP__ in {path:?}");
             let mtime: chrono::DateTime<chrono::Local> = tokio::fs::symlink_metadata(path)
                 .await
-                .with_context(|| format!("Failed to read file mtime for hashing: {path:?}"))?
+                .with_context(|| format!("Failed to read file metadata for hashing: {path:?}"))?
                 .modified()
                 .with_context(|| format!("Failed to read file mtime for hashing: {path:?}"))?
                 .into();

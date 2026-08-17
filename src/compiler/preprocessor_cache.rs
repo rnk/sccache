@@ -250,6 +250,7 @@ impl PreprocessorCacheEntry {
         preprocessor_key: &str,
         result_key: &str,
         included_files: impl IntoIterator<Item = (String, PathBuf, std::fs::Metadata)>,
+        out_pretty: &str,
     ) -> &mut Self {
         let included_files = included_files
             .into_iter()
@@ -270,7 +271,7 @@ impl PreprocessorCacheEntry {
         let num_results = self.results.len();
 
         debug!(
-            "Added result to preprocessor cache entry (preprocessor_key={preprocessor_key:?}, result_key={result_key:?}, num_includes={num_includes}, num_results={num_results})"
+            "[{out_pretty}, {preprocessor_key}, {result_key}]: Added result to preprocessor cache entry: num_includes={num_includes}, num_results={num_results}"
         );
 
         self
@@ -280,39 +281,47 @@ impl PreprocessorCacheEntry {
     /// are already on disk and have not changed.
     pub async fn lookup_result_digest(
         &mut self,
-        preprocessor_dependencies_cache: &Mutex<LruCache<PathBuf, Arc<Result<CachedIncludeEntry>>>>,
-        env_vars: &[(OsString, OsString)],
+        preprocessor_dependencies_cache: &PreprocessorDependenciesCache,
+        compile_timestamp: chrono::DateTime<chrono::Utc>,
+        out_pretty: &str,
+        preprocessor_key: &str,
     ) -> (bool, Option<String>) {
         let mut maybe_result = None;
         let mut needs_update = false;
-        let compile_timestamp = env_vars
-            .iter()
-            .find(|(k, _)| k == "SOURCE_DATE_EPOCH")
-            .and_then(|(_, v)| v.as_os_str().to_str())
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
         // Find the first result key whose include files on disk match this
         // preprocessor cache entry. Check newest results first since they're
         // more likely to match.
         for (idx, (result_key, includes)) in self.iter_mut().rev().enumerate() {
-            if let Some(updated) = Self::result_matches(
+            let (failure, updated) = Self::result_matches(
                 preprocessor_dependencies_cache,
                 compile_timestamp,
                 includes,
-                env_vars,
+                out_pretty,
+                preprocessor_key,
             )
-            .await
-            {
-                needs_update = needs_update || updated;
-                // Need to write back to storage if the LRU order changes
-                needs_update = needs_update || idx != 0;
+            .await;
+
+            needs_update = needs_update || updated;
+
+            if let Some(reason) = failure {
+                trace!(
+                    "[{out_pretty}, {preprocessor_key}, {result_key}]: Preprocessor cache entry lookup failure: {reason}"
+                );
+            } else {
+                if idx != 0 {
+                    // Need to write back to storage if the LRU order changes
+                    needs_update = true;
+                    trace!(
+                        "[{out_pretty}, {preprocessor_key}, {result_key}]: Preprocessor cache entry results LRU order changed"
+                    );
+                }
                 maybe_result = Some(result_key.clone());
                 break;
             }
         }
 
-        if let Some(result_key) = maybe_result.as_ref() {
+        if let Some(ref result_key) = maybe_result {
             // Move the entry to the back of the LRU
             self.results.get(result_key);
         }
@@ -329,87 +338,27 @@ impl PreprocessorCacheEntry {
 
     /// A result matches if all of its include files exist on disk and have not changed.
     async fn result_matches(
-        preprocessor_dependencies_cache: &Mutex<LruCache<PathBuf, Arc<Result<CachedIncludeEntry>>>>,
-        compile_timestamp: i64,
+        preprocessor_dependencies_cache: &PreprocessorDependenciesCache,
+        compile_timestamp: chrono::DateTime<chrono::Utc>,
         includes: &mut [IncludeEntry],
-        env_vars: &[(OsString, OsString)],
-    ) -> Option<bool> {
-        use std::ops::Deref;
-
+        out_pretty: &str,
+        preprocessor_key: &str,
+    ) -> (Option<String>, bool) {
+        let mut failure = None;
         let mut updated = false;
 
         for prev in includes.iter_mut() {
             let path = Path::new(prev.path.as_os_str());
-            let meta = tokio::fs::symlink_metadata(path).await.ok()?;
-            let mtime = meta.modified().map(Into::into).ok();
-            let ctime = meta.ctime_or_creation().ok();
-            let file_size = meta.len();
 
-            let seen = match preprocessor_dependencies_cache.lock().await.get(path) {
-                Some(seen) => seen
-                    .deref()
-                    .as_ref()
-                    .ok()
-                    .filter(|cached| {
-                        // If the file hasn't changed, reuse the cached entry
-                        if cached.entry.file_size != file_size
-                            || cached.entry.ctime != ctime
-                            || cached.entry.mtime != mtime
-                        {
-                            false
-                        }
-                        // If __DATE__ or __TIMESTAMP__ were found, compare
-                        // compilation timestamp to now (or SOURCE_DATE_EPOCH)
-                        else if cached.found_date || cached.found_timestamp {
-                            cached.compiled_at == compile_timestamp
-                        } else {
-                            true
-                        }
-                    })
-                    .map(|_| seen.clone()),
-                _ => None,
-            };
-
-            let cached = if let Some(seen) = seen {
-                seen.clone()
-            } else {
-                let digest = Digest::from_file_with_time_macros(path, env_vars)
-                    .await
-                    .with_context(|| format!("while reading {}", path.display()))
-                    .inspect_err(|err| trace!("[result_matches]: {err:#}"))
-                    .map(|(digest, finder)| (digest.finish(), finder));
-
-                let (digest, finder) = match digest {
-                    Ok(res) => res,
-                    Err(err) => {
-                        preprocessor_dependencies_cache
-                            .lock()
-                            .await
-                            .insert(path.to_path_buf(), Arc::new(Err(err)));
-                        return None;
-                    }
-                };
-
-                let cached = Arc::new(Ok(CachedIncludeEntry {
-                    entry: IncludeEntry {
-                        ctime,
-                        digest,
-                        file_size,
-                        mtime,
-                        path: path.into(),
-                    },
-                    found_time: finder.found_time(),
-                    found_date: finder.found_date(),
-                    found_timestamp: finder.found_timestamp(),
-                    compiled_at: compile_timestamp,
-                }));
-
-                preprocessor_dependencies_cache
-                    .lock()
-                    .await
-                    .insert(path.to_path_buf(), cached.clone());
-
-                cached
+            let entry = match preprocessor_dependencies_cache
+                .get(path, compile_timestamp)
+                .await
+            {
+                Ok(entry) => entry,
+                Err(err) => {
+                    failure = Some(format!("{err:#}"));
+                    break;
+                }
             };
 
             let CachedIncludeEntry {
@@ -418,7 +367,7 @@ impl PreprocessorCacheEntry {
                 found_date,
                 found_timestamp,
                 ..
-            } = cached.deref().as_ref().unwrap();
+            } = entry.as_ref();
 
             if *found_time {
                 // We don't know for sure that the program actually uses the __TIME__ macro,
@@ -426,23 +375,33 @@ impl PreprocessorCacheEntry {
                 // not very useful since the chance that we get a cache hit later the same
                 // second should be quite slim... So, just signal back to the caller that
                 // __TIME__ has been found so that the preprocessor cache mode can be disabled.
-                debug!("Found __TIME__ in {path:?}");
-                return None;
+                failure = Some(format!("Found __TIME__ in {path:?}"));
+                break;
             }
 
             // If the digests are different, disable preprocessor cache mode
             if prev.digest != curr.digest {
-                return None;
+                failure = Some(format!("Digest mismatch for {path:?}"));
+                break;
             }
 
             // If __DATE__ or __TIMESTAMP__ found, update the includes for this result.
-            if *found_date || *found_timestamp {
+            if *found_date {
+                trace!(
+                    "[{out_pretty}, {preprocessor_key}]: updating entry, __DATE__ found in {path:?}"
+                );
+                *prev = curr.clone();
+                updated = true;
+            } else if *found_timestamp {
+                trace!(
+                    "[{out_pretty}, {preprocessor_key}]: updating entry, __TIMESTAMP__ found in {path:?}"
+                );
                 *prev = curr.clone();
                 updated = true;
             }
         }
 
-        Some(updated)
+        (failure, updated)
     }
 }
 
@@ -475,6 +434,7 @@ pub async fn preprocessor_cache_entry_hash_key(
     cwd: &Path,
     plusplus: bool,
     basedirs: &[Vec<u8>],
+    compile_timestamp: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<String>> {
     // If you change any of the inputs to the hash, you should change `FORMAT_VERSION`.
 
@@ -578,7 +538,7 @@ pub async fn preprocessor_cache_entry_hash_key(
 
     digest = {
         let (digest, finder) = digest
-            .with_file_and_time_macros(&input_path, env_vars)
+            .with_file_and_time_macros(&input_path, compile_timestamp)
             .await?;
         if finder.found_time() {
             // Disable preprocessor cache mode
@@ -1020,23 +980,24 @@ pub fn include_is_too_new(
 #[derive(Clone, Deserialize, Serialize, Debug, Default, PartialEq, Eq)]
 pub struct IncludeEntry {
     /// Its absolute path
-    path: OsString,
+    pub path: OsString,
     /// The hash of its contents
-    digest: String,
+    pub digest: String,
     /// Its file size, in bytes.
-    file_size: u64,
+    pub file_size: u64,
     /// Its modification time, `None` if not recorded.
-    mtime: Option<Timestamp>,
+    pub mtime: Option<Timestamp>,
     /// Its status change time, `None` if not recorded.
-    ctime: Option<Timestamp>,
+    pub ctime: Option<Timestamp>,
 }
 
+#[derive(Clone)]
 pub struct CachedIncludeEntry {
-    entry: IncludeEntry,
-    found_time: bool,
-    found_date: bool,
-    found_timestamp: bool,
-    compiled_at: i64,
+    pub compiled_at: chrono::DateTime<chrono::Utc>,
+    pub entry: IncludeEntry,
+    pub found_time: bool,
+    pub found_date: bool,
+    pub found_timestamp: bool,
 }
 
 #[derive(Debug)]
@@ -1072,6 +1033,111 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[derive(Clone, Debug)]
+pub struct PreprocessorDependenciesCache {
+    lru: Arc<Mutex<LruCache<PathBuf, Arc<CachedIncludeEntry>>>>,
+}
+
+impl PreprocessorDependenciesCache {
+    pub fn new(capacity: u64) -> Self {
+        PreprocessorDependenciesCache {
+            lru: Arc::new(Mutex::new(LruCache::new(capacity))),
+        }
+    }
+    pub async fn get<P: AsRef<Path>>(
+        &self,
+        path: P,
+        compiled_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Arc<CachedIncludeEntry>> {
+        use chrono::Datelike;
+
+        let path = path.as_ref();
+        let meta = match tokio::fs::symlink_metadata(path).await {
+            Ok(meta) => meta,
+            Err(err) => {
+                bail!("Error reading metadata for {path:?}: {err:#}");
+            }
+        };
+        let mtime = meta.modified().map(Into::into).ok();
+        let ctime = meta.ctime_or_creation().ok();
+        let file_size = meta.len();
+
+        let cached = self.lru.lock().await.get(path).and_then(|cached| {
+            // If the file hasn't changed, reuse the cached entry
+            let file_good = cached.entry.file_size == file_size
+                && cached.entry.ctime == ctime
+                && cached.entry.mtime == mtime;
+
+            // If __TIMESTAMP__ or __DATE__ were found, compare
+            // compilation timestamp to now (or SOURCE_DATE_EPOCH)
+
+            // If neither were found, use this cached include entry
+            let time_good = if cached.found_timestamp {
+                cached.compiled_at == compiled_at
+            }
+            // If __TIMESTAMP__ was found, compare timestamp seconds exactly
+            else if cached.found_date {
+                // If __DATE__ was found, only compare the parts of the
+                // timestamp the compiler embeds (day, month, and year)
+                let date_0 = cached.compiled_at.date_naive();
+                let date_1 = compiled_at.date_naive();
+                date_0.day() == date_1.day()
+                    && date_0.month() == date_1.month()
+                    && date_0.year() == date_1.year()
+            } else {
+                // If neither were found, use this cached include entry
+                true
+            };
+
+            if file_good && time_good {
+                Some(cached.clone())
+            } else {
+                None
+            }
+        });
+
+        let cached = if let Some(cached) = cached {
+            cached.clone()
+        } else {
+            let digest = Digest::from_file_with_time_macros(path, compiled_at)
+                .await
+                .with_context(|| format!("while reading {path:?}"))
+                .inspect_err(|err| trace!("[result_matches]: {err:#}"))
+                .map(|(digest, finder)| (digest.finish(), finder));
+
+            let (digest, finder) = match digest {
+                Ok(res) => res,
+                Err(err) => {
+                    bail!("Error computing digest: {err:#}");
+                }
+            };
+
+            let cached = Arc::new(CachedIncludeEntry {
+                compiled_at,
+                entry: IncludeEntry {
+                    ctime,
+                    digest,
+                    file_size,
+                    mtime,
+                    path: path.into(),
+                },
+                found_time: finder.found_time(),
+                found_date: finder.found_date(),
+                found_timestamp: finder.found_timestamp(),
+            });
+
+            self.lru
+                .lock()
+                .await
+                .insert(path.to_path_buf(), cached.clone());
+
+            cached
+        };
+
+        Ok(cached)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::{
@@ -1087,7 +1153,7 @@ mod test {
     #[test]
     fn test_serialize_deserialize() {
         let mut entry_a = PreprocessorCacheEntry::new();
-        entry_a.add_result("abc", "def", []);
+        entry_a.add_result("abc", "def", [], "src.c");
 
         assert_eq!(entry_a.iter().count(), 1);
 
@@ -1581,6 +1647,8 @@ mod test {
             ..Default::default()
         };
 
+        let compile_timestamp = chrono::Utc::now();
+
         // Test 1: With basedirs, hashes should be the same
         let hash1_with_basedirs = preprocessor_cache_entry_hash_key(
             "test_digest",
@@ -1590,6 +1658,7 @@ mod test {
             dir1.path(),
             false,
             &dirs,
+            compile_timestamp,
         )
         .wait()
         .unwrap()
@@ -1603,6 +1672,7 @@ mod test {
             dir2.path(),
             false,
             &dirs,
+            compile_timestamp,
         )
         .wait()
         .unwrap()
@@ -1622,6 +1692,7 @@ mod test {
             dir1.path(),
             false,
             &dirs[..1],
+            compile_timestamp,
         )
         .wait()
         .unwrap()
@@ -1635,6 +1706,7 @@ mod test {
             dir2.path(),
             false,
             &dirs[1..],
+            compile_timestamp,
         )
         .wait()
         .unwrap()
@@ -1654,6 +1726,7 @@ mod test {
             dir1.path(),
             false,
             &[],
+            compile_timestamp,
         )
         .wait()
         .unwrap()
@@ -1667,6 +1740,7 @@ mod test {
             dir2.path(),
             false,
             &[],
+            compile_timestamp,
         )
         .wait()
         .unwrap()

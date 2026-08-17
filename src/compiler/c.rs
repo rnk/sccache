@@ -15,23 +15,23 @@
 use crate::{
     cache::{Cache, FileObjectSource, Storage},
     compiler::{
-        Cacheable, ColorMode, Compilation, CompileCommand, CompileCommandImpl, Compiler,
-        CompilerArguments, CompilerHasher, CompilerKind, HashResult, Language,
+        CacheControl, Cacheable, ColorMode, Compilation, CompileCommand, CompileCommandImpl,
+        Compiler, CompilerArguments, CompilerHasher, CompilerKind, HashResult, Language,
         preprocessor_cache::{
-            CachedIncludeEntry, include_is_too_new, preprocessor_cache_entry_hash_key,
+            PreprocessorCacheEntry, PreprocessorDependenciesCache, include_is_too_new,
+            preprocessor_cache_entry_hash_key,
         },
     },
     config::PreprocessorCacheModeConfig,
     dist,
     errors::*,
-    lru_disk_cache::LruCache,
     mock_command::{CommandCreatorSync, ProcessOutput},
     server::SccacheService,
     util::{Digest, HASH_BUFFER_SIZE, HashToDigest, hash_all, read_line_batches, strip_basedirs},
 };
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures::{StreamExt, TryFutureExt, TryStreamExt, lock::Mutex};
+use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use std::{
     borrow::Cow,
@@ -52,8 +52,14 @@ use crate::{
     dist::pkg::{self, InputsWriter},
 };
 
-use super::CacheControl;
-use super::preprocessor_cache::PreprocessorCacheEntry;
+// cache for hashed preprocessor dependencies
+static PREPROCESSOR_DEPENDENCIES_CACHE: LazyLock<PreprocessorDependenciesCache> =
+    LazyLock::new(|| {
+        PreprocessorDependenciesCache::new(
+            // TODO: capacity chosen arbitrarily, should measure instead
+            10_000,
+        )
+    });
 
 /// A generic implementation of the `Compiler` trait for C/C++ compilers.
 #[derive(Clone)]
@@ -68,8 +74,6 @@ where
     executable_digest: String,
     extra_hashes: Vec<String>,
     compiler: I,
-    // cache for hashed preprocessor dependencies
-    preprocessor_dependencies_cache: Arc<Mutex<LruCache<PathBuf, Arc<Result<CachedIncludeEntry>>>>>,
 }
 
 /// A generic implementation of the `CompilerHasher` trait for C/C++ compilers.
@@ -83,8 +87,6 @@ where
     executable_digest: String,
     compiler: I,
     extra_hashes: Vec<String>,
-    // cache for hashed preprocessor dependencies
-    preprocessor_dependencies_cache: Arc<Mutex<LruCache<PathBuf, Arc<Result<CachedIncludeEntry>>>>>,
 }
 
 /// Artifact produced by a C/C++ compiler.
@@ -481,10 +483,6 @@ where
             executable,
             executable_digest,
             extra_hashes: vec![],
-            preprocessor_dependencies_cache: Arc::new(Mutex::new(LruCache::new(
-                // TODO: capacity chosen arbitrarily, should measure instead
-                10_000,
-            ))),
         })
     }
 
@@ -604,7 +602,6 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
                     executable_digest: self.executable_digest.clone(),
                     compiler: self.compiler.clone(),
                     extra_hashes: self.extra_hashes.clone(),
-                    preprocessor_dependencies_cache: self.preprocessor_dependencies_cache.clone(),
                 }))
             }
             CompilerArguments::CannotCache(why, extra_info) => {
@@ -626,7 +623,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
 enum PreprocessorCacheLookup {
     Disabled,
     Hit(String),
-    Miss(String),
+    Miss(String, bool),
 }
 
 impl<I> CCompilerHasher<I>
@@ -640,12 +637,12 @@ where
         extra_hashes: &[&str],
         cache_control: &CacheControl,
         storage: &dyn Storage,
+        compile_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<PreprocessorCacheLookup> {
         let CCompilerHasher {
             parsed_args,
             executable_digest,
             compiler,
-            preprocessor_dependencies_cache,
             ..
         } = self;
 
@@ -664,54 +661,76 @@ where
             cwd,
             compiler.plusplus(),
             storage.basedirs(),
+            compile_timestamp,
         )
         .await?
         .filter(|_| !matches!(cache_control, CacheControl::ForceNoCache));
 
-        if let Some(preprocessor_key) = preprocessor_key {
-            if matches!(cache_control, CacheControl::ForceRecache) {
-                debug!("[{out_pretty}]: Preprocessor forced re-cache: {preprocessor_key}");
-                return Ok(PreprocessorCacheLookup::Miss(preprocessor_key));
-            }
+        let preprocessor_key = match preprocessor_key {
+            Some(preprocessor_key) => preprocessor_key,
+            None => return Ok(PreprocessorCacheLookup::Disabled),
+        };
 
-            let preprocessor_cache_entry = PreprocessorCacheEntry::get(storage, &preprocessor_key)
-                .await
-                .inspect_err(|err| {
-                    debug!("[{out_pretty}]: Error loading preprocessor cache entry for {preprocessor_key:?}: {err:#}");
-                });
-
-            if let Ok(Cache::Hit(mut preprocessor_cache_entry)) = preprocessor_cache_entry {
-                let (updated, hit) = preprocessor_cache_entry
-                    .lookup_result_digest(preprocessor_dependencies_cache.as_ref(), env_vars)
-                    .await;
-
-                let mut update_failed = false;
-                if updated {
-                    // Time macros have been found, we need to update the preprocessor cache entry.
-                    // See [`PreprocessorCacheEntry::result_matches`].
-                    debug!(
-                        "[{out_pretty}]: Preprocessor cache updated because of time macros: {preprocessor_key}"
-                    );
-
-                    if let Err(e) = preprocessor_cache_entry
-                        .put(storage, &preprocessor_key)
-                        .await
-                    {
-                        debug!("[{out_pretty}]: Failed to update preprocessor cache: {e}");
-                        update_failed = true;
-                    }
-                }
-
-                if !update_failed && let Some(key) = hit {
-                    debug!("[{out_pretty}]: Preprocessor cache hit: {preprocessor_key} -> {key}");
-                    return Ok(PreprocessorCacheLookup::Hit(key));
-                }
-            }
-            debug!("[{out_pretty}]: Preprocessor cache miss: {preprocessor_key}");
-            return Ok(PreprocessorCacheLookup::Miss(preprocessor_key));
+        if matches!(cache_control, CacheControl::ForceRecache) {
+            debug!("[{out_pretty}, {preprocessor_key}]: Preprocessor forced re-cache");
+            return Ok(PreprocessorCacheLookup::Miss(preprocessor_key, true));
         }
 
-        Ok(PreprocessorCacheLookup::Disabled)
+        let preprocessor_cache_entry = PreprocessorCacheEntry::get(storage, &preprocessor_key)
+            .inspect_err(|err| {
+                debug!("[{out_pretty}, {preprocessor_key}]: Error loading preprocessor cache entry for: {err:#}");
+            })
+            .await;
+
+        let mut preprocessor_cache_entry = match preprocessor_cache_entry {
+            Ok(Cache::Hit(preprocessor_cache_entry)) => preprocessor_cache_entry,
+            Ok(Cache::Miss) => {
+                debug!("[{out_pretty}, {preprocessor_key}]: Preprocessor cache miss");
+                return Ok(PreprocessorCacheLookup::Miss(preprocessor_key, false));
+            }
+            Err(err) => {
+                debug!(
+                    "[{out_pretty}, {preprocessor_key}]: Error loading preprocessor cache entry: {err:#}"
+                );
+                return Ok(PreprocessorCacheLookup::Miss(preprocessor_key, false));
+            }
+        };
+
+        trace!("[{out_pretty}, {preprocessor_key}]: Searching preprocessor cache entry");
+
+        let (updated, maybe_result_key) = preprocessor_cache_entry
+            .lookup_result_digest(
+                &PREPROCESSOR_DEPENDENCIES_CACHE,
+                compile_timestamp,
+                out_pretty.as_ref(),
+                &preprocessor_key,
+            )
+            .await;
+
+        if updated {
+            // If the preprocessor cache entry was updated, write it back to storage.
+            // This happens if the LRU order changes, or if time macros were found and
+            // the entry's includes were updated to match the current ctimes/mtimes.
+            // See [`PreprocessorCacheEntry::result_matches`].
+
+            debug!("[{out_pretty}, {preprocessor_key}]: Updating preprocessor cache entry");
+
+            if let Err(err) = preprocessor_cache_entry
+                .put(storage, &preprocessor_key)
+                .await
+            {
+                debug!("[{out_pretty}]: Failed to write preprocessor cache entry: {err}");
+                return Ok(PreprocessorCacheLookup::Miss(preprocessor_key, true));
+            }
+        }
+
+        if let Some(result_key) = maybe_result_key {
+            debug!("[{out_pretty}, {preprocessor_key}, {result_key}]: Preprocessor cache hit");
+            Ok(PreprocessorCacheLookup::Hit(result_key))
+        } else {
+            debug!("[{out_pretty}, {preprocessor_key}]: Preprocessor cache miss");
+            Ok(PreprocessorCacheLookup::Miss(preprocessor_key, true))
+        }
     }
 }
 
@@ -736,8 +755,6 @@ where
         storage: Arc<dyn Storage>,
         cache_control: CacheControl,
     ) -> Result<HashResult<T>> {
-        let start_of_compilation = std::time::SystemTime::now();
-
         let CCompilerHasher {
             compiler,
             executable,
@@ -747,6 +764,7 @@ where
         } = self.as_ref();
 
         let basedirs = storage.basedirs();
+        let out_pretty = parsed_args.output_pretty();
 
         // A compiler binary may be a symlink to another and so has the same digest, but that means
         // the toolchain will not contain the correct path to invoke the compiler! Add the compiler
@@ -784,6 +802,19 @@ where
         let kind = compiler.kind().into();
         let lang = <CCompilerHasher<I> as CompilerHasher<T>>::language(&*self);
 
+        let start_of_compilation = std::time::SystemTime::now();
+
+        // If the compiler has support for it, the expansion of __DATE__ will change
+        // according to the value of SOURCE_DATE_EPOCH. If the compiler doesn't support
+        // it (i.e. MSVC), this envvar shouldn't be defined.
+        let compile_timestamp = env_vars
+            .iter()
+            .find(|(k, _)| k == "SOURCE_DATE_EPOCH")
+            .and_then(|(_, v)| v.as_os_str().to_str())
+            .and_then(|v| v.parse().ok())
+            .and_then(chrono::DateTime::from_timestamp_secs)
+            .unwrap_or_else(chrono::Utc::now);
+
         // Try to look for a cached preprocessing step for this compilation request.
         let (preprocessor_cache_lookup, preprocessor_cache_lookup_duration) = {
             let start = Instant::now();
@@ -795,6 +826,7 @@ where
                     &extra_hashes,
                     &cache_control,
                     storage.as_ref(),
+                    compile_timestamp,
                 )
                 .await?;
             (res, start.elapsed())
@@ -823,7 +855,7 @@ where
                     weak_toolchain_key,
                 });
             }
-            PreprocessorCacheLookup::Miss(_) => {
+            PreprocessorCacheLookup::Miss(_, _) => {
                 let mut stats = service.stats.lock().await;
                 stats.preprocessor_cache_misses.increment(&kind, &lang);
                 stats.preprocessor_cache_miss_duration += preprocessor_cache_lookup_duration;
@@ -860,14 +892,22 @@ where
             .await?;
 
         let preprocessor_key_and_dependencies = dependencies.and_then(|dependencies| {
-            if let PreprocessorCacheLookup::Miss(preprocessor_key) = preprocessor_cache_lookup {
-                Some((preprocessor_key, dependencies))
+            if let PreprocessorCacheLookup::Miss(preprocessor_key, reuse_preprocessor_cache_entry) =
+                preprocessor_cache_lookup
+            {
+                Some((
+                    preprocessor_key,
+                    reuse_preprocessor_cache_entry,
+                    dependencies,
+                ))
             } else {
                 None
             }
         });
 
-        if let Some((preprocessor_key, dependencies)) = preprocessor_key_and_dependencies {
+        if let Some((preprocessor_key, reuse_preprocessor_cache_entry, dependencies)) =
+            preprocessor_key_and_dependencies
+        {
             dependencies
                 .map_ok(|dependencies| {
                     // Dedupe dependencies up front to ensure we only hash each file once
@@ -882,19 +922,23 @@ where
                 .try_flatten_stream()
                 .map_ok(|path| {
                     futures::stream::once(Box::pin(async {
-                        let (digest, finder) =
-                            Digest::from_file_with_time_macros(&path, &env_vars).await?;
-                        if finder.found_time() {
-                            // Write an entry for this dependency, even though it has __TIME__ macros.
-                            // If it's still present next time, preprocessor cache mode will be disabled.
-                            // If it's not present next time, the new object key will be added to this cache entry.
-                            debug!("Found __TIME__ in {path:?}");
-                        }
                         let meta = tokio::fs::symlink_metadata(&path).await?;
                         if include_is_too_new(&path, &(&meta).into(), start_of_compilation) {
                             bail!("Dependency changed after preprocessor invoked: {path:?}");
                         }
-                        Ok((digest.finish(), path, meta))
+
+                        let dep = PREPROCESSOR_DEPENDENCIES_CACHE
+                            .get(&path, compile_timestamp)
+                            .await?;
+
+                        if dep.found_time {
+                            // Write an entry for this dependency, even though it has __TIME__ macros.
+                            // If it's still present next time, preprocessor cache mode will be disabled.
+                            // If it's not present next time, the new object key will be added to this cache entry.
+                            debug!("[{out_pretty}]: Found __TIME__ in {path:?}");
+                        }
+
+                        Ok((dep.entry.digest.clone(), path, meta))
                     }))
                 })
                 .try_flatten_unordered(None)
@@ -903,17 +947,22 @@ where
                     // Load the latest cache entry for this preprocessor key
                     // This helps minimize races if other clients write more
                     // entries while this client is preprocessing.
-                    let mut preprocessor_cache_entry =
-                        if let Ok(Cache::Hit(preprocessor_cache_entry)) =
+                    let mut preprocessor_cache_entry = if reuse_preprocessor_cache_entry
+                        && let Ok(Cache::Hit(preprocessor_cache_entry)) =
                             PreprocessorCacheEntry::get(storage.as_ref(), &preprocessor_key).await
-                        {
-                            preprocessor_cache_entry
-                        } else {
-                            Default::default()
-                        };
+                    {
+                        preprocessor_cache_entry
+                    } else {
+                        Default::default()
+                    };
 
                     // Add the object key to the preprocessor cache entry
-                    preprocessor_cache_entry.add_result(&preprocessor_key, &key, dependencies);
+                    preprocessor_cache_entry.add_result(
+                        &preprocessor_key,
+                        &key,
+                        dependencies,
+                        out_pretty.as_ref(),
+                    );
 
                     // Write the cache entry back to the preprocessor cache
                     preprocessor_cache_entry
@@ -923,10 +972,7 @@ where
                 .await
                 // Don't fail if updating the preprocessor cache entry fails, just log it
                 .inspect_err(|err| {
-                    debug!(
-                        "[{}]: Failed to update preprocessor cache entry: {err}",
-                        parsed_args.output_pretty()
-                    );
+                    debug!("[{out_pretty}]: Failed to update preprocessor cache entry: {err}");
                 })
                 .ok();
         }
