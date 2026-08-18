@@ -483,6 +483,8 @@ pub fn start_server(config: Config, addr: &crate::net::SocketAddr) -> Result<()>
                     dist_client,
                     storage,
                     preprocessor_storage,
+                    config.cache_read_timeout,
+                    config.cache_write_timeout,
                 );
                 Ok((
                     srv.local_addr().unwrap(),
@@ -505,6 +507,8 @@ pub fn start_server(config: Config, addr: &crate::net::SocketAddr) -> Result<()>
                     dist_client,
                     storage,
                     preprocessor_storage,
+                    config.cache_read_timeout,
+                    config.cache_write_timeout,
                 );
                 Ok((
                     srv.local_addr().unwrap(),
@@ -528,6 +532,8 @@ pub fn start_server(config: Config, addr: &crate::net::SocketAddr) -> Result<()>
                     dist_client,
                     storage,
                     preprocessor_storage,
+                    config.cache_read_timeout,
+                    config.cache_write_timeout,
                 );
                 Ok((
                     srv.local_addr()
@@ -578,6 +584,7 @@ pub struct SccacheServer<A: crate::net::Acceptor, C: CommandCreatorSync = Proces
 }
 
 impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         port: u16,
         runtime: Runtime,
@@ -585,6 +592,8 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
         preprocessor_storage: Arc<dyn Storage>,
+        cache_read_timeout: Option<Duration>,
+        cache_write_timeout: Option<Duration>,
     ) -> Result<Self> {
         let addr = crate::net::SocketAddr::with_port(port);
         let listener = runtime.block_on(tokio::net::TcpListener::bind(addr.as_net().unwrap()))?;
@@ -596,11 +605,14 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
             dist_client,
             storage,
             preprocessor_storage,
+            cache_read_timeout,
+            cache_write_timeout,
         ))
     }
 }
 
 impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
+    #[allow(clippy::too_many_arguments)]
     pub fn with_listener(
         listener: A,
         runtime: Runtime,
@@ -608,6 +620,8 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
         preprocessor_storage: Arc<dyn Storage>,
+        cache_read_timeout: Option<Duration>,
+        cache_write_timeout: Option<Duration>,
     ) -> Self {
         // Prepare the service which we'll use to service all incoming TCP
         // connections.
@@ -618,6 +632,8 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             dist_client,
             storage,
             preprocessor_storage,
+            cache_read_timeout,
+            cache_write_timeout,
             &client,
             pool,
             tx,
@@ -937,6 +953,12 @@ where
     /// Server statistics.
     pub stats: Arc<Mutex<ServerStats>>,
 
+    /// Timeout for cache reads (default: 60s)
+    pub cache_read_timeout: Option<Duration>,
+
+    /// Timeout for cache writes (default: None)
+    pub cache_write_timeout: Option<Duration>,
+
     /// Distributed sccache client
     dist_client: Arc<DistClientContainer>,
 
@@ -1198,10 +1220,13 @@ impl<C> SccacheService<C>
 where
     C: CommandCreatorSync + Clone + Send + Sync + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
         preprocessor_storage: Arc<dyn Storage>,
+        cache_read_timeout: Option<Duration>,
+        cache_write_timeout: Option<Duration>,
         client: &Client,
         rt: tokio::runtime::Handle,
         tx: mpsc::Sender<ServerMessage>,
@@ -1227,6 +1252,8 @@ where
             preprocessor_storage,
             pending_compilations_limit: util::num_cpus() as u64,
             compiler_info_queue,
+            cache_read_timeout,
+            cache_write_timeout,
             rt,
             creator,
             tx,
@@ -1263,6 +1290,8 @@ where
             preprocessor_storage,
             pending_compilations_limit: util::num_cpus() as u64,
             compiler_info_queue,
+            cache_read_timeout: None,
+            cache_write_timeout: None,
             rt,
             creator,
             tx,
@@ -1316,6 +1345,8 @@ where
             preprocessor_storage,
             pending_compilations_limit: util::num_cpus() as u64,
             compiler_info_queue,
+            cache_read_timeout: None,
+            cache_write_timeout: None,
             rt: rt.clone(),
             creator,
             tx,

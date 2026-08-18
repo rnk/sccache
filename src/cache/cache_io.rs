@@ -12,11 +12,13 @@
 
 use super::utils::{get_file_mode, set_file_mode};
 use crate::errors::*;
+use crate::mock_command::ProcessOutput;
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{self, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -277,10 +279,16 @@ impl CacheWrite {
     }
 
     /// Create a new cache entry populated with the contents of `objects`.
-    pub async fn from_objects<T>(objects: T, pool: &tokio::runtime::Handle) -> Result<CacheWrite>
+    pub async fn from_objects<T>(
+        objects: T,
+        output: ProcessOutput,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<(Vec<u8>, ProcessOutput, Duration)>
     where
         T: IntoIterator<Item = FileObjectSource> + Send + Sync + 'static,
     {
+        let start_create_artifact = Instant::now();
+
         pool.spawn_blocking(move || {
             let mut entry = CacheWrite::new();
             for FileObjectSource {
@@ -303,7 +311,11 @@ impl CacheWrite {
                     (Err(_), true) => continue,
                 }
             }
-            Ok(entry)
+
+            entry.put_stdout(&output.stdout)?;
+            entry.put_stderr(&output.stderr)?;
+
+            Ok((entry.finish()?, output, start_create_artifact.elapsed()))
         })
         .await?
     }

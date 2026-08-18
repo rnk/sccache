@@ -78,6 +78,7 @@ impl SccacheTest<'_> {
             // the time of writing.
             ("CARGO_INCREMENTAL", OsString::from("0")),
             ("TEST_ENV_VAR", OsString::from("1")),
+            ("SCCACHE_WAIT_FOR_PREPROCESSOR_CACHE_WRITE", "1".into()),
         ];
 
         if let Some(vec) = additional_envs {

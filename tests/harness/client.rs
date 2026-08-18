@@ -91,9 +91,7 @@ pub fn sccache_client_cfg(data_dir: &Path, preprocessor_cache_mode: bool) -> Fil
             },
             ..Default::default()
         },
-        server_startup_timeout_ms: None,
-        basedirs: vec![],
-        client_side_mode: false,
+        ..Default::default()
     }
 }
 
@@ -112,6 +110,10 @@ impl SccacheClient {
         let mut envvars = vec![
             ("SCCACHE_SERVER_PORT".into(), port.to_string().into()),
             ("SCCACHE_THREADS".into(), "2".into()),
+            (
+                "SCCACHE_WAIT_FOR_PREPROCESSOR_CACHE_WRITE".into(),
+                "1".into(),
+            ),
         ];
 
         // Send daemon logs to a file if SCCACHE_DEBUG is defined

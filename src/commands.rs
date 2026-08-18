@@ -720,6 +720,8 @@ where
         server::DistClientContainer::new_disabled(),
         Arc::new(compilations_storage),
         Arc::new(preprocessor_storage),
+        None,
+        None,
         jobserver,
         runtime.handle().clone(),
         tx,

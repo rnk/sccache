@@ -4,6 +4,7 @@ x-common-env: &common-env
   RUST_LOG: sccache=trace
   SCCACHE_SERVER_LOG: sccache=trace
   SCCACHE_PATH: ${SCCACHE_PATH:-/sccache/target/debug/sccache}
+  SCCACHE_WAIT_FOR_PREPROCESSOR_CACHE_WRITE: "1"
   LLVM_PROFILE_FILE: ${LLVM_PROFILE_FILE:-}
 
 x-test-runner: &test-runner

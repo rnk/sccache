@@ -737,8 +737,9 @@ where
                 compilations_storage.as_ref(),
                 // Set a maximum time limit for the cache to respond before we
                 // forge ahead ourselves with a compilation.
-                // TODO: this should be configurable
-                Duration::new(60, 0),
+                service
+                    .cache_read_timeout
+                    .unwrap_or(Duration::from_secs(60)),
             )
             .await;
 
@@ -787,42 +788,58 @@ where
                     );
                     return Ok((CompileResult::NotCacheable(dist_type, duration), output));
                 }
+
                 trace!(
                     "[{out_pretty}]: Compiled in {}, storing in cache",
                     fmt_duration_as_secs(&duration)
                 );
-                let start_create_artifact = Instant::now();
-                let mut entry = CacheWrite::from_objects(outputs, &runtime)
+
+                let (entry, output, duration) = CacheWrite::from_objects(outputs, output, &runtime)
                     .await
                     .context("failed to zip up compiler outputs")?;
 
-                entry.put_stdout(&output.stdout)?;
-                entry.put_stderr(&output.stderr)?;
                 trace!(
                     "[{out_pretty}]: Created cache artifact in {}",
-                    fmt_duration_as_secs(&start_create_artifact.elapsed())
+                    fmt_duration_as_secs(&duration)
                 );
 
                 let out_pretty2 = out_pretty.clone();
                 // Try to finish storing the newly-written cache
                 // entry. We'll get the result back elsewhere.
-                let future = async move {
-                    let start = Instant::now();
-                    match compilations_storage
-                        .put(&hash_key, entry.finish()?.into())
-                        .await
-                    {
-                        Ok(_) => {
-                            trace!("[{out_pretty2}]: Stored in cache successfully!");
-                            Ok(CacheWriteInfo {
-                                object_file_pretty: out_pretty2,
-                                duration: start.elapsed(),
-                            })
+                let future: Pin<Box<dyn Future<Output = Result<CacheWriteInfo>> + Send>> =
+                    Box::pin(async move {
+                        let start = Instant::now();
+                        match compilations_storage.put(&hash_key, entry.into()).await {
+                            Ok(_) => {
+                                trace!("[{out_pretty2}]: Stored in cache successfully!");
+                                Ok(CacheWriteInfo {
+                                    object_file_pretty: out_pretty2,
+                                    duration: start.elapsed(),
+                                })
+                            }
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
-                    }
+                    });
+
+                let future = if let Some(timeout) = service.cache_write_timeout {
+                    let out_pretty2 = out_pretty.clone();
+                    Box::pin(async move {
+                        let start = Instant::now();
+                        match tokio::time::timeout(timeout, future).await {
+                            Ok(res) => res,
+                            Err(err) => {
+                                trace!(
+                                    "[{out_pretty2}]: Cache write timed out {}",
+                                    fmt_duration_as_secs(&start.elapsed())
+                                );
+                                Err(anyhow::Error::new(err))
+                            }
+                        }
+                    })
+                } else {
+                    future
                 };
-                let future = Box::pin(future);
+
                 Ok((
                     CompileResult::CacheMiss(miss_type, dist_type, duration, future),
                     output,
@@ -4188,7 +4205,11 @@ LLVM version: 6.0",
         let creator = new_creator();
         let f = TestFixture::new();
         let gcc = f.mk_bin("gcc").unwrap();
-        let runtime = single_threaded_runtime();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
         let pool = runtime.handle().clone();
         let storage = PreprocessorCache(
             Arc::new(DiskCache::new(
