@@ -3021,7 +3021,7 @@ pub mod server {
     use serde::{Deserialize, Serialize};
     use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, str::FromStr};
 
-    use crate::errors::*;
+    use crate::{errors::*, util::split_quoted_shell_str};
 
     const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
     fn default_toolchain_cache_size() -> u64 {
@@ -3184,16 +3184,27 @@ pub mod server {
                         .unwrap(),
                     exec_cmd: string_from_env_var("SCCACHE_DIST_OVERLAY_EXEC_CMD")
                         .as_deref()
-                        .and_then(shlex::split)
+                        .and_then(split_quoted_shell_str)
                         .or(overlay_exec_cmd),
                     lower_dirs: env::var_os("SCCACHE_DIST_OVERLAY_DIRS")
                         .map(|s| std::env::split_paths(&s).collect::<Vec<_>>())
                         .or(overlay_lower_dirs),
                     overlay_env: string_from_env_var("SCCACHE_DIST_OVERLAY_ENV")
-                        .map(|s| {
-                            s.split(std::path::MAIN_SEPARATOR_STR)
-                                .filter_map(|s| s.split_once("="))
-                                .map(|(key, val)| (key.to_owned(), val.to_owned()))
+                        .as_deref()
+                        .and_then(split_quoted_shell_str)
+                        .map(|env_vars| {
+                            env_vars
+                                .iter()
+                                .filter_map(|s| s.trim().split_once("="))
+                                .map(|(key, val)| {
+                                    (
+                                        key.trim().to_owned(),
+                                        val.trim()
+                                            .trim_start_matches('"')
+                                            .trim_end_matches('"')
+                                            .to_owned(),
+                                    )
+                                })
                                 .collect::<HashMap<_, _>>()
                         })
                         .or(overlay_env_vars),
@@ -3212,7 +3223,7 @@ pub mod server {
                         .unwrap_or_else(default_pot_cmd),
                     pot_clone_args: string_from_env_var("SCCACHE_DIST_POT_CLONE_ARGS")
                         .as_deref()
-                        .and_then(shlex::split)
+                        .and_then(split_quoted_shell_str)
                         .or(pot_clone_args)
                         .unwrap_or_else(default_pot_clone_args),
                 },
@@ -3222,12 +3233,12 @@ pub mod server {
                         .unwrap_or_else(default_docker_image),
                     run_cmd: string_from_env_var("SCCACHE_DIST_DOCKER_RUN_CMD")
                         .as_deref()
-                        .and_then(shlex::split)
+                        .and_then(split_quoted_shell_str)
                         .or(docker_run_cmd)
                         .unwrap_or_else(default_docker_run_cmd),
                     exec_cmd: string_from_env_var("SCCACHE_DIST_DOCKER_EXEC_CMD")
                         .as_deref()
-                        .and_then(shlex::split)
+                        .and_then(split_quoted_shell_str)
                         .or(docker_exec_cmd)
                         .unwrap_or_else(default_docker_exec_cmd),
                 },
