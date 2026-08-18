@@ -638,7 +638,10 @@ where
         rewrite_includes_only: bool,
         storage: Arc<dyn Storage>,
         cache_control: CacheControl,
-    ) -> Result<HashResult<T>>;
+    ) -> Result<(
+        HashResult<T>,
+        Option<Pin<Box<dyn Future<Output = Result<()>> + Send>>>,
+    )>;
 
     /// Return the state of any `--color` option passed to the compiler.
     fn color_mode(&self) -> ColorMode;
@@ -709,21 +712,34 @@ where
         // Decrement pending_compilations as soon as we're done preprocessing
         drop(pending);
 
-        if let Err(e) = hash_result {
-            return match e.downcast::<ProcessError>() {
-                Ok(ProcessError(output)) => {
-                    debug!("[{out_pretty}]: process error: {output:?}");
-                    Ok((CompileResult::Error(start.elapsed()), output))
-                }
-                Err(e) => Err(e),
-            };
-        }
+        let (hash_result, preprocessor_cache_write) = match hash_result {
+            Ok((hash_result, preprocessor_cache_write)) => (
+                hash_result,
+                preprocessor_cache_write.map(|fut| {
+                    // Immediately drive the preprocessor cache write so it
+                    // runs concurrently to cache lookups and compilations
+                    runtime.spawn(async move {
+                        // We don't care about the result here
+                        let _ = fut.await;
+                    })
+                }),
+            ),
+            Err(err) => {
+                return match err.downcast::<ProcessError>() {
+                    Ok(ProcessError(output)) => {
+                        debug!("[{out_pretty}]: process error: {output:?}");
+                        Ok((CompileResult::Error(start.elapsed()), output))
+                    }
+                    Err(e) => Err(e),
+                };
+            }
+        };
 
         // Instance to perform the cache lookup and prepare to compile
         let lookup_or_compile = CacheLookupOrCompile::new(
             cache_control,
             &creator,
-            hash_result.unwrap(),
+            hash_result,
             &cwd,
             dist_client,
             out_pretty.clone(),
@@ -806,7 +822,7 @@ where
                 let out_pretty2 = out_pretty.clone();
                 // Try to finish storing the newly-written cache
                 // entry. We'll get the result back elsewhere.
-                let future: Pin<Box<dyn Future<Output = Result<CacheWriteInfo>> + Send>> =
+                let cache_write: Pin<Box<dyn Future<Output = Result<CacheWriteInfo>> + Send>> =
                     Box::pin(async move {
                         let start = Instant::now();
                         match compilations_storage.put(&hash_key, entry.into()).await {
@@ -821,11 +837,11 @@ where
                         }
                     });
 
-                let future = if let Some(timeout) = service.cache_write_timeout {
+                let cache_write = if let Some(timeout) = service.cache_write_timeout {
                     let out_pretty2 = out_pretty.clone();
                     Box::pin(async move {
                         let start = Instant::now();
-                        match tokio::time::timeout(timeout, future).await {
+                        match tokio::time::timeout(timeout, cache_write).await {
                             Ok(res) => res,
                             Err(err) => {
                                 trace!(
@@ -837,11 +853,23 @@ where
                         }
                     })
                 } else {
-                    future
+                    cache_write
+                };
+
+                let cache_write = if let Some(preprocessor_cache_write) = preprocessor_cache_write {
+                    Box::pin(async move {
+                        // the preprocessor cache write is allowed to error,
+                        // we only care about the object cache write
+                        futures::future::join(preprocessor_cache_write, cache_write)
+                            .await
+                            .1
+                    })
+                } else {
+                    cache_write
                 };
 
                 Ok((
-                    CompileResult::CacheMiss(miss_type, dist_type, duration, future),
+                    CompileResult::CacheMiss(miss_type, dist_type, duration, cache_write),
                     output,
                 ))
             }
@@ -3408,7 +3436,7 @@ LLVM version: 6.0",
                     CompilerArguments::Ok(h) => h,
                     o => panic!("Bad result from parse_arguments: {o:?}"),
                 };
-                hasher
+                let (res, fut) = hasher
                     .generate_hash_key(
                         &service,
                         &creator,
@@ -3420,7 +3448,11 @@ LLVM version: 6.0",
                         CacheControl::Default,
                     )
                     .wait()
-                    .unwrap()
+                    .unwrap();
+                if let Some(fut) = fut {
+                    fut.wait().unwrap();
+                }
+                res
             })
             .collect();
         assert_eq!(results.len(), 2);
@@ -3485,7 +3517,7 @@ LLVM version: 6.0",
                     CompilerArguments::Ok(h) => h,
                     o => panic!("Bad result from parse_arguments: {o:?}"),
                 };
-                hasher
+                let (res, fut) = hasher
                     .generate_hash_key(
                         &service,
                         &creator,
@@ -3497,7 +3529,11 @@ LLVM version: 6.0",
                         CacheControl::Default,
                     )
                     .wait()
-                    .unwrap()
+                    .unwrap();
+                if let Some(fut) = fut {
+                    fut.wait().unwrap();
+                }
+                res
             })
             .collect();
 
@@ -3558,7 +3594,7 @@ LLVM version: 6.0",
                     CompilerArguments::Ok(h) => h,
                     o => panic!("Bad result from parse_arguments: {o:?}"),
                 };
-                hasher
+                let (res, fut) = hasher
                     .generate_hash_key(
                         &service,
                         &creator,
@@ -3570,7 +3606,11 @@ LLVM version: 6.0",
                         CacheControl::Default,
                     )
                     .wait()
-                    .unwrap()
+                    .unwrap();
+                if let Some(fut) = fut {
+                    fut.wait().unwrap();
+                }
+                res
             })
             .collect();
         assert_eq!(results.len(), 2);

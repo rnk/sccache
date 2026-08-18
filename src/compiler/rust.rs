@@ -1398,7 +1398,10 @@ where
         _rewrite_includes_only: bool,
         _storage: Arc<dyn Storage>,
         cache_control: CacheControl,
-    ) -> Result<HashResult<T>> {
+    ) -> Result<(
+        HashResult<T>,
+        Option<Pin<Box<dyn Future<Output = Result<()>> + Send>>>,
+    )> {
         trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
 
         // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
@@ -1734,26 +1737,29 @@ where
             .chain(abs_staticlibs)
             .collect();
 
-        Ok(HashResult {
-            key,
-            compilation: Box::new(RustCompilation {
-                executable: self.executable.clone(),
-                host: self.host.clone(),
-                sysroot: self.sysroot.clone(),
-                arguments,
-                inputs,
-                outputs,
-                crate_link_paths: self.parsed_args.crate_link_paths.clone(),
-                crate_name: self.parsed_args.crate_name.clone(),
-                crate_types: self.parsed_args.crate_types.clone(),
-                dep_info,
-                cwd,
-                env_vars,
-                #[cfg(feature = "dist-client")]
-                rlib_dep_reader: self.rlib_dep_reader.clone(),
-            }),
-            weak_toolchain_key,
-        })
+        Ok((
+            HashResult {
+                key,
+                compilation: Box::new(RustCompilation {
+                    executable: self.executable.clone(),
+                    host: self.host.clone(),
+                    sysroot: self.sysroot.clone(),
+                    arguments,
+                    inputs,
+                    outputs,
+                    crate_link_paths: self.parsed_args.crate_link_paths.clone(),
+                    crate_name: self.parsed_args.crate_name.clone(),
+                    crate_types: self.parsed_args.crate_types.clone(),
+                    dep_info,
+                    cwd,
+                    env_vars,
+                    #[cfg(feature = "dist-client")]
+                    rlib_dep_reader: self.rlib_dep_reader.clone(),
+                }),
+                weak_toolchain_key,
+            },
+            None,
+        ))
     }
 
     fn color_mode(&self) -> ColorMode {
@@ -3571,7 +3577,7 @@ proc_macro false
             storage.clone(),
             pool.clone(),
         );
-        let res = hasher
+        let (res, fut) = hasher
             .generate_hash_key(
                 &service,
                 &creator,
@@ -3597,6 +3603,9 @@ proc_macro false
             )
             .wait()
             .unwrap();
+        if let Some(fut) = fut {
+            fut.wait().unwrap();
+        }
         let m = Digest::new();
         let empty_digest = m.finish();
 
@@ -3682,7 +3691,7 @@ proc_macro false
 
         mock_dep_info(&creator, &["foo.rs"]);
         mock_file_names(&creator, &["foo.rlib"]);
-        hasher
+        let (res, fut) = hasher
             .generate_hash_key(
                 &service,
                 &creator,
@@ -3694,8 +3703,11 @@ proc_macro false
                 CacheControl::Default,
             )
             .wait()
-            .unwrap()
-            .key
+            .unwrap();
+        if let Some(fut) = fut {
+            fut.wait().unwrap();
+        }
+        res.key
     }
 
     #[allow(clippy::unnecessary_unwrap)]

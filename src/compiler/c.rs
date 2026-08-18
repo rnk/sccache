@@ -31,6 +31,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use std::{
@@ -42,7 +43,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tempfile::TempPath;
 
@@ -638,7 +639,7 @@ where
         extra_hashes: &[&str],
         cache_control: &CacheControl,
         storage: &dyn Storage,
-        compile_timestamp: chrono::DateTime<chrono::Utc>,
+        compile_timestamp: DateTime<Utc>,
         cache_read_timeout: Duration,
     ) -> Result<PreprocessorCacheLookup> {
         let CCompilerHasher {
@@ -744,6 +745,99 @@ where
             Ok(PreprocessorCacheLookup::Miss(preprocessor_key, true))
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_preprocessor_cache_entry(
+        dependencies: Pin<Box<dyn Future<Output = Result<Vec<PathBuf>>> + Send>>,
+        preprocessor_key: String,
+        reuse_cache_entry: bool,
+        result_key: String,
+        storage: Arc<dyn Storage + 'static>,
+        cache_read_timeout: Duration,
+        cache_write_timeout: Option<Duration>,
+        compile_timestamp: DateTime<Utc>,
+        start_of_compilation: SystemTime,
+        out_pretty: String,
+    ) -> Result<()> {
+        dependencies
+            .map_ok(|dependencies| {
+                // Dedupe dependencies up front to ensure we only hash each file once
+                futures::stream::iter(
+                    dependencies
+                        .into_iter()
+                        .sorted_unstable_by(|a, b| a.cmp(b))
+                        .dedup()
+                        .map(Ok),
+                )
+            })
+            .try_flatten_stream()
+            .map_ok(|path| {
+                futures::stream::once(Box::pin(async {
+                    let meta = tokio::fs::symlink_metadata(&path).await?;
+                    if include_is_too_new(&path, &(&meta).into(), start_of_compilation) {
+                        bail!("Dependency changed after preprocessor invoked: {path:?}");
+                    }
+
+                    let dep = PREPROCESSOR_DEPENDENCIES_CACHE
+                        .get(&path, compile_timestamp)
+                        .await?;
+
+                    if dep.found_time {
+                        // Write an entry for this dependency, even though it has __TIME__ macros.
+                        // If it's still present next time, preprocessor cache mode will be disabled.
+                        // If it's not present next time, the new object key will be added to this cache entry.
+                        debug!("[{out_pretty}]: Found __TIME__ in {path:?}");
+                    }
+
+                    Ok((dep.entry.digest.clone(), path, meta))
+                }))
+            })
+            .try_flatten_unordered(None)
+            .try_collect::<Vec<_>>()
+            .and_then(|dependencies| async {
+                // Load the latest cache entry for this preprocessor key
+                // This helps minimize races if other clients write more
+                // entries while this client is preprocessing.
+                let mut preprocessor_cache_entry = if reuse_cache_entry {
+                    let fut = PreprocessorCacheEntry::get(storage.as_ref(), &preprocessor_key);
+                    let fut = tokio::time::timeout(cache_read_timeout, fut);
+                    match fut.await {
+                        Ok(Ok(Cache::Hit(preprocessor_cache_entry))) => preprocessor_cache_entry,
+                        _ => Default::default(),
+                    }
+                } else {
+                    Default::default()
+                };
+
+                // Add the object key to the preprocessor cache entry
+                preprocessor_cache_entry.add_result(
+                    &preprocessor_key,
+                    &result_key,
+                    dependencies,
+                    out_pretty.as_ref(),
+                );
+
+                // Write the cache entry back to the preprocessor cache
+                let fut = preprocessor_cache_entry.put(storage.as_ref(), &preprocessor_key);
+
+                if let Some(timeout) = cache_write_timeout {
+                    let start = Instant::now();
+                    match tokio::time::timeout(timeout, fut).await {
+                        Ok(res) => res,
+                        Err(_) => {
+                            bail!("Preprocessor cache write timeout ({:?})", start.elapsed())
+                        }
+                    }
+                } else {
+                    fut.await
+                }
+            })
+            .await
+            // Don't fail if updating the preprocessor cache entry fails, just log it
+            .inspect_err(|err| {
+                debug!("[{out_pretty}]: Failed to update preprocessor cache entry: {err}");
+            })
+    }
 }
 
 #[async_trait]
@@ -762,11 +856,14 @@ where
         creator: &T,
         cwd: PathBuf,
         env_vars: Vec<(OsString, OsString)>,
-        pool: &tokio::runtime::Handle,
+        _pool: &tokio::runtime::Handle,
         rewrite_includes_only: bool,
         storage: Arc<dyn Storage>,
         cache_control: CacheControl,
-    ) -> Result<HashResult<T>> {
+    ) -> Result<(
+        HashResult<T>,
+        Option<Pin<Box<dyn Future<Output = Result<()>> + Send>>>,
+    )> {
         let CCompilerHasher {
             compiler,
             executable,
@@ -783,7 +880,6 @@ where
         let cache_read_timeout = service
             .cache_read_timeout
             .unwrap_or(Duration::from_secs(60));
-        let cache_write_timeout = service.cache_write_timeout;
 
         // A compiler binary may be a symlink to another and so has the same digest, but that means
         // the toolchain will not contain the correct path to invoke the compiler! Add the compiler
@@ -793,21 +889,24 @@ where
         // Skip preprocessing if we're not going to do any cache reads/writes
         // In this mode, the cache key doesn't matter, so return empty string
         if CacheControl::ForceNoCache == cache_control {
-            return Ok(HashResult {
-                key: String::new(),
-                compilation: Box::new(CCompilation {
-                    compiler: self.compiler,
-                    creator: creator.to_owned(),
-                    cwd,
-                    env_vars,
-                    executable: self.executable,
-                    is_locally_preprocessed: false,
-                    parsed_args: self.parsed_args,
-                    rewrite_includes_only,
-                    service: service.to_owned(),
-                }),
-                weak_toolchain_key,
-            });
+            return Ok((
+                HashResult {
+                    key: String::new(),
+                    compilation: Box::new(CCompilation {
+                        compiler: self.compiler,
+                        creator: creator.to_owned(),
+                        cwd,
+                        env_vars,
+                        executable: self.executable,
+                        is_locally_preprocessed: false,
+                        parsed_args: self.parsed_args,
+                        rewrite_includes_only,
+                        service: service.to_owned(),
+                    }),
+                    weak_toolchain_key,
+                },
+                None,
+            ));
         }
 
         let extra_hashes = hash_all(&parsed_args.extra_hash_files).await?;
@@ -821,7 +920,7 @@ where
         let kind = compiler.kind().into();
         let lang = <CCompilerHasher<I> as CompilerHasher<T>>::language(&*self);
 
-        let start_of_compilation = std::time::SystemTime::now();
+        let start_of_compilation = SystemTime::now();
 
         // If the compiler has support for it, the expansion of __DATE__ will change
         // according to the value of SOURCE_DATE_EPOCH. If the compiler doesn't support
@@ -831,8 +930,8 @@ where
             .find(|(k, _)| k == "SOURCE_DATE_EPOCH")
             .and_then(|(_, v)| v.as_os_str().to_str())
             .and_then(|v| v.parse().ok())
-            .and_then(chrono::DateTime::from_timestamp_secs)
-            .unwrap_or_else(chrono::Utc::now);
+            .and_then(DateTime::from_timestamp_secs)
+            .unwrap_or_else(Utc::now);
 
         // Try to look for a cached preprocessing step for this compilation request.
         let (preprocessor_cache_lookup, preprocessor_cache_lookup_duration) = {
@@ -853,27 +952,30 @@ where
         };
 
         match preprocessor_cache_lookup {
-            PreprocessorCacheLookup::Hit(key) => {
+            PreprocessorCacheLookup::Hit(result_key) => {
                 let mut stats = service.stats.lock().await;
                 stats.preprocessor_cache_hits.increment(&kind, &lang);
                 stats.preprocessor_cache_hit_duration += preprocessor_cache_lookup_duration;
 
                 // Skip preprocessing if it's a preprocessor cache hit
-                return Ok(HashResult {
-                    key,
-                    compilation: Box::new(CCompilation {
-                        compiler: self.compiler,
-                        creator: creator.to_owned(),
-                        cwd,
-                        env_vars,
-                        executable: self.executable,
-                        is_locally_preprocessed: false,
-                        parsed_args: self.parsed_args,
-                        rewrite_includes_only,
-                        service: service.to_owned(),
-                    }),
-                    weak_toolchain_key,
-                });
+                return Ok((
+                    HashResult {
+                        key: result_key,
+                        compilation: Box::new(CCompilation {
+                            compiler: self.compiler,
+                            creator: creator.to_owned(),
+                            cwd,
+                            env_vars,
+                            executable: self.executable,
+                            is_locally_preprocessed: false,
+                            parsed_args: self.parsed_args,
+                            rewrite_includes_only,
+                            service: service.to_owned(),
+                        }),
+                        weak_toolchain_key,
+                    },
+                    None,
+                ));
             }
             PreprocessorCacheLookup::Miss(_, _) => {
                 let mut stats = service.stats.lock().await;
@@ -901,7 +1003,7 @@ where
             // matches the line numbers in this source file
             .include_line_numbers(parsed_args.profile_generate);
 
-        let (key, dependencies) = preprocessor
+        let (result_key, dependencies) = preprocessor
             .preprocess()
             .and_then(|(preprocessor_output, dependencies)| {
                 preprocessor
@@ -911,147 +1013,53 @@ where
             .or_else(|err| preprocessor.clean_up(err))
             .await?;
 
-        let preprocessor_key_and_dependencies = dependencies.and_then(|dependencies| {
-            if let PreprocessorCacheLookup::Miss(preprocessor_key, reuse_preprocessor_cache_entry) =
+        let dependencies_and_preprocessor_key = dependencies.and_then(|dependencies| {
+            if let PreprocessorCacheLookup::Miss(preprocessor_key, reuse_cache_entry) =
                 preprocessor_cache_lookup
             {
-                Some((
-                    preprocessor_key,
-                    reuse_preprocessor_cache_entry,
-                    dependencies,
-                ))
+                Some((dependencies, preprocessor_key, reuse_cache_entry))
             } else {
                 None
             }
         });
 
-        if let Some((preprocessor_key, reuse_preprocessor_cache_entry, dependencies)) =
-            preprocessor_key_and_dependencies
-        {
-            let fut = pool.spawn({
-                let key = key.clone();
-                let out_pretty = out_pretty.into_owned();
-                async move {
-                    dependencies
-                        .map_ok(|dependencies| {
-                            // Dedupe dependencies up front to ensure we only hash each file once
-                            futures::stream::iter(
-                                dependencies
-                                    .into_iter()
-                                    .sorted_unstable_by(|a, b| a.cmp(b))
-                                    .dedup()
-                                    .map(Ok),
-                            )
-                        })
-                        .try_flatten_stream()
-                        .map_ok(|path| {
-                            futures::stream::once(Box::pin(async {
-                                let meta = tokio::fs::symlink_metadata(&path).await?;
-                                if include_is_too_new(&path, &(&meta).into(), start_of_compilation)
-                                {
-                                    bail!(
-                                        "Dependency changed after preprocessor invoked: {path:?}"
-                                    );
-                                }
+        let maybe_cache_write = dependencies_and_preprocessor_key.map(
+            |(dependencies, preprocessor_key, reuse_cache_entry)| {
+                Box::pin({
+                    Self::update_preprocessor_cache_entry(
+                        dependencies,
+                        preprocessor_key,
+                        reuse_cache_entry,
+                        result_key.clone(),
+                        storage,
+                        cache_read_timeout,
+                        service.cache_write_timeout,
+                        compile_timestamp,
+                        start_of_compilation,
+                        out_pretty.into_owned(),
+                    )
+                }) as Pin<Box<dyn Future<Output = Result<()>> + Send>>
+            },
+        );
 
-                                let dep = PREPROCESSOR_DEPENDENCIES_CACHE
-                                    .get(&path, compile_timestamp)
-                                    .await?;
-
-                                if dep.found_time {
-                                    // Write an entry for this dependency, even though it has __TIME__ macros.
-                                    // If it's still present next time, preprocessor cache mode will be disabled.
-                                    // If it's not present next time, the new object key will be added to this cache entry.
-                                    debug!("[{out_pretty}]: Found __TIME__ in {path:?}");
-                                }
-
-                                Ok((dep.entry.digest.clone(), path, meta))
-                            }))
-                        })
-                        .try_flatten_unordered(None)
-                        .try_collect::<Vec<_>>()
-                        .and_then(|dependencies| async {
-                            // Load the latest cache entry for this preprocessor key
-                            // This helps minimize races if other clients write more
-                            // entries while this client is preprocessing.
-                            let mut preprocessor_cache_entry = if reuse_preprocessor_cache_entry {
-                                let fut = PreprocessorCacheEntry::get(
-                                    storage.as_ref(),
-                                    &preprocessor_key,
-                                );
-                                let fut = tokio::time::timeout(cache_read_timeout, fut);
-                                match fut.await {
-                                    Ok(Ok(Cache::Hit(preprocessor_cache_entry))) => {
-                                        preprocessor_cache_entry
-                                    }
-                                    _ => Default::default(),
-                                }
-                            } else {
-                                Default::default()
-                            };
-
-                            // Add the object key to the preprocessor cache entry
-                            preprocessor_cache_entry.add_result(
-                                &preprocessor_key,
-                                &key,
-                                dependencies,
-                                out_pretty.as_ref(),
-                            );
-
-                            // Write the cache entry back to the preprocessor cache
-                            let fut =
-                                preprocessor_cache_entry.put(storage.as_ref(), &preprocessor_key);
-
-                            if let Some(timeout) = cache_write_timeout {
-                                let start = Instant::now();
-                                match tokio::time::timeout(timeout, fut).await {
-                                    Ok(res) => res,
-                                    Err(_) => {
-                                        bail!(
-                                            "Preprocessor cache write timeout ({:?})",
-                                            start.elapsed()
-                                        )
-                                    }
-                                }
-                            } else {
-                                fut.await
-                            }
-                        })
-                        .await
-                        // Don't fail if updating the preprocessor cache entry fails, just log it
-                        .inspect_err(|err| {
-                            debug!(
-                                "[{out_pretty}]: Failed to update preprocessor cache entry: {err}"
-                            );
-                        })
-                        .ok();
-                }
-            });
-
-            // Wait on the pending cache write when running sccache tests
-            if env_vars.iter().any(|(k, v)| {
-                k == "SCCACHE_WAIT_FOR_PREPROCESSOR_CACHE_WRITE"
-                    && matches!(v.to_str().unwrap_or_default(), "true" | "on" | "1")
-            }) {
-                let _ = fut.await;
-            }
-        }
-
-        Ok(HashResult {
-            key,
-            compilation: Box::new(CCompilation {
-                compiler: self.compiler,
-                creator: creator.to_owned(),
-                cwd,
-                env_vars,
-                executable: self.executable,
-                is_locally_preprocessed: true,
-                parsed_args: self.parsed_args,
-                rewrite_includes_only,
-                service: service.to_owned(),
-            }),
-            weak_toolchain_key,
-        })
+        Ok((
+            HashResult {
+                key: result_key,
+                compilation: Box::new(CCompilation {
+                    compiler: self.compiler,
+                    creator: creator.to_owned(),
+                    cwd,
+                    env_vars,
+                    executable: self.executable,
+                    is_locally_preprocessed: true,
+                    parsed_args: self.parsed_args,
+                    rewrite_includes_only,
+                    service: service.to_owned(),
+                }),
+                weak_toolchain_key,
+            },
+            maybe_cache_write,
+        ))
     }
 
     fn color_mode(&self) -> ColorMode {
