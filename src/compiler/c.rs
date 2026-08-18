@@ -1888,12 +1888,8 @@ impl pkg::ToolchainPackager for CToolchainPackager {
             add_named_prog(&mut package_builder, "objcopy")?;
 
             // Linker configuration.
-            if Path::new("/etc/ld.so.conf").is_file() {
-                package_builder.add_file(&self.env_vars, "/etc/ld.so.conf")?;
-            }
-
-            if Path::new("/etc/ld.so.conf.d").is_dir() {
-                package_builder.add_dir_contents(&self.env_vars, "/etc/ld.so.conf.d")?;
+            if Path::new("/etc/ld.so.cache").is_file() {
+                package_builder.add_file(&self.env_vars, "/etc/ld.so.cache")?;
             }
 
             Ok(())
