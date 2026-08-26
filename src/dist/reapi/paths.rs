@@ -33,6 +33,43 @@ pub fn strip_root(path: &str) -> &str {
     path.strip_prefix('/').unwrap_or(path)
 }
 
+/// Collapse `.` and `..` components in an input-root-relative path.
+///
+/// Build systems routinely spell directories with an interior `..` --
+/// LLVM's CMake emits `-I<src>/llvm/../third-party/siphash/include`. The tar
+/// entries we stage use the canonical spelling, so a lookup in the input root
+/// only finds them once the path is collapsed. Getting this wrong is silent:
+/// the path rewriter decides the argument does not name anything we shipped,
+/// leaves it absolute, and the worker resolves it against its own filesystem,
+/// where the header does not exist.
+///
+/// This is purely lexical, so it is wrong when a component is a symlink to
+/// somewhere else -- the same caveat every build system that canonicalizes
+/// `-I` flags lives with.
+pub fn normalize(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => match out.last() {
+                // Leading `..` cannot be collapsed; it escapes the input root,
+                // which will fail loudly on the worker rather than silently.
+                Some(&last) if last != ".." => {
+                    out.pop();
+                }
+                _ => out.push(".."),
+            },
+            other => out.push(other),
+        }
+    }
+    out.join("/")
+}
+
+/// The input-root-relative, `..`-free form of an absolute dist path.
+pub fn root_relative(path: &str) -> String {
+    normalize(strip_root(path))
+}
+
 /// Express an input-root-relative path relative to `base`.
 pub fn relativize(path: &str, base: &str) -> String {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
@@ -97,6 +134,19 @@ mod test {
     fn strip_root_is_the_only_absolute_to_relative_conversion() {
         assert_eq!(strip_root("/work/x"), "work/x");
         assert_eq!(strip_root("work/x"), "work/x");
+    }
+
+    #[test]
+    fn normalize_collapses_interior_dotdot() {
+        assert_eq!(
+            normalize("work/proj/llvm/../third-party/siphash/include"),
+            "work/proj/third-party/siphash/include"
+        );
+        assert_eq!(normalize("work/./proj//a/"), "work/proj/a");
+        assert_eq!(normalize("a/b/../.."), "");
+        // Escaping the root is preserved rather than silently swallowed.
+        assert_eq!(normalize("a/../../b"), "../b");
+        assert_eq!(root_relative("/work/a/../b"), "work/b");
     }
 
     #[test]

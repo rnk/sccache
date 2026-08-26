@@ -1236,6 +1236,11 @@ pub struct ReapiConfig {
     /// Platform properties attached to every action, e.g. `OSFamily = "Linux"`
     /// or `container-image = "docker://..."`.
     pub platform: BTreeMap<String, String>,
+    /// Extra gRPC metadata sent with every request, e.g. `authorization` for
+    /// services that sit behind an authenticating proxy, or the routing
+    /// headers some deployments expect. Names are lowercased; a value here
+    /// overrides the token passed via `SCCACHE_DIST_TOKEN`.
+    pub headers: BTreeMap<String, String>,
     /// Per-action execution timeout, in seconds.
     pub action_timeout_secs: u64,
     /// Ask the server to skip its action cache lookup. sccache's own object
@@ -1300,6 +1305,20 @@ impl ReapiConfig {
                         .collect()
                 })
                 .unwrap_or(self.platform),
+            headers: env::var("SCCACHE_DIST_REAPI_HEADERS")
+                .ok()
+                .map(|val| {
+                    // "name=value,name=value". Header values rarely contain
+                    // commas; those that do need the config file instead.
+                    val.split(',')
+                        .filter(|kv| !kv.trim().is_empty())
+                        .filter_map(|kv| {
+                            kv.split_once('=')
+                                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
+                        })
+                        .collect()
+                })
+                .unwrap_or(self.headers),
             action_timeout_secs: number_from_env_var("SCCACHE_DIST_REAPI_ACTION_TIMEOUT")
                 .map(|val| val.unwrap_or(self.action_timeout_secs))
                 .unwrap_or(self.action_timeout_secs),
@@ -1331,6 +1350,7 @@ impl Default for ReapiConfig {
             toolchain: ReapiToolchainMode::default(),
             stage: ReapiStageMode::default(),
             platform: Default::default(),
+            headers: Default::default(),
             action_timeout_secs: 600,
             skip_cache_lookup: false,
             do_not_cache: false,

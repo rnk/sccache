@@ -187,6 +187,17 @@ Rewrite rule for `arguments`: strip the leading `/` only for args that are
 the input-root tree we just built. Do **not** blanket-strip every arg starting
 with `/`. This is a small, unit-testable function.
 
+Paths are lexically normalized (`.` and `..` collapsed) before that lookup.
+Build systems routinely emit an interior `..`: LLVM's CMake produces
+`-I<src>/llvm/../third-party/siphash/include`, while the tar entries we stage
+use the canonical spelling. Skipping normalization fails *silently* -- the
+lookup misses, the rewriter concludes the argument does not name anything we
+shipped, leaves it absolute, and the worker resolves it against its own
+filesystem, where the header does not exist. The normalization is purely
+lexical, so it is wrong when an interior component is a symlink to somewhere
+else; that is the same caveat every build system that canonicalizes `-I` flags
+lives with.
+
 `argv[0]` is relative (`work/toolchain/bin/clang`) and contains a `/`, so
 `execve` resolves it against the cwd (= input root) rather than `PATH`.
 
@@ -315,9 +326,25 @@ Selection in `src/server.rs`: if `dist.reapi.url` is set, construct
 else about `[dist]` (`fallback_to_local_compile`, `max_retries`,
 `rewrite_includes_only`, `toolchain_cache_size`) is shared.
 
-`grpcs://` selects TLS via the `rustls` already in the tree. Auth: bearer token
-from the existing `dist.auth` config, sent as an `authorization` metadata
-header. mTLS is a later addition.
+`grpcs://` selects TLS via the `rustls` already in the tree. mTLS is a later
+addition.
+
+Auth: a token from the existing `dist.auth` config is sent as
+`authorization: Bearer <token>`. That covers the common case, but real
+deployments sit behind proxies that want something else, so `[dist.reapi.headers]`
+sets arbitrary gRPC metadata on every request and overrides the token-derived
+header:
+
+```toml
+[dist.reapi.headers]
+authorization = "Basic dXNlcjpodW50ZXIy"
+```
+
+This is deliberately general rather than a menu of auth schemes. It also
+covers deployments that route on their own headers. Bazel's `.netrc` support
+produces exactly the `Basic` form above, so pointing sccache at a cluster
+Bazel already talks to is a matter of base64-encoding the same credential; the
+`--remote_header=` flags in a `.bazelrc` map one-to-one onto this table.
 
 ## What landed
 

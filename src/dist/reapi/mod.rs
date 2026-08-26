@@ -36,7 +36,7 @@ pub mod proto;
 mod tests;
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -60,20 +60,22 @@ use cas::Cas;
 use merkle::DirBuilder;
 use proto::build::bazel::remote::execution::v2 as reapi;
 
-/// Metadata every request carries: the instance name and, optionally, a bearer
-/// token.
+/// Metadata every request carries: the instance name, and whatever headers the
+/// deployment needs -- typically an `authorization` header, plus any routing
+/// headers the service expects.
 pub struct RpcContext {
     pub instance_name: String,
-    auth: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    headers: Vec<(
+        tonic::metadata::MetadataKey<tonic::metadata::Ascii>,
+        tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+    )>,
 }
 
 impl RpcContext {
     pub fn request<T>(&self, message: T) -> tonic::Request<T> {
         let mut request = tonic::Request::new(message);
-        if let Some(auth) = &self.auth {
-            request
-                .metadata_mut()
-                .insert(http::header::AUTHORIZATION.as_str(), auth.clone());
+        for (name, value) in self.headers.iter() {
+            request.metadata_mut().insert(name.clone(), value.clone());
         }
         request
     }
@@ -208,17 +210,36 @@ impl Client {
             .await
             .with_context(|| format!("Failed to connect to remote execution service at {url}"))?;
 
-        let auth = auth_token
-            .filter(|token| !token.is_empty())
-            .map(|token| {
-                tonic::metadata::MetadataValue::try_from(format!("Bearer {token}"))
-                    .context("Remote execution auth token is not a valid HTTP header value")
+        // The token, when present, is the conventional bearer credential.
+        // Anything in `headers` wins, so a deployment behind a proxy that
+        // wants a different scheme can spell out the whole header itself.
+        let mut headers: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(token) = auth_token.filter(|token| !token.is_empty()) {
+            headers.insert(
+                http::header::AUTHORIZATION.as_str().to_owned(),
+                format!("Bearer {token}"),
+            );
+        }
+        headers.extend(
+            reapi_config
+                .headers
+                .iter()
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.clone())),
+        );
+        let headers = headers
+            .into_iter()
+            .map(|(name, value)| -> Result<_> {
+                let key = tonic::metadata::MetadataKey::from_bytes(name.as_bytes())
+                    .with_context(|| format!("{name:?} is not a valid header name"))?;
+                let value = tonic::metadata::MetadataValue::try_from(&value)
+                    .with_context(|| format!("The value of header {name:?} is not valid ASCII"))?;
+                Ok((key, value))
             })
-            .transpose()?;
+            .collect::<Result<Vec<_>>>()?;
 
         let rpc = Arc::new(RpcContext {
             instance_name: reapi_config.instance_name.clone(),
-            auth,
+            headers,
         });
 
         let capabilities = Self::fetch_capabilities(&rpc, &channel).await?;
@@ -785,6 +806,12 @@ impl dist::Client for Client {
 
     fn stage_sources(&self) -> bool {
         self.reapi_config.stage == config::ReapiStageMode::Sources
+    }
+
+    /// The archive is dismantled into CAS blobs on this machine and never
+    /// sent anywhere, so compressing it would only cost CPU.
+    fn ships_inputs_archive(&self) -> bool {
+        false
     }
 
     async fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf> {

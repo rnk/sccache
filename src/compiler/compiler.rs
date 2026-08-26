@@ -1383,13 +1383,25 @@ where
             // and we don't want to OOM the server during parallel builds.
             let job_inputs = crate::util::tempfile()?;
 
+            // Optimize for size when the archive is what goes over the wire,
+            // since bandwidth costs more than client CPU cycles. When the
+            // client takes the archive apart locally instead -- REv2 uploads
+            // individually content-addressed blobs -- compressing it buys
+            // nothing and costs a great deal, so store the entries instead.
+            // `Compression::none()` still emits a well-formed zlib stream, so
+            // the reader side is unchanged either way.
+            let compression = if dist_client.ships_inputs_archive() {
+                flate2::Compression::best()
+            } else {
+                flate2::Compression::none()
+            };
+
             inputs_packager
                 .write_inputs(
                     &mut path_transformer,
                     crate::dist::pkg::InputsCompressor::new(flate2::write::ZlibEncoder::new(
                         job_inputs.reopen()?,
-                        // Optimize for size since bandwidth costs more than client CPU cycles
-                        flate2::Compression::best(),
+                        compression,
                     )),
                 )
                 .await

@@ -66,6 +66,12 @@ env_passthrough = ["SOURCE_DATE_EPOCH"]
 #[dist.reapi.platform]
 OSFamily = "Linux"
 
+# gRPC metadata sent with every request. Use this for services behind an
+# authenticating proxy, or for deployments that expect routing headers. A
+# value here overrides the bearer token built from `SCCACHE_DIST_TOKEN`.
+#[dist.reapi.headers]
+authorization = "Basic dXNlcjpodW50ZXIy"
+
 # Multi-level cache configuration
 # Define cache levels in order (fast to slow).
 # Each level must be separately configured below.
@@ -224,6 +230,7 @@ These require the `dist-client-reapi` feature. See [the remote execution doc](Re
 * `SCCACHE_DIST_REAPI_TOOLCHAIN` `inputs` (default) to send the compiler to the worker in the action's input root, or `image` to assume it is already present in the worker's container image.
 * `SCCACHE_DIST_REAPI_STAGE` `sources` (default) to compile the original source remotely with its dependencies staged individually, or `preprocessed` to send a single preprocessed blob. `sources` uses substantially less upload bandwidth and shares inputs with other clients; `preprocessed` is the sccache-dist behaviour, kept as an escape hatch.
 * `SCCACHE_DIST_REAPI_PLATFORM` platform properties for every action, as `name=value,name=value`, e.g. `OSFamily=Linux`.
+* `SCCACHE_DIST_REAPI_HEADERS` gRPC metadata sent with every request, as `name=value,name=value`, e.g. `authorization=Basic dXNlcjpodW50ZXIy`. Header names are lowercased, and a value here overrides the bearer token built from `SCCACHE_DIST_TOKEN`. Values containing a comma need the config file instead.
 * `SCCACHE_DIST_REAPI_ACTION_TIMEOUT` per-action execution timeout in seconds. Default is `600`.
 * `SCCACHE_DIST_REAPI_ENV_PASSTHROUGH` comma-separated environment variable names to forward to the remote action. Default is `SOURCE_DATE_EPOCH`.
 * `SCCACHE_DIST_REAPI_SKIP_CACHE_LOOKUP` set to `true` to ask the server to skip its action cache.

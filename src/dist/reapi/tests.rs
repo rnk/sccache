@@ -530,6 +530,9 @@ async fn fixture(toolchain: ReapiToolchainMode) -> Fixture {
             platform: [("OSFamily".to_owned(), "Linux".to_owned())]
                 .into_iter()
                 .collect(),
+            headers: [("x-test-header".to_owned(), "sccache".to_owned())]
+                .into_iter()
+                .collect(),
             action_timeout_secs: 60,
             skip_cache_lookup: false,
             do_not_cache: false,

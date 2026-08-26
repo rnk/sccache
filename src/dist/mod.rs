@@ -1027,5 +1027,23 @@ pub trait Client: Send + Sync {
     fn stage_sources(&self) -> bool {
         false
     }
+
+    /// Does the inputs archive itself travel over the network?
+    ///
+    /// sccache-dist ships the archive verbatim to a scheduler, so spending
+    /// client CPU on level-9 deflate to shrink it is a good trade. An REv2
+    /// client does the opposite: it takes the archive apart locally into
+    /// individually content-addressed blobs and the archive never leaves the
+    /// machine, so every cycle spent compressing it is pure waste -- and it is
+    /// not a small amount. For one 500-input LLVM translation unit, deflating
+    /// the archive costs ~209ms and the two decompressing passes that read it
+    /// back cost another ~27ms, against ~10ms to SHA-256 the same inputs
+    /// straight off disk.
+    ///
+    /// Defaults to true, which is the sccache-dist behaviour.
+    fn ships_inputs_archive(&self) -> bool {
+        true
+    }
+
     async fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf>;
 }

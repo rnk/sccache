@@ -24,7 +24,7 @@ use crate::{config::ReapiToolchainMode, dist::CompileCommand, errors::*};
 use super::{
     RpcContext,
     merkle::{DirBuilder, digest_message},
-    paths::{relativize, strip_root},
+    paths::{relativize, root_relative, strip_root},
     proto::build::bazel::remote::execution::v2 as reapi,
 };
 
@@ -49,8 +49,10 @@ pub struct ActionPlan {
 /// produce, are rewritten. An absolute path that names neither -- an
 /// `-idirafter /opt/vendor/...` pointing into the worker's container image, say
 /// -- is deliberately left alone.
-fn should_rewrite(arg: &str, tree: &DirBuilder, outputs: &[String]) -> bool {
-    outputs.iter().any(|o| o == arg) || tree.contains(strip_root(arg))
+/// Does `path` -- the input-root-relative form of `arg` -- name something the
+/// action either ships or produces?
+fn should_rewrite(path: &str, tree: &DirBuilder, outputs: &[String]) -> bool {
+    outputs.iter().any(|o| root_relative(o) == path) || tree.contains(path)
 }
 
 fn rewrite_arg(
@@ -61,8 +63,11 @@ fn rewrite_arg(
 ) -> String {
     // A bare path: the compile input, the `-o` value, an `-I` given as two
     // separate arguments.
-    if arg.starts_with('/') && should_rewrite(arg, tree, outputs) {
-        return relativize(strip_root(arg), working_directory);
+    if arg.starts_with('/') {
+        let path = root_relative(arg);
+        if should_rewrite(&path, tree, outputs) {
+            return relativize(&path, working_directory);
+        }
     }
 
     // A path glued to a flag: `-I/abs/path`, `--sysroot=/`, `-L/abs/path`,
@@ -77,8 +82,9 @@ fn rewrite_arg(
         && let Some(index) = arg.find('/')
     {
         let (flag, value) = arg.split_at(index);
-        if should_rewrite(value, tree, outputs) {
-            return format!("{flag}{}", relativize(strip_root(value), working_directory));
+        let path = root_relative(value);
+        if should_rewrite(&path, tree, outputs) {
+            return format!("{flag}{}", relativize(&path, working_directory));
         }
     }
 
@@ -98,7 +104,7 @@ pub fn plan(
     timeout: Duration,
     do_not_cache: bool,
 ) -> Result<ActionPlan> {
-    let working_directory = strip_root(&command.cwd).to_owned();
+    let working_directory = root_relative(&command.cwd);
 
     let executable = match toolchain_mode {
         ReapiToolchainMode::Image => command.executable.clone(),
