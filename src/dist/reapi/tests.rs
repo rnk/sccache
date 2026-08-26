@@ -25,7 +25,7 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -635,7 +635,7 @@ async fn run_one(fixture: &Fixture, source: &[u8]) -> RunJobResponse {
     };
     let job = fixture
         .client
-        .new_job(toolchain.clone(), inputs)
+        .new_job(toolchain.clone(), crate::dist::JobInputs::Archive(inputs))
         .await
         .unwrap();
 
@@ -658,6 +658,122 @@ async fn run_one(fixture: &Fixture, source: &[u8]) -> RunJobResponse {
         )
         .await
         .unwrap()
+}
+
+/// The same inputs as [`run_one`], but as real files on disk described by
+/// `InputEntry`s -- the archive-free path.
+fn inputs_entries(dir: &Path, source: &[u8]) -> Vec<crate::dist::pkg::InputEntry> {
+    use crate::dist::pkg::InputEntry;
+    use std::io::Write;
+
+    let write = |name: &str, data: &[u8], mode: u32| -> PathBuf {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(data).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        path
+    };
+
+    vec![
+        InputEntry::File {
+            dist_path: PathBuf::from("work/proj/src/a.dist.cpp"),
+            src_path: write("a.dist.cpp", source, 0o644),
+        },
+        InputEntry::File {
+            dist_path: PathBuf::from("opt/cc/bin/cc"),
+            src_path: write("cc", FAKE_COMPILER, 0o755),
+        },
+    ]
+}
+
+async fn run_one_from_entries(
+    fixture: &Fixture,
+    entries: &Arc<Vec<crate::dist::pkg::InputEntry>>,
+) -> RunJobResponse {
+    let toolchain = Toolchain {
+        archive_id: "test-toolchain".to_owned(),
+    };
+    let job = fixture
+        .client
+        .new_job(
+            toolchain.clone(),
+            crate::dist::JobInputs::Entries(entries.clone()),
+        )
+        .await
+        .unwrap();
+
+    fixture
+        .client
+        .toolchains
+        .lock()
+        .await
+        .insert(toolchain.archive_id.clone(), Default::default());
+
+    fixture
+        .client
+        .run_job(
+            &job.job_id,
+            std::time::Duration::from_secs(60),
+            toolchain,
+            compile_command(),
+            vec!["/work/proj/build/a.o".to_owned()],
+        )
+        .await
+        .unwrap()
+}
+
+/// The two input representations have to describe byte-identical input roots.
+///
+/// If they diverge, the action digest diverges, and a build that switches
+/// between them silently loses every remote action cache hit -- which is the
+/// kind of regression that shows up as "remote execution got slower" long
+/// after the change that caused it.
+#[tokio::test]
+async fn entries_and_archive_agree_on_the_input_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = fixture(ReapiToolchainMode::Inputs).await;
+
+    let entries = Arc::new(inputs_entries(dir.path(), b"the source text"));
+    let from_archive = run_one(&fixture, b"the source text").await;
+    let from_entries = run_one_from_entries(&fixture, &entries).await;
+
+    let executed = fixture.server.state.lock().unwrap().executed.clone();
+    assert_eq!(executed.len(), 2);
+    assert_eq!(
+        executed[0], executed[1],
+        "staging inputs individually produced a different action digest than the archive"
+    );
+
+    for response in [from_archive, from_entries] {
+        let RunJobResponse::Complete { result, .. } = response else {
+            panic!("expected a completed job, got {response:?}");
+        };
+        assert_eq!(result.output.code(), Some(0));
+    }
+}
+
+/// A header shared by many compilations is hashed once, not once per job.
+#[tokio::test]
+async fn repeated_inputs_are_hashed_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = fixture(ReapiToolchainMode::Inputs).await;
+
+    // The same files, referenced by two successive jobs -- exactly how a
+    // build reuses a header across translation units.
+    let entries = Arc::new(inputs_entries(dir.path(), b"same source"));
+
+    run_one_from_entries(&fixture, &entries).await;
+    // Two distinct files (source + compiler) seen, so two cache entries.
+    assert_eq!(fixture.client.digests.len(), 2);
+
+    run_one_from_entries(&fixture, &entries).await;
+    // The second job reused both; nothing new was hashed.
+    assert_eq!(fixture.client.digests.len(), 2);
 }
 
 #[tokio::test]
@@ -776,7 +892,7 @@ async fn compiler_failure_is_reported_as_a_completed_job() {
     };
     let job = fixture
         .client
-        .new_job(toolchain.clone(), inputs)
+        .new_job(toolchain.clone(), crate::dist::JobInputs::Archive(inputs))
         .await
         .unwrap();
     fixture
@@ -842,7 +958,11 @@ async fn image_mode_sends_no_toolchain() {
             Toolchain {
                 archive_id: "in-the-image".to_owned(),
             },
-            inputs_tar(&[("work/proj/src/a.dist.cpp", b"source", 0o644)]),
+            crate::dist::JobInputs::Archive(inputs_tar(&[(
+                "work/proj/src/a.dist.cpp",
+                b"source",
+                0o644,
+            )])),
         )
         .await
         .unwrap();

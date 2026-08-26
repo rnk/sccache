@@ -775,6 +775,9 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                             ServerStats::default(),
                             Some(compilations_storage).as_deref(),
                             Some(preprocessor_storage).as_deref(),
+                            // No server is running, so nothing is configured
+                            // to distribute anything.
+                            "no server running".to_string(),
                         )
                         .await
                     })?

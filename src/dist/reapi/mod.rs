@@ -28,6 +28,7 @@
 //! worker image.
 
 mod cas;
+mod digest_cache;
 mod exec;
 mod merkle;
 mod paths;
@@ -48,15 +49,16 @@ use tonic::transport::{Channel, Endpoint};
 use crate::{
     config::{self, ReapiToolchainMode},
     dist::{
-        self, BuildResult, CompileCommand, NewJobResponse, OutputData, RunJobResponse,
+        self, BuildResult, CompileCommand, JobInputs, NewJobResponse, OutputData, RunJobResponse,
         SchedulerStatus, SubmitToolchainResult, Toolchain, cache,
-        pkg::{PackagedToolchain, ToolchainPackager},
+        pkg::{InputEntry, PackagedToolchain, ToolchainPackager},
     },
     errors::*,
     mock_command::ProcessOutput,
 };
 
 use cas::Cas;
+use digest_cache::DigestCache;
 use merkle::DirBuilder;
 use proto::build::bazel::remote::execution::v2 as reapi;
 
@@ -127,6 +129,20 @@ fn rewound(file: &std::fs::File) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Where the bytes of a blob we may need to upload can be found.
+enum BlobSource {
+    File(PathBuf),
+    Memory(Vec<u8>),
+}
+
+/// Input-root paths are `String` in the REv2 wire format; the packagers hand
+/// them over as `PathBuf`.
+fn path_str(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .with_context(|| format!("Input path {path:?} is not valid UTF-8"))
+}
+
 /// The state we hold between `new_job` and `run_job`.
 struct JobState {
     /// The action's inputs, without the toolchain, which is merged in at
@@ -145,6 +161,9 @@ pub struct Client {
     request_timeout: u32,
     rewrite_includes_only: bool,
     jobs: Mutex<HashMap<String, JobState>>,
+    /// Content hashes for files we have already hashed, so a header shared by
+    /// a thousand translation units is read once rather than a thousand times.
+    digests: Arc<DigestCache>,
     /// Input-root fragments for toolchains we have already uploaded, keyed by
     /// `Toolchain::archive_id`.
     toolchains: tokio::sync::Mutex<HashMap<String, Arc<DirBuilder>>>,
@@ -270,6 +289,7 @@ impl Client {
 
         Ok(Self {
             cas: Cas::new(rpc.clone(), channel.clone(), max_batch_bytes),
+            digests: DigestCache::new(),
             rpc,
             channel,
             reapi_config,
@@ -366,6 +386,136 @@ impl Client {
         }
 
         Ok(tree)
+    }
+
+    /// Build an input-root fragment from individually named inputs, uploading
+    /// whatever the server is missing.
+    ///
+    /// This is [`Self::ingest_archive`] without the archive, and it is the
+    /// better shape for REv2 in every respect. The archive path has to copy
+    /// every input into a tar, then decompress and parse that tar twice --
+    /// once to hash the entries and once to pull out the blobs the server
+    /// wants -- for content that is already sitting on the local disk. Here
+    /// the files are hashed where they lie, through [`DigestCache`], so the
+    /// second and later jobs that reference a header pay a `stat` instead of
+    /// a read; and the only bytes that ever get loaded into memory are the
+    /// ones actually being uploaded.
+    async fn ingest_entries(&self, entries: Arc<Vec<InputEntry>>) -> Result<DirBuilder> {
+        let digests = self.digests.clone();
+        let scan = entries.clone();
+
+        // `uploadable` maps digest -> where to get those bytes, for the
+        // subset the server turns out to be missing.
+        let (tree, all_digests, uploadable) = tokio::task::spawn_blocking(
+            move || -> Result<(DirBuilder, Vec<reapi::Digest>, HashMap<String, BlobSource>)> {
+                let mut tree = DirBuilder::default();
+                let mut all = Vec::new();
+                let mut uploadable = HashMap::new();
+
+                for entry in scan.iter() {
+                    match entry {
+                        InputEntry::Dir { dist_path } => {
+                            tree.insert_dir(&path_str(dist_path)?)?;
+                        }
+                        InputEntry::Symlink { dist_path, target } => {
+                            tree.insert_symlink(&path_str(dist_path)?, &path_str(target)?)?;
+                        }
+                        InputEntry::File {
+                            dist_path,
+                            src_path,
+                        } => {
+                            let found = digests.digest_of(src_path)?;
+                            tree.insert_file(
+                                &path_str(dist_path)?,
+                                found.digest.clone(),
+                                found.is_executable,
+                            )?;
+                            all.push(found.digest.clone());
+                            uploadable.insert(
+                                found.digest.hash.clone(),
+                                BlobSource::File(src_path.clone()),
+                            );
+                        }
+                        InputEntry::Blob { dist_path, data } => {
+                            let digest = merkle::digest_bytes(data);
+                            tree.insert_file(&path_str(dist_path)?, digest.clone(), false)?;
+                            all.push(digest.clone());
+                            uploadable
+                                .insert(digest.hash.clone(), BlobSource::Memory(data.clone()));
+                        }
+                    }
+                }
+
+                Ok((tree, all, uploadable))
+            },
+        )
+        .await
+        .context("Failed to build the action input root")??;
+
+        let missing = self.cas.missing(&all_digests).await?;
+        if missing.is_empty() {
+            return Ok(tree);
+        }
+
+        let total: i64 = missing.iter().map(|d| d.size_bytes).sum();
+        debug!(
+            "Uploading {} blob(s), {total} bytes, to the remote execution CAS",
+            missing.len()
+        );
+
+        // Load and ship the missing blobs in bounded batches, so a job with a
+        // very large cold input set never has all of it in memory at once.
+        const FLUSH_BYTES: i64 = 32 * 1024 * 1024;
+        let mut pending: Vec<(reapi::Digest, Vec<u8>)> = Vec::new();
+        let mut pending_bytes = 0i64;
+
+        for digest in missing.iter() {
+            let Some(source) = uploadable.get(&digest.hash) else {
+                // The server asked for something we did not offer it.
+                bail!(
+                    "Remote execution service reported a missing blob {} that is not \
+                     part of this job",
+                    digest.hash
+                );
+            };
+            let data = match source {
+                BlobSource::Memory(data) => data.clone(),
+                BlobSource::File(path) => {
+                    let digests = self.digests.clone();
+                    let path = path.clone();
+                    let digest = digest.clone();
+                    tokio::task::spawn_blocking(move || digests.read_for_upload(&path, &digest))
+                        .await
+                        .context("Failed to read an input for upload")??
+                }
+            };
+
+            pending_bytes += digest.size_bytes;
+            pending.push((digest.clone(), data));
+            if pending_bytes >= FLUSH_BYTES {
+                self.cas.upload_all(std::mem::take(&mut pending)).await?;
+                pending_bytes = 0;
+            }
+        }
+
+        if !pending.is_empty() {
+            self.cas.upload_all(pending).await?;
+        }
+
+        Ok(tree)
+    }
+
+    /// Build an input-root fragment from whichever form the inputs arrived in.
+    async fn ingest(&self, inputs: JobInputs) -> Result<DirBuilder> {
+        match inputs {
+            JobInputs::Entries(entries) => self.ingest_entries(entries).await,
+            // Still reachable for packagers that cannot enumerate their
+            // inputs -- Rust, today.
+            JobInputs::Archive(file) => {
+                self.ingest_archive(move || Ok(flate2::read::ZlibDecoder::new(rewound(&file)?)))
+                    .await
+            }
+        }
     }
 
     /// The toolchain's contribution to the input root, uploading it the first
@@ -485,9 +635,9 @@ impl Client {
 
 #[async_trait]
 impl dist::Client for Client {
-    async fn new_job(&self, toolchain: Toolchain, inputs: std::fs::File) -> Result<NewJobResponse> {
+    async fn new_job(&self, toolchain: Toolchain, inputs: JobInputs) -> Result<NewJobResponse> {
         let tree = self
-            .ingest_archive(move || Ok(flate2::read::ZlibDecoder::new(rewound(&inputs)?)))
+            .ingest(inputs)
             .await
             .context("Failed to upload compilation inputs")?;
 
@@ -515,10 +665,10 @@ impl dist::Client for Client {
         })
     }
 
-    async fn put_job(&self, job_id: &str, inputs: std::fs::File) -> Result<()> {
+    async fn put_job(&self, job_id: &str, inputs: JobInputs) -> Result<()> {
         // Re-upload after the server reported blobs missing.
         let tree = self
-            .ingest_archive(move || Ok(flate2::read::ZlibDecoder::new(rewound(&inputs)?)))
+            .ingest(inputs)
             .await
             .context("Failed to re-upload compilation inputs")?;
 
@@ -812,6 +962,13 @@ impl dist::Client for Client {
     /// sent anywhere, so compressing it would only cost CPU.
     fn ships_inputs_archive(&self) -> bool {
         false
+    }
+
+    /// Every input becomes its own CAS blob, so building an archive first is
+    /// a copy that serves no purpose -- and it is the reason the digest cache
+    /// cannot help.
+    fn stages_inputs_individually(&self) -> bool {
+        true
     }
 
     async fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf> {

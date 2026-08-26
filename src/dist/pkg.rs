@@ -91,6 +91,40 @@ impl<W: Write + Send> InputsWriter for InputsCompressor<W> {
     }
 }
 
+/// One thing a job needs staged, named by where it must appear in the job's
+/// filesystem.
+///
+/// This is the same information a tar entry carries, minus the bytes: a
+/// `File` says *where to find* the content rather than embedding a copy of
+/// it. That distinction is the entire point. A client that content-addresses
+/// each input separately can hash the file in place -- and, crucially, can
+/// remember that hash across jobs -- whereas an archive forces every byte to
+/// be copied through it on every single job, which defeats any memoization.
+///
+/// Paths are the same root-relative form [`tar_safe_path`] produces, so the
+/// two representations describe identical trees.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputEntry {
+    /// A file that exists on this machine and can be read on demand.
+    File {
+        dist_path: PathBuf,
+        src_path: PathBuf,
+    },
+    /// Content that exists only in memory. Preprocessed source is the only
+    /// producer, so this variant disappears with the preprocessed staging mode.
+    Blob {
+        dist_path: PathBuf,
+        data: Vec<u8>,
+    },
+    Symlink {
+        dist_path: PathBuf,
+        target: PathBuf,
+    },
+    Dir {
+        dist_path: PathBuf,
+    },
+}
+
 #[async_trait]
 pub trait InputsPackager: Send {
     async fn write_inputs(
@@ -98,6 +132,23 @@ pub trait InputsPackager: Send {
         path_transformer: &mut dist::PathTransformer,
         inputs_writer: Box<dyn InputsWriter>,
     ) -> Result<()>;
+
+    /// Can this packager enumerate its inputs without building an archive?
+    ///
+    /// Asked before [`Self::list_inputs`] because both it and `write_inputs`
+    /// consume the packager, so the choice has to be made up front.
+    fn can_list_inputs(&self) -> bool {
+        false
+    }
+
+    /// Enumerate the inputs directly. Only called when
+    /// [`Self::can_list_inputs`] is true.
+    async fn list_inputs(
+        self: Box<Self>,
+        _path_transformer: &mut dist::PathTransformer,
+    ) -> Result<Vec<InputEntry>> {
+        bail!("This packager cannot enumerate inputs without an archive")
+    }
 }
 
 #[cfg(not(all(

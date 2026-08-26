@@ -1593,14 +1593,33 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<T,
     }
 }
 
+/// Everything a job needs staged, computed once and then serialized either as
+/// a tar or as a list of individually named inputs.
+///
+/// Splitting this out is what lets a remote-execution client skip the archive
+/// entirely: the work of *deciding* what to stage is identical either way, and
+/// only the final serialization differs.
 #[cfg(feature = "dist-client")]
-#[async_trait]
-impl<T: CommandCreatorSync, I: CCompilerImpl> pkg::InputsPackager for CCompilation<T, I> {
-    async fn write_inputs(
+struct StagedInputs {
+    /// Content that exists only in memory: preprocessed source, when that is
+    /// what the remote action compiles.
+    blob: Option<(PathBuf, Vec<u8>)>,
+    /// Intermediate directories, which must come before the files under them.
+    dirs: std::collections::BTreeMap<PathBuf, PathBuf>,
+    /// Symlink dist path -> target, which must come before anything that
+    /// traverses them.
+    symlinks: std::collections::BTreeMap<PathBuf, PathBuf>,
+    /// Real files: dist path -> where to read them locally.
+    files: std::collections::BTreeMap<PathBuf, PathBuf>,
+}
+
+#[cfg(feature = "dist-client")]
+impl<T: CommandCreatorSync, I: CCompilerImpl> CCompilation<T, I> {
+    /// Work out the complete set of inputs for this compilation.
+    async fn stage(
         self: Box<Self>,
         path_transformer: &mut dist::PathTransformer,
-        compressor: Box<dyn InputsWriter>,
-    ) -> Result<()> {
+    ) -> Result<StagedInputs> {
         use std::collections::{BTreeMap, BTreeSet};
 
         let CCompilation {
@@ -1661,9 +1680,9 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> pkg::InputsPackager for CCompilati
         // Clone the path transformer so the clone can be used in spawn_blocking
         let mut pt = path_transformer.clone();
 
-        // Add the input file, symlinks, dependencies, and extra files
-        let (builder, pt) = tokio::task::spawn_blocking(move || {
-            let mut builder = tar::Builder::new(compressor);
+        // Work out the input file, symlinks, dependencies, and extra files
+        let (staged, pt) = tokio::task::spawn_blocking(move || {
+            let mut blob = None;
             let mut dirs_set = BTreeSet::new();
             let mut symlinks = BTreeMap::new();
             let mut simplifier = pkg::SimplifyPath {
@@ -1701,13 +1720,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> pkg::InputsPackager for CCompilati
                     .as_dist(&dist_path)
                     .with_context(|| format!("Unable to transform input path {input_path:?}"))?;
 
-                // Add the preprocessor output to the tar archive
-                let (mut header, dist_path) = pkg::make_tar_header(&input_path, &dist_path)?;
-                // The current size is from the non-preprocessed path, so set the actual size.
-                header.set_size(preprocessor_output.len() as u64);
-                header.set_cksum();
-                builder.append_data(&mut header, dist_path, &preprocessor_output[..])?;
-                drop(preprocessor_output);
+                blob = Some((pkg::tar_safe_path(dist_path), preprocessor_output.to_vec()));
             }
 
             // Simplify and transform the extra files first, so we record
@@ -1741,7 +1754,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> pkg::InputsPackager for CCompilati
             .try_collect::<_, BTreeMap<PathBuf, PathBuf>, _>()
             .context("Failed transforming input paths")?;
 
-            dirs_set
+            let dirs = dirs_set
                 .into_iter()
                 .map(|dir_path| {
                     pt.as_dist(&dir_path)
@@ -1751,15 +1764,9 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> pkg::InputsPackager for CCompilati
                         .map(|tar_path| (tar_path, dir_path))
                 })
                 .try_collect::<_, BTreeMap<PathBuf, PathBuf>, _>()
-                .context("Failed transforming intermediate directory paths")?
-                .into_iter()
-                .try_for_each(|(tar_path, dir_path)| {
-                    // Record each directory in the archive
-                    builder.append_dir(tar_path, dir_path)
-                })
-                .context("Failed adding intermediate directories to archive")?;
+                .context("Failed transforming intermediate directory paths")?;
 
-            symlinks
+            let symlinks = symlinks
                 .into_iter()
                 .map(|(src_path, dst_path)| {
                     pt.as_dist(&src_path)
@@ -1776,33 +1783,137 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> pkg::InputsPackager for CCompilati
                         })
                 })
                 .try_collect::<_, BTreeMap<PathBuf, PathBuf>, _>()
-                .context("Failed transforming symlink paths")?
-                .into_iter()
-                .try_for_each(|(src_path, dst_path)| {
-                    // Record each symlink in the archive
-                    let mut header = tar::Header::new_gnu();
-                    header.set_size(0);
-                    header.set_mtime(0);
-                    header.set_entry_type(tar::EntryType::Symlink);
-                    builder.append_link(&mut header, src_path, dst_path)
-                })
-                .context("Failed adding symlinks to archive")?;
+                .context("Failed transforming symlink paths")?;
 
-            // Now add the extra files
-            for (tar_path, src_path) in extra_files {
-                builder.append_path_with_name(src_path, tar_path)?;
-            }
-
-            Ok::<_, anyhow::Error>((builder, pt))
+            Ok::<_, anyhow::Error>((
+                StagedInputs {
+                    blob,
+                    dirs,
+                    symlinks,
+                    files: extra_files,
+                },
+                pt,
+            ))
         })
         .await??;
 
         // Move the modified path transformer clone to the original
         *path_transformer = pt;
 
-        // Finish archive
+        Ok(staged)
+    }
+}
+
+#[cfg(feature = "dist-client")]
+impl StagedInputs {
+    /// Serialize as the tar archive sccache-dist expects.
+    ///
+    /// Order matters: directories and symlinks have to precede anything that
+    /// resolves through them, because the receiver unpacks in stream order.
+    fn write_tar(self, compressor: Box<dyn InputsWriter>) -> Result<()> {
+        let StagedInputs {
+            blob,
+            dirs,
+            symlinks,
+            files,
+        } = self;
+
+        let mut builder = tar::Builder::new(compressor);
+
+        if let Some((dist_path, data)) = blob {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder.append_data(&mut header, dist_path, &data[..])?;
+        }
+
+        dirs.into_iter()
+            .try_for_each(|(tar_path, dir_path)| builder.append_dir(tar_path, dir_path))
+            .context("Failed adding intermediate directories to archive")?;
+
+        symlinks
+            .into_iter()
+            .try_for_each(|(src_path, dst_path)| {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(0);
+                header.set_mtime(0);
+                header.set_entry_type(tar::EntryType::Symlink);
+                builder.append_link(&mut header, src_path, dst_path)
+            })
+            .context("Failed adding symlinks to archive")?;
+
+        for (tar_path, src_path) in files {
+            builder.append_path_with_name(src_path, tar_path)?;
+        }
+
         let _ = builder.into_inner()?.finish()?;
         Ok(())
+    }
+
+    /// Describe the same tree as individually named inputs.
+    ///
+    /// Same ordering discipline as [`Self::write_tar`], for the same reason:
+    /// an input root is built by inserting these in order.
+    fn into_entries(self) -> Vec<pkg::InputEntry> {
+        let StagedInputs {
+            blob,
+            dirs,
+            symlinks,
+            files,
+        } = self;
+
+        let mut entries = Vec::with_capacity(dirs.len() + symlinks.len() + files.len() + 1);
+        entries.extend(
+            dirs.into_keys()
+                .map(|dist_path| pkg::InputEntry::Dir { dist_path }),
+        );
+        entries.extend(
+            symlinks
+                .into_iter()
+                .map(|(dist_path, target)| pkg::InputEntry::Symlink { dist_path, target }),
+        );
+        entries.extend(
+            files
+                .into_iter()
+                .map(|(dist_path, src_path)| pkg::InputEntry::File {
+                    dist_path,
+                    src_path,
+                }),
+        );
+        if let Some((dist_path, data)) = blob {
+            entries.push(pkg::InputEntry::Blob { dist_path, data });
+        }
+        entries
+    }
+}
+
+#[cfg(feature = "dist-client")]
+#[async_trait]
+impl<T: CommandCreatorSync, I: CCompilerImpl> pkg::InputsPackager for CCompilation<T, I> {
+    async fn write_inputs(
+        self: Box<Self>,
+        path_transformer: &mut dist::PathTransformer,
+        compressor: Box<dyn InputsWriter>,
+    ) -> Result<()> {
+        let staged = self.stage(path_transformer).await?;
+        tokio::task::spawn_blocking(move || staged.write_tar(compressor))
+            .await
+            .context("Failed to write the inputs archive")?
+    }
+
+    /// C and C++ inputs are ordinary files on disk, so they can be named
+    /// rather than copied.
+    fn can_list_inputs(&self) -> bool {
+        true
+    }
+
+    async fn list_inputs(
+        self: Box<Self>,
+        path_transformer: &mut dist::PathTransformer,
+    ) -> Result<Vec<pkg::InputEntry>> {
+        Ok(self.stage(path_transformer).await?.into_entries())
     }
 }
 

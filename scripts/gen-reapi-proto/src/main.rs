@@ -44,6 +44,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::fs::write(&p, gated)?;
     }
+    // Demote doc comments to plain comments.
+    //
+    // These are the .proto files' own comments, and several contain indented
+    // blocks that rustdoc takes for Rust and tries to compile as doctests --
+    // `cargo test` then fails on comment prose. Demoting rather than dropping
+    // keeps every word where a reader of the generated code will find it; the
+    // authoritative copies are the vendored .proto files anyway. Runs after
+    // the `cfg(test)` gating above, which matches on a doc comment.
+    for e in std::fs::read_dir(&out_dir)? {
+        let p = e?.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&p)?;
+        let demoted = src
+            .lines()
+            .map(|line| match line.trim_start().strip_prefix("///") {
+                Some(rest) => {
+                    let indent = &line[..line.len() - line.trim_start().len()];
+                    format!("{indent}//{rest}")
+                }
+                None => line.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&p, demoted + "\n")?;
+    }
+
     for e in std::fs::read_dir(&out_dir)? {
         let p = e?.path();
         if p.extension().and_then(|s| s.to_str()) == Some("rs") {

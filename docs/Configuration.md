@@ -69,6 +69,14 @@ OSFamily = "Linux"
 # gRPC metadata sent with every request. Use this for services behind an
 # authenticating proxy, or for deployments that expect routing headers. A
 # value here overrides the bearer token built from `SCCACHE_DIST_TOKEN`.
+#
+# Prefer the config file over `SCCACHE_DIST_REAPI_HEADERS` for credentials.
+# A server that exits is restarted automatically by the next client, and that
+# replacement inherits the *client's* environment -- so configuration that
+# lives only in the shell that ran `--start-server` is silently lost, and the
+# daemon quietly stops distributing anything. A config file is picked up by
+# whoever starts the server. Check `sccache --show-stats` if in doubt: the
+# `Distribution:` line says what the running daemon will actually do.
 #[dist.reapi.headers]
 authorization = "Basic dXNlcjpodW50ZXIy"
 

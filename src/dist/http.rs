@@ -1236,8 +1236,9 @@ mod client {
         async fn new_job(
             &self,
             toolchain: Toolchain,
-            inputs: std::fs::File,
+            inputs: dist::JobInputs,
         ) -> Result<NewJobResponse> {
+            let inputs = inputs.into_archive()?;
             bincode_req_fut(
                 self.client
                     .post(urls::scheduler_new_job(&self.scheduler_url))
@@ -1263,8 +1264,8 @@ mod client {
             .await
         }
 
-        async fn put_job(&self, job_id: &str, inputs: std::fs::File) -> Result<()> {
-            let body = futures::io::AllowStdIo::new(inputs);
+        async fn put_job(&self, job_id: &str, inputs: dist::JobInputs) -> Result<()> {
+            let body = futures::io::AllowStdIo::new(inputs.into_archive()?);
             let body = tokio_util::io::ReaderStream::new(body.compat());
             bincode_req_fut(
                 self.client

@@ -1218,7 +1218,7 @@ pub enum ReapiStageMode {
 
 /// Configuration for distributing compilations over the Bazel Remote Execution
 /// v2 API instead of to an sccache-dist scheduler.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct ReapiConfig {
@@ -1257,6 +1257,36 @@ pub struct ReapiConfig {
     /// the server's action cache useless. Compiling preprocessed source needs
     /// almost nothing from the environment.
     pub env_passthrough: Vec<String>,
+}
+
+/// Hand-written so header *values* never reach a log.
+///
+/// `authorization` lives in this map, and `Config` is `Debug`-formatted in
+/// several diagnostic paths -- a failing test assertion printed a live
+/// credential in full before this existed. Names are kept, since knowing
+/// *which* headers are set is the useful part of the diagnostic.
+impl std::fmt::Debug for ReapiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReapiConfig")
+            .field("url", &self.url)
+            .field("instance_name", &self.instance_name)
+            .field("toolchain", &self.toolchain)
+            .field("stage", &self.stage)
+            .field("platform", &self.platform)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .keys()
+                    .map(|name| format!("{name}=<redacted>"))
+                    .collect::<Vec<_>>(),
+            )
+            .field("action_timeout_secs", &self.action_timeout_secs)
+            .field("skip_cache_lookup", &self.skip_cache_lookup)
+            .field("do_not_cache", &self.do_not_cache)
+            .field("env_passthrough", &self.env_passthrough)
+            .finish()
+    }
 }
 
 impl ReapiConfig {

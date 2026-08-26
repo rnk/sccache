@@ -195,6 +195,10 @@ impl DistClientContainer {
         DistInfo::Disabled("dist-client feature not selected".to_string())
     }
 
+    pub async fn describe(&self) -> String {
+        "disabled (dist-client feature not selected)".to_string()
+    }
+
     async fn get_client(&self) -> Result<Option<Arc<dyn dist::Client>>> {
         Ok(None)
     }
@@ -252,6 +256,38 @@ impl DistClientContainer {
                 );
             }
             DistClientState::Disabled => (),
+        }
+    }
+
+    /// A one-line summary of what this daemon will do with a compilation,
+    /// from local state only -- no round trip to the scheduler.
+    ///
+    /// This exists because a daemon that is *not* distributing looks exactly
+    /// like one that is: builds still succeed, and the distributed-compile
+    /// counters simply stay at zero because nothing was ever attempted. A
+    /// server that gets restarted without the environment that configured it
+    /// -- which any client will do automatically if the old one exits --
+    /// silently becomes a local-only server. Printing this in `--show-stats`
+    /// makes that state visible in the command people already run.
+    pub async fn describe(&self) -> String {
+        let guard = self.state.lock().await;
+        match &*guard {
+            DistClientState::Disabled => "disabled".to_string(),
+            DistClientState::FailWithMessage(_, msg) => format!("enabled, not usable: {msg}"),
+            DistClientState::RetryCreateAt(_, time) => format!(
+                "enabled, not connected, retrying in {:.1}s",
+                time.duration_since(Instant::now()).as_secs_f32()
+            ),
+            DistClientState::Some(cfg, _) => {
+                #[cfg(feature = "dist-client-reapi")]
+                if let Some(url) = cfg.reapi.url.as_deref() {
+                    return format!("remote execution (REv2): {url}");
+                }
+                match cfg.scheduler_url.as_ref() {
+                    Some(url) => format!("sccache-dist: {}", url.to_url()),
+                    None => "enabled".to_string(),
+                }
+            }
         }
     }
 
@@ -1503,6 +1539,7 @@ where
             stats,
             Some(&*self.storage),
             Some(&*self.preprocessor_storage),
+            self.dist_client.describe().await,
         )
         .await
     }
@@ -2303,6 +2340,10 @@ pub struct ServerInfo {
     pub use_preprocessor_cache_mode: bool,
     pub version: String,
     pub basedirs: Vec<String>,
+    /// What this daemon does with a compilation: local only, sccache-dist, or
+    /// remote execution. See [`DistClientContainer::describe`].
+    #[serde(default)]
+    pub distribution: String,
 }
 
 /// Status of the dist client.
@@ -2722,6 +2763,7 @@ impl ServerInfo {
         stats: ServerStats,
         storage: Option<&dyn Storage>,
         preprocessor_storage: Option<&dyn Storage>,
+        distribution: String,
     ) -> Result<Self> {
         use crate::cache::multilevel::MultiLevelStats;
         async fn storage_info(
@@ -2787,6 +2829,7 @@ impl ServerInfo {
             use_preprocessor_cache_mode,
             version,
             basedirs,
+            distribution,
         })
     }
 
@@ -2796,6 +2839,12 @@ impl ServerInfo {
             &mut StdoutServerStatsWriter,
             advanced,
             self.use_preprocessor_cache_mode,
+        );
+        println!(
+            "{:<name_width$} {}",
+            "Distribution:",
+            self.distribution,
+            name_width = name_width
         );
         println!(
             "{:<name_width$} {}",

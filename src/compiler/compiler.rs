@@ -1329,6 +1329,24 @@ struct LocalCompile<T: CommandCreatorSync> {
     outputs: Vec<FileObjectSource>,
 }
 
+/// The job's inputs, in a form that can be handed to the client more than
+/// once -- the retry path resubmits them after a server reports them missing.
+#[cfg(feature = "dist-client")]
+enum JobInputSource {
+    Archive(tempfile::NamedTempFile),
+    Entries(Arc<Vec<crate::dist::pkg::InputEntry>>),
+}
+
+#[cfg(feature = "dist-client")]
+impl JobInputSource {
+    fn open(&self) -> Result<dist::JobInputs> {
+        Ok(match self {
+            JobInputSource::Archive(file) => dist::JobInputs::Archive(file.reopen()?),
+            JobInputSource::Entries(entries) => dist::JobInputs::Entries(entries.clone()),
+        })
+    }
+}
+
 struct DistCompile<T: CommandCreatorSync> {
     compilation: Box<dyn Compilation<T>>,
     dist_client: Arc<dyn dist::Client>,
@@ -1376,39 +1394,53 @@ where
         let (inputs_packager, toolchain_packager, outputs_rewriter) =
             compilation.into_dist_packagers()?;
 
-        let job_inputs = {
-            trace!("[{out_pretty}]: Serializing dist inputs");
-
-            // Write the job inputs to a tempfile because they can be huge
-            // and we don't want to OOM the server during parallel builds.
-            let job_inputs = crate::util::tempfile()?;
-
-            // Optimize for size when the archive is what goes over the wire,
-            // since bandwidth costs more than client CPU cycles. When the
-            // client takes the archive apart locally instead -- REv2 uploads
-            // individually content-addressed blobs -- compressing it buys
-            // nothing and costs a great deal, so store the entries instead.
-            // `Compression::none()` still emits a well-formed zlib stream, so
-            // the reader side is unchanged either way.
-            let compression = if dist_client.ships_inputs_archive() {
-                flate2::Compression::best()
+        // Hand the client the inputs in whichever form it can use. Naming the
+        // files is strictly better where it is available: an archive has to
+        // copy every input through itself on every job, which both costs the
+        // copy and denies the client any chance to remember what it already
+        // hashed. Only packagers that cannot enumerate their inputs (Rust,
+        // today) still build one.
+        let job_inputs =
+            if dist_client.stages_inputs_individually() && inputs_packager.can_list_inputs() {
+                trace!("[{out_pretty}]: Enumerating dist inputs");
+                JobInputSource::Entries(Arc::new(
+                    inputs_packager
+                        .list_inputs(&mut path_transformer)
+                        .await
+                        .context("Could not enumerate inputs for compilation")?,
+                ))
             } else {
-                flate2::Compression::none()
+                trace!("[{out_pretty}]: Serializing dist inputs");
+
+                // Write the job inputs to a tempfile because they can be huge
+                // and we don't want to OOM the server during parallel builds.
+                let job_inputs = crate::util::tempfile()?;
+
+                // Optimize for size when the archive is what goes over the wire,
+                // since bandwidth costs more than client CPU cycles. When the
+                // client takes the archive apart locally instead, compressing it
+                // buys nothing and costs a great deal, so store the entries.
+                // `Compression::none()` still emits a well-formed zlib stream, so
+                // the reader side is unchanged either way.
+                let compression = if dist_client.ships_inputs_archive() {
+                    flate2::Compression::best()
+                } else {
+                    flate2::Compression::none()
+                };
+
+                inputs_packager
+                    .write_inputs(
+                        &mut path_transformer,
+                        crate::dist::pkg::InputsCompressor::new(flate2::write::ZlibEncoder::new(
+                            job_inputs.reopen()?,
+                            compression,
+                        )),
+                    )
+                    .await
+                    .context("Could not write inputs for compilation")?;
+
+                JobInputSource::Archive(job_inputs)
             };
-
-            inputs_packager
-                .write_inputs(
-                    &mut path_transformer,
-                    crate::dist::pkg::InputsCompressor::new(flate2::write::ZlibEncoder::new(
-                        job_inputs.reopen()?,
-                        compression,
-                    )),
-                )
-                .await
-                .context("Could not write inputs for compilation")?;
-
-            job_inputs
-        };
 
         trace!("[{out_pretty}]: Identifying dist toolchain for {executable:?}");
 
@@ -1503,7 +1535,7 @@ where
                 trace!("[{out_pretty}]: Requesting job allocation");
 
                 match dist_client
-                    .new_job(dist_toolchain.clone(), job_inputs.reopen()?)
+                    .new_job(dist_toolchain.clone(), job_inputs.open()?)
                     .await
                 {
                     Ok(res) => {
@@ -1521,7 +1553,7 @@ where
             if !has_inputs {
                 debug!("[{out_pretty}, {job_id}]: Resubmitting job inputs");
                 match dist_client
-                    .put_job(job_id, job_inputs.reopen()?)
+                    .put_job(job_id, job_inputs.open()?)
                     .await
                     .map_err(|e| e.context("Could not submit job inputs"))
                 {
@@ -4771,10 +4803,10 @@ mod test_dist {
     }
     #[async_trait]
     impl dist::Client for ErrorPutToolchainClient {
-        async fn new_job(&self, _: Toolchain, _: std::fs::File) -> Result<NewJobResponse> {
+        async fn new_job(&self, _: Toolchain, _: dist::JobInputs) -> Result<NewJobResponse> {
             unreachable!()
         }
-        async fn put_job(&self, _: &str, _: std::fs::File) -> Result<()> {
+        async fn put_job(&self, _: &str, _: dist::JobInputs) -> Result<()> {
             unreachable!()
         }
         async fn del_job(&self, _: &str) -> Result<()> {
@@ -4845,11 +4877,11 @@ mod test_dist {
     }
     #[async_trait]
     impl dist::Client for ErrorAllocJobClient {
-        async fn new_job(&self, tc: Toolchain, _: std::fs::File) -> Result<NewJobResponse> {
+        async fn new_job(&self, tc: Toolchain, _: dist::JobInputs) -> Result<NewJobResponse> {
             assert_eq!(self.tc, tc);
             Err(anyhow!("MOCK: alloc job failure"))
         }
-        async fn put_job(&self, _: &str, _: std::fs::File) -> Result<()> {
+        async fn put_job(&self, _: &str, _: dist::JobInputs) -> Result<()> {
             unreachable!()
         }
         async fn del_job(&self, _: &str) -> Result<()> {
@@ -4927,7 +4959,7 @@ mod test_dist {
 
     #[async_trait]
     impl dist::Client for ErrorSubmitToolchainClient {
-        async fn new_job(&self, tc: Toolchain, _: std::fs::File) -> Result<NewJobResponse> {
+        async fn new_job(&self, tc: Toolchain, _: dist::JobInputs) -> Result<NewJobResponse> {
             assert!(
                 !self
                     .has_started
@@ -4942,7 +4974,7 @@ mod test_dist {
                 timeout: 10,
             })
         }
-        async fn put_job(&self, _: &str, _: std::fs::File) -> Result<()> {
+        async fn put_job(&self, _: &str, _: dist::JobInputs) -> Result<()> {
             unreachable!()
         }
         async fn del_job(&self, _: &str) -> Result<()> {
@@ -5021,7 +5053,7 @@ mod test_dist {
 
     #[async_trait]
     impl dist::Client for ErrorRunJobClient {
-        async fn new_job(&self, tc: Toolchain, _: std::fs::File) -> Result<NewJobResponse> {
+        async fn new_job(&self, tc: Toolchain, _: dist::JobInputs) -> Result<NewJobResponse> {
             assert!(
                 !self
                     .has_started
@@ -5036,7 +5068,7 @@ mod test_dist {
                 timeout: 10,
             })
         }
-        async fn put_job(&self, _: &str, _: std::fs::File) -> Result<()> {
+        async fn put_job(&self, _: &str, _: dist::JobInputs) -> Result<()> {
             unreachable!()
         }
         async fn del_job(&self, _: &str) -> Result<()> {
@@ -5132,7 +5164,7 @@ mod test_dist {
 
     #[async_trait]
     impl dist::Client for OneshotClient {
-        async fn new_job(&self, tc: Toolchain, _: std::fs::File) -> Result<NewJobResponse> {
+        async fn new_job(&self, tc: Toolchain, _: dist::JobInputs) -> Result<NewJobResponse> {
             assert!(
                 !self
                     .has_started
@@ -5146,7 +5178,7 @@ mod test_dist {
                 timeout: 10,
             })
         }
-        async fn put_job(&self, _: &str, _: std::fs::File) -> Result<()> {
+        async fn put_job(&self, _: &str, _: dist::JobInputs) -> Result<()> {
             unreachable!()
         }
         async fn del_job(&self, _: &str) -> Result<()> {

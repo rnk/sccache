@@ -970,13 +970,45 @@ pub trait BuilderIncoming: Send + Sync {
     async fn shutdown(&self);
 }
 
+/// How a job's inputs reach the client.
+///
+/// sccache-dist has always sent one compressed archive, because that archive
+/// is what goes over the wire. A client that content-addresses each input
+/// separately wants the opposite -- the list of things to stage, so it can
+/// hash them in place and upload only what the server lacks. Both describe
+/// the same tree; see [`pkg::InputEntry`].
+pub enum JobInputs {
+    /// A zlib-compressed tar, with root-relative entry paths.
+    Archive(std::fs::File),
+    /// Individually named inputs, still on the local filesystem.
+    ///
+    /// Shared rather than owned because a job may be submitted more than once
+    /// -- the retry path re-sends inputs after a server reports them missing.
+    Entries(Arc<Vec<pkg::InputEntry>>),
+}
+
+impl JobInputs {
+    /// The archive, for clients that only understand one.
+    ///
+    /// Unreachable for those clients in practice: the caller only produces
+    /// `Entries` when [`Client::stages_inputs_individually`] said to.
+    pub fn into_archive(self) -> Result<std::fs::File> {
+        match self {
+            JobInputs::Archive(file) => Ok(file),
+            JobInputs::Entries(_) => {
+                bail!("This dist client requires an inputs archive, but got individual inputs")
+            }
+        }
+    }
+}
+
 /////////
 #[async_trait]
 pub trait Client: Send + Sync {
     // To Scheduler
-    async fn new_job(&self, toolchain: Toolchain, inputs: std::fs::File) -> Result<NewJobResponse>;
+    async fn new_job(&self, toolchain: Toolchain, inputs: JobInputs) -> Result<NewJobResponse>;
     // To Scheduler
-    async fn put_job(&self, job_id: &str, inputs: std::fs::File) -> Result<()>;
+    async fn put_job(&self, job_id: &str, inputs: JobInputs) -> Result<()>;
     // To Scheduler
     async fn del_job(&self, job_id: &str) -> Result<()>;
     // To Scheduler
@@ -1043,6 +1075,19 @@ pub trait Client: Send + Sync {
     /// Defaults to true, which is the sccache-dist behaviour.
     fn ships_inputs_archive(&self) -> bool {
         true
+    }
+
+    /// Does this client want inputs as individual files rather than as an
+    /// archive?
+    ///
+    /// Saying yes lets the client hash each input where it lies and remember
+    /// the result, instead of having every byte copied through a tar on every
+    /// job. Only honoured when the packager can enumerate its inputs; see
+    /// [`pkg::InputsPackager::can_list_inputs`].
+    ///
+    /// Defaults to false, which is the sccache-dist behaviour.
+    fn stages_inputs_individually(&self) -> bool {
+        false
     }
 
     async fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf>;

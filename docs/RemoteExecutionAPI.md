@@ -201,6 +201,63 @@ lives with.
 `argv[0]` is relative (`work/toolchain/bin/clang`) and contains a `/`, so
 `execve` resolves it against the cwd (= input root) rather than `PATH`.
 
+## Staging inputs without an archive
+
+sccache's dist path packages a job's inputs into a zlib'd tar. That is the
+right shape for sccache-dist, where the archive is what travels to the
+scheduler. It is the wrong shape here, for two reasons.
+
+The cheap one is copying. Building the archive reads every input and writes it
+again; the client then decompresses and parses it *twice* -- once to digest
+the entries, once to extract the blobs the server turned out to be missing --
+for content that was already sitting on the local disk. For a 500-input LLVM
+translation unit that is ~10 MB written and ~20 MB read back, per compile,
+plus deflate.
+
+The expensive one is that the archive destroys the daemon's ability to
+remember anything. Every byte has to pass through the tar on every job, so
+knowing that a header is unchanged since the last thousand compiles saves
+nothing -- the work has already been done by the time the client sees it.
+
+So `InputsPackager` can also enumerate its inputs, as `Vec<InputEntry>`
+(`can_list_inputs`/`list_inputs`), and `dist::Client` can ask for that form
+(`stages_inputs_individually`). Both describe the same tree; the C/C++
+packager computes the input set once and then serializes it either way, so
+the two cannot drift. A test asserts the resulting REv2 action digests are
+identical, because a divergence there would silently cost every remote action
+cache hit.
+
+With paths rather than bytes, `DigestCache` can do the obvious thing: key a
+SHA-256 on `(dev, ino, size, mtime, ctime)` and skip the read entirely when a
+file still looks the same. LLVM headers are shared across thousands of
+translation units, so steady-state this replaces almost all input hashing
+with `stat` calls -- ~10ms of hashing becomes ~1.2ms of `stat` for that same
+translation unit.
+
+Rust has no `list_inputs` implementation and still sends an archive.
+
+Measured over 1300 identical LLVM CodeGen compiles, all distributed:
+
+| | wall | daemon CPU |
+| --- | --- | --- |
+| archive, `Compression::best()` | 142.8s | 690.5s |
+| archive, `Compression::none()` | 117.7s | 334.1s |
+| individual inputs + digest cache | 88.5s | 240.4s |
+
+### Stat-based caching is a trust assumption
+
+`DigestCache` believes the filesystem. A file whose contents are replaced by
+different contents of the same length, with both `mtime` and `ctime` restored,
+is indistinguishable from an unchanged one. `ctime` cannot be set without
+privileges, which closes the accidental version of this; the deliberate
+version, and filesystems with coarse timestamps, remain. Every stat-based
+build cache -- ccache's direct mode, Bazel's local digest cache -- carries the
+same assumption.
+
+The upload path re-verifies: a file read for upload is hashed again and the
+job fails if it no longer matches what the input root promised, so a
+mid-build edit cannot poison the shared CAS with mislabelled content.
+
 ## Toolchain model
 
 Scope decision: **assume a well-behaved, relocatable compiler.** Verified
