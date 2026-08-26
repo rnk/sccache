@@ -173,6 +173,7 @@ impl CCompilerImpl for Clang {
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
         rewrite_includes_only: bool,
+        stage_sources: bool,
         _hash_key: &str,
     ) -> Result<(
         impl CompileCommandImpl,
@@ -187,6 +188,7 @@ impl CCompilerImpl for Clang {
             env_vars,
             self.kind(),
             rewrite_includes_only,
+            stage_sources,
         )
     }
 }
@@ -1417,6 +1419,7 @@ mod test {
             f.tempdir.path(),
             &[],
             CCompilerKind::Clang,
+            false,
             false,
         )
         .unwrap();

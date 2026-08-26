@@ -1396,6 +1396,7 @@ where
         env_vars: Vec<(OsString, OsString)>,
         pool: &tokio::runtime::Handle,
         _rewrite_includes_only: bool,
+        _stage_sources: bool,
         _storage: Arc<dyn Storage>,
         cache_control: CacheControl,
     ) -> Result<(
@@ -1784,6 +1785,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         &self,
         _path_transformer: &mut dist::PathTransformer,
         _rewrite_includes_only: bool,
+        _stage_sources: bool,
         _hash_key: &str,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
@@ -3598,6 +3600,7 @@ proc_macro false
                 .to_vec(),
                 &pool,
                 false,
+                false,
                 storage.clone(),
                 CacheControl::Default,
             )
@@ -3698,6 +3701,7 @@ proc_macro false
                 f.tempdir.path().to_owned(),
                 env_vars.to_owned(),
                 &pool,
+                false,
                 false,
                 storage.clone(),
                 CacheControl::Default,

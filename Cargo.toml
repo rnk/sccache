@@ -106,7 +106,16 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, opti
   "push-gateway-no-tls-provider",
 ] }
 metrics-util = { version = "0.20", default-features = false, optional = true }
+prost = { version = "0.13", optional = true }
+prost-types = { version = "0.13", optional = true }
 rustix = { version = "1", features = ["fs", "process"] }
+tonic = { version = "0.13", default-features = false, features = [
+  "codegen",
+  "prost",
+  "transport",
+  "tls-ring",
+  "tls-native-roots",
+], optional = true }
 rustls = { version = "0.23", default-features = false, features = [
   "logging",
   "std",
@@ -210,6 +219,16 @@ serial_test = "3.1"
 temp-env = "0.3.6"
 test-case = "3.3.1"
 thirtyfour = "0.36"
+# The `router` feature (and its axum dependency) is only needed by the fake REv2
+# service used in `src/dist/reapi/tests.rs`. Keeping it in dev-dependencies keeps
+# it out of release builds; the v2/v3 feature resolver does not unify
+# dev-dependency features into normal builds.
+tonic = { version = "0.13", default-features = false, features = [
+  "codegen",
+  "prost",
+  "router",
+  "transport",
+] }
 version-compare = { version = "0.1.1" }
 
 [target.'cfg(unix)'.dependencies]
@@ -274,6 +293,11 @@ dist-client = [
   "url",
   "sha2",
 ]
+# Enables Bazel Remote Execution v2 (REAPI) support in the sccache client, so
+# sccache can distribute compilations to any generic REv2 service rather than to
+# an sccache-dist scheduler. Purely additive: with this off, sccache builds and
+# behaves exactly as before.
+dist-client-reapi = ["dist-client", "prost", "prost-types", "tonic"]
 # Enables the sccache-dist binary
 dist-server = [
   "axum-extra",
@@ -304,7 +328,7 @@ dist-server = [
 dist-tests = ["dist-client", "dist-server"]
 
 [workspace]
-exclude = ["tests/test-crate"]
+exclude = ["scripts/gen-reapi-proto", "tests/test-crate"]
 members = ["tests/integration/randomize_readdir"]
 
 [[bench]]

@@ -131,6 +131,7 @@ impl CCompilerImpl for TaskingVX {
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
         _rewrite_includes_only: bool,
+        _stage_sources: bool,
         _hash_key: &str,
     ) -> Result<(
         impl CompileCommandImpl,

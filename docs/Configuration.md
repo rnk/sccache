@@ -39,6 +39,33 @@ cache_dir = "/home/user/.cache/sccache-dist-client"
 type = "token"
 token = "secrettoken"
 
+# Distribute to a generic Bazel Remote Execution v2 service instead of to an
+# sccache-dist scheduler. Setting `url` here takes precedence over
+# `dist.scheduler_url`. Requires the `dist-client-reapi` feature.
+# See docs/RemoteExecutionAPI.md.
+#[dist.reapi]
+# grpc:// or grpcs://
+url = "grpc://localhost:50051"
+# REv2 instance name; many servers use the empty string
+instance_name = "main"
+# "inputs" ships the compiler to the worker in the action's input root and
+# requires a relocatable compiler (clang, not gcc). "image" assumes the
+# compiler already exists in the worker's container image.
+toolchain = "inputs"
+# "sources" (default) compiles the original source remotely, staging every file
+# the preprocessor opened as an individual, content-addressed input; a one-header
+# edit then re-uploads one header. "preprocessed" sends a single preprocessed
+# blob instead, the way sccache-dist does.
+stage = "sources"
+# per-action timeout in seconds
+action_timeout_secs = 600
+# environment variables forwarded to the remote action; deliberately an
+# allowlist, not the whole environment
+env_passthrough = ["SOURCE_DATE_EPOCH"]
+
+#[dist.reapi.platform]
+OSFamily = "Linux"
+
 # Multi-level cache configuration
 # Define cache levels in order (fast to slow).
 # Each level must be separately configured below.
@@ -187,6 +214,20 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_DIST_CONNECT_TIMEOUT` timeout in seconds for connections to an sccache-dist server. Default is `5`.
 * `SCCACHE_DIST_REQUEST_TIMEOUT` timeout in seconds for compile requests to an sccache-dist server. Default is `600`.
 * `SCCACHE_DIST_RETRY_LIMIT` number of times the client should retry failed distributed compilations. The default is `0` (no retries). If set to `inf`, the client will infinitely retry compilations and never fallback to building locally.
+
+### dist: remote execution (REAPI v2)
+
+These require the `dist-client-reapi` feature. See [the remote execution doc](RemoteExecutionAPI.md).
+
+* `SCCACHE_DIST_REAPI_URL` endpoint of a Bazel Remote Execution v2 service, e.g. `grpc://host:50051` or `grpcs://host:443`. Setting this selects remote execution in preference to `SCCACHE_DIST_SCHEDULER_URL`.
+* `SCCACHE_DIST_REAPI_INSTANCE` REv2 instance name. Default is the empty string.
+* `SCCACHE_DIST_REAPI_TOOLCHAIN` `inputs` (default) to send the compiler to the worker in the action's input root, or `image` to assume it is already present in the worker's container image.
+* `SCCACHE_DIST_REAPI_STAGE` `sources` (default) to compile the original source remotely with its dependencies staged individually, or `preprocessed` to send a single preprocessed blob. `sources` uses substantially less upload bandwidth and shares inputs with other clients; `preprocessed` is the sccache-dist behaviour, kept as an escape hatch.
+* `SCCACHE_DIST_REAPI_PLATFORM` platform properties for every action, as `name=value,name=value`, e.g. `OSFamily=Linux`.
+* `SCCACHE_DIST_REAPI_ACTION_TIMEOUT` per-action execution timeout in seconds. Default is `600`.
+* `SCCACHE_DIST_REAPI_ENV_PASSTHROUGH` comma-separated environment variable names to forward to the remote action. Default is `SOURCE_DATE_EPOCH`.
+* `SCCACHE_DIST_REAPI_SKIP_CACHE_LOOKUP` set to `true` to ask the server to skip its action cache.
+* `SCCACHE_DIST_REAPI_DO_NOT_CACHE` set to `true` to ask the server not to cache action results.
 
 ### cache configs
 

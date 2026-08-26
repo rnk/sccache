@@ -636,6 +636,7 @@ where
         env_vars: Vec<(OsString, OsString)>,
         pool: &tokio::runtime::Handle,
         rewrite_includes_only: bool,
+        stage_sources: bool,
         storage: Arc<dyn Storage>,
         cache_control: CacheControl,
     ) -> Result<(
@@ -691,6 +692,14 @@ where
             .map(|client| client.rewrite_includes_only())
             .unwrap_or_default();
 
+        // Whether the remote action compiles the original source, with its
+        // dependencies staged individually, rather than a single preprocessed
+        // blob. See `dist::Client::stage_sources`.
+        let stage_sources = dist_client
+            .as_ref()
+            .map(|client| client.stage_sources())
+            .unwrap_or_default();
+
         let hash_result = self
             .generate_hash_key(
                 service,
@@ -699,6 +708,7 @@ where
                 env_vars,
                 &runtime,
                 rewrite_includes_only,
+                stage_sources,
                 preprocessor_storage.clone(),
                 cache_control,
             )
@@ -744,6 +754,7 @@ where
             dist_client,
             out_pretty.clone(),
             rewrite_includes_only,
+            stage_sources,
             runtime.clone(),
             service,
         );
@@ -900,6 +911,7 @@ struct CacheLookupOrCompile<'a, T: CommandCreatorSync> {
     outputs: Vec<FileObjectSource>,
     filtered_outputs: Vec<FileObjectSource>,
     rewrite_includes_only: bool,
+    stage_sources: bool,
     runtime: tokio::runtime::Handle,
     sccache_service: &'a server::SccacheService<T>,
     weak_toolchain_key: String,
@@ -918,6 +930,7 @@ where
         dist_client: Option<Arc<dyn dist::Client>>,
         out_pretty: String,
         rewrite_includes_only: bool,
+        stage_sources: bool,
         runtime: tokio::runtime::Handle,
         sccache_service: &'a server::SccacheService<T>,
     ) -> Self {
@@ -968,6 +981,7 @@ where
             outputs,
             filtered_outputs,
             rewrite_includes_only,
+            stage_sources,
             runtime,
             sccache_service,
             weak_toolchain_key,
@@ -1027,7 +1041,7 @@ where
         let mut path_transformer = dist::PathTransformer::new();
 
         let (compile_cmd, _dist_compile_cmd, cacheable) = compilation
-            .generate_compile_commands(&mut path_transformer, true, &hash_key)
+            .generate_compile_commands(&mut path_transformer, true, false, &hash_key)
             .context("Failed to generate compile commands")?;
 
         Ok(Compile {
@@ -1054,6 +1068,7 @@ where
             out_pretty,
             outputs,
             rewrite_includes_only,
+            stage_sources,
             sccache_service,
             weak_toolchain_key,
             ..
@@ -1062,7 +1077,12 @@ where
         let mut path_transformer = dist::PathTransformer::new();
 
         let (compile_cmd, dist_compile_cmd, cacheable) = compilation
-            .generate_compile_commands(&mut path_transformer, rewrite_includes_only, &hash_key)
+            .generate_compile_commands(
+                &mut path_transformer,
+                rewrite_includes_only,
+                stage_sources,
+                &hash_key,
+            )
             .context("Failed to generate compile commands")?;
 
         let dist = dist_client.and_then(|dist_client| {
@@ -1805,6 +1825,7 @@ where
         &self,
         path_transformer: &mut dist::PathTransformer,
         rewrite_includes_only: bool,
+        stage_sources: bool,
         hash_key: &str,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
@@ -3444,6 +3465,7 @@ LLVM version: 6.0",
                         vec![],
                         pool,
                         false,
+                        false,
                         preprocessor_storage.clone(),
                         CacheControl::Default,
                     )
@@ -3525,6 +3547,7 @@ LLVM version: 6.0",
                         vec![],
                         pool,
                         false,
+                        false,
                         storage.clone(),
                         CacheControl::Default,
                     )
@@ -3601,6 +3624,7 @@ LLVM version: 6.0",
                         cwd.to_path_buf(),
                         vec![],
                         pool,
+                        false,
                         false,
                         storage.clone(),
                         CacheControl::Default,

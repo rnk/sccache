@@ -28,7 +28,7 @@ use serde::{
 #[cfg(test)]
 use serial_test::serial;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env, fmt,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -1170,6 +1170,178 @@ impl Default for DistNetworkingKeepalive {
     }
 }
 
+/// How the compiler reaches the remote execution worker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReapiToolchainMode {
+    /// Ship the packaged toolchain to the worker as part of the action's input
+    /// root, and invoke it through a path relative to the working directory.
+    ///
+    /// This requires a *relocatable* compiler: one that resolves its own
+    /// resources relative to `argv[0]`/`/proc/self/exe` rather than by absolute
+    /// path, and that does not exec helper binaries (`cc1plus`, `as`) by
+    /// absolute path. Clang satisfies this; GCC does not.
+    #[default]
+    Inputs,
+    /// Assume the compiler already exists in the worker's container image at
+    /// the same absolute path it has locally, and send no toolchain at all.
+    /// This is what `recc`-style setups usually do.
+    Image,
+}
+
+/// What the remote action actually compiles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReapiStageMode {
+    /// Compile the original source, staging it and every file the preprocessor
+    /// opened as individual inputs. This is how a conventional remote
+    /// execution client works, and it is the default.
+    ///
+    /// Each input is content-addressed and deduplicated by the server, so
+    /// editing one header re-uploads one header. The preprocessed form of a
+    /// single translation unit, by contrast, is a multi-megabyte blob that has
+    /// to be sent in full every time even though it duplicates content already
+    /// being staged file by file. Measured on `llvm/lib/Support/CommandLine.cpp`,
+    /// the preprocessed blob was 3.4 MB of a 6.9 MB payload. Developer machines
+    /// have asymmetric links, so uplink is the scarce direction: it is worth
+    /// paying for a larger object on the way back.
+    #[default]
+    Sources,
+    /// Send a single preprocessed blob and compile that.
+    ///
+    /// This is what sccache-dist does. It is kept as an escape hatch for
+    /// toolchains where remote preprocessing misbehaves, and is expected to be
+    /// removed once `sources` has proven itself -- at which point the
+    /// `stage_sources` plumbing and the `.dist.cpp` staging path can go with it.
+    Preprocessed,
+}
+
+/// Configuration for distributing compilations over the Bazel Remote Execution
+/// v2 API instead of to an sccache-dist scheduler.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct ReapiConfig {
+    /// Endpoint of the remote execution service, e.g.
+    /// `grpc://localhost:50051` or `grpcs://remote.example.com:443`.
+    /// When unset, REv2 support is inactive and sccache uses `scheduler_url`.
+    pub url: Option<String>,
+    /// REv2 instance name. Many servers use the empty string.
+    pub instance_name: String,
+    /// How the compiler reaches the worker.
+    pub toolchain: ReapiToolchainMode,
+    /// What the remote action compiles: the original sources, or a
+    /// preprocessed blob.
+    pub stage: ReapiStageMode,
+    /// Platform properties attached to every action, e.g. `OSFamily = "Linux"`
+    /// or `container-image = "docker://..."`.
+    pub platform: BTreeMap<String, String>,
+    /// Per-action execution timeout, in seconds.
+    pub action_timeout_secs: u64,
+    /// Ask the server to skip its action cache lookup. sccache's own object
+    /// cache is normally consulted first, so a remote action cache hit is only
+    /// possible when the two disagree; leaving the lookup enabled is free.
+    pub skip_cache_lookup: bool,
+    /// Ask the server not to cache the action result at all.
+    pub do_not_cache: bool,
+    /// Environment variables to forward to the remote action.
+    ///
+    /// Deliberately an allowlist rather than the client's whole environment:
+    /// forwarding everything would leak secrets to the worker and would give
+    /// every developer a different action digest for identical work, making
+    /// the server's action cache useless. Compiling preprocessed source needs
+    /// almost nothing from the environment.
+    pub env_passthrough: Vec<String>,
+}
+
+impl ReapiConfig {
+    pub fn with_env_or_config(self) -> Self {
+        Self {
+            url: env::var("SCCACHE_DIST_REAPI_URL").ok().or(self.url),
+            instance_name: env::var("SCCACHE_DIST_REAPI_INSTANCE").unwrap_or(self.instance_name),
+            toolchain: env::var("SCCACHE_DIST_REAPI_TOOLCHAIN")
+                .ok()
+                .and_then(|val| match val.to_ascii_lowercase().as_str() {
+                    "inputs" => Some(ReapiToolchainMode::Inputs),
+                    "image" => Some(ReapiToolchainMode::Image),
+                    _ => {
+                        warn!(
+                            "Ignoring unrecognized SCCACHE_DIST_REAPI_TOOLCHAIN={val:?}, \
+                             expected \"inputs\" or \"image\""
+                        );
+                        None
+                    }
+                })
+                .unwrap_or(self.toolchain),
+            stage: env::var("SCCACHE_DIST_REAPI_STAGE")
+                .ok()
+                .and_then(|val| match val.to_ascii_lowercase().as_str() {
+                    "sources" => Some(ReapiStageMode::Sources),
+                    "preprocessed" => Some(ReapiStageMode::Preprocessed),
+                    _ => {
+                        warn!(
+                            "Ignoring unrecognized SCCACHE_DIST_REAPI_STAGE={val:?}, \
+                             expected \"sources\" or \"preprocessed\""
+                        );
+                        None
+                    }
+                })
+                .unwrap_or(self.stage),
+            platform: env::var("SCCACHE_DIST_REAPI_PLATFORM")
+                .ok()
+                .map(|val| {
+                    // "name=value,name=value"
+                    val.split(',')
+                        .filter(|kv| !kv.trim().is_empty())
+                        .filter_map(|kv| {
+                            kv.split_once('=')
+                                .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+                        })
+                        .collect()
+                })
+                .unwrap_or(self.platform),
+            action_timeout_secs: number_from_env_var("SCCACHE_DIST_REAPI_ACTION_TIMEOUT")
+                .map(|val| val.unwrap_or(self.action_timeout_secs))
+                .unwrap_or(self.action_timeout_secs),
+            skip_cache_lookup: bool_from_env_var("SCCACHE_DIST_REAPI_SKIP_CACHE_LOOKUP")
+                .map(|val| val.unwrap_or(self.skip_cache_lookup))
+                .unwrap_or(self.skip_cache_lookup),
+            do_not_cache: bool_from_env_var("SCCACHE_DIST_REAPI_DO_NOT_CACHE")
+                .map(|val| val.unwrap_or(self.do_not_cache))
+                .unwrap_or(self.do_not_cache),
+            env_passthrough: env::var("SCCACHE_DIST_REAPI_ENV_PASSTHROUGH")
+                .ok()
+                .map(|val| {
+                    val.split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or(self.env_passthrough),
+        }
+    }
+}
+
+impl Default for ReapiConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            instance_name: String::new(),
+            toolchain: ReapiToolchainMode::default(),
+            stage: ReapiStageMode::default(),
+            platform: Default::default(),
+            action_timeout_secs: 600,
+            skip_cache_lookup: false,
+            do_not_cache: false,
+            // `SOURCE_DATE_EPOCH` is the one variable that routinely changes
+            // compiler output (it seeds `__DATE__`/`__TIME__`), so leaving it
+            // behind would produce objects that differ from a local build.
+            env_passthrough: vec!["SOURCE_DATE_EPOCH".to_owned()],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
@@ -1180,6 +1352,7 @@ pub struct DistConfig {
     // f64 to allow `max_retries = inf`, i.e. never fallback to local compile
     pub max_retries: f64,
     pub net: DistNetworking,
+    pub reapi: ReapiConfig,
     pub rewrite_includes_only: bool,
     #[cfg(any(feature = "dist-client", feature = "dist-server"))]
     pub scheduler_url: Option<HTTPUrl>,
@@ -1195,6 +1368,7 @@ impl DistConfig {
         Self {
             auth: self.auth.with_env_or_config(),
             net: self.net.with_env_or_config(),
+            reapi: self.reapi.with_env_or_config(),
             #[cfg(any(feature = "dist-client", feature = "dist-server"))]
             scheduler_url: env::var("SCCACHE_DIST_SCHEDULER_URL")
                 .map_err(Into::into)
@@ -1224,6 +1398,7 @@ impl Default for DistConfig {
             fallback_to_local_compile: true,
             max_retries: 0f64,
             net: Default::default(),
+            reapi: Default::default(),
             rewrite_includes_only: false,
             scheduler_url: Default::default(),
             toolchains: Default::default(),

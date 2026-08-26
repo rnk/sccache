@@ -132,6 +132,9 @@ pub fn init_logging() {
 
 pub use self::path_transform::PathTransformer;
 
+#[cfg(feature = "dist-client-reapi")]
+pub mod reapi;
+
 #[cfg(feature = "dist-client")]
 pub mod pkg;
 #[cfg(not(feature = "dist-client"))]
@@ -528,7 +531,11 @@ pub fn strings_to_osstrings(strings: &[String]) -> Vec<OsString> {
 #[serde(deny_unknown_fields)]
 pub struct OutputData(Vec<u8>, u64);
 impl OutputData {
-    #[cfg(any(feature = "dist-server", all(feature = "dist-client", test)))]
+    #[cfg(any(
+        feature = "dist-server",
+        feature = "dist-client-reapi",
+        all(feature = "dist-client", test)
+    ))]
     pub fn try_from_reader<R: std::io::Read>(reader: R) -> std::io::Result<Self> {
         let mut compressor = flate2::read::ZlibEncoder::new(
             reader,
@@ -1004,5 +1011,21 @@ pub trait Client: Send + Sync {
     fn max_retries(&self) -> f64;
     fn request_timeout(&self) -> u32;
     fn rewrite_includes_only(&self) -> bool;
+    /// Should the remote action compile the *original* source, with its
+    /// dependencies staged as individual inputs, rather than a single
+    /// preprocessed blob?
+    ///
+    /// Staging sources is what a conventional remote execution client does,
+    /// and it is a large uplink win: the preprocessed form of one translation
+    /// unit duplicates content that is already being staged file by file, and
+    /// each of those files is content-addressed, so a one-header edit
+    /// re-uploads one header instead of a multi-megabyte blob. That matters
+    /// most on the asymmetric links developer machines actually have.
+    ///
+    /// Defaults to false so that sccache-dist, which unpacks a job into an
+    /// overlay and expects a preprocessed input, is unaffected.
+    fn stage_sources(&self) -> bool {
+        false
+    }
     async fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf>;
 }

@@ -149,6 +149,12 @@ pub struct DistClientConfig {
     toolchain_cache_size: u64,
     toolchains: Vec<config::DistToolchainConfig>,
     rewrite_includes_only: bool,
+    #[cfg(feature = "dist-client-reapi")]
+    reapi: config::ReapiConfig,
+    /// Tracked even when the feature is off, so a REAPI URL that cannot be
+    /// honoured is reported rather than silently dropped.
+    #[cfg(not(feature = "dist-client-reapi"))]
+    dist_reapi_url_set: bool,
 }
 
 #[cfg(feature = "dist-client")]
@@ -207,6 +213,10 @@ impl DistClientContainer {
             toolchain_cache_size: config.dist.toolchain_cache_size,
             toolchains: config.dist.toolchains.clone(),
             rewrite_includes_only: config.dist.rewrite_includes_only,
+            #[cfg(feature = "dist-client-reapi")]
+            reapi: config.dist.reapi.clone(),
+            #[cfg(not(feature = "dist-client-reapi"))]
+            dist_reapi_url_set: config.dist.reapi.url.is_some(),
         };
         let state = Self::create_state(config);
         let state = pool.block_on(state);
@@ -349,6 +359,60 @@ impl DistClientContainer {
                 }
             }};
         }
+        // Configuring a remote execution endpoint in a build that cannot use
+        // one would otherwise fall through to `scheduler_url` and, if that is
+        // unset, compile everything locally with no explanation.
+        #[cfg(not(feature = "dist-client-reapi"))]
+        if config.dist_reapi_url_set {
+            warn!(
+                "A remote execution URL is configured, but this sccache was built without \
+                 the `dist-client-reapi` feature; ignoring it"
+            );
+        }
+
+        // A remote execution endpoint takes precedence over an sccache-dist
+        // scheduler: configuring one is an explicit opt in to REv2.
+        #[cfg(feature = "dist-client-reapi")]
+        if config.reapi.url.is_some() {
+            let auth_token = match &config.auth {
+                config::DistAuth::Token { token } if !token.is_empty() => Some(token.to_owned()),
+                _ => None,
+            };
+            info!(
+                "Enabling remote execution (REAPI v2) to {}",
+                config.reapi.url.as_deref().unwrap_or_default()
+            );
+            let dist_client = dist::reapi::Client::new(
+                config.reapi.clone(),
+                &config.cache_dir.join("client"),
+                config.toolchain_cache_size,
+                &config.toolchains,
+                auth_token,
+                config.fallback_to_local_compile,
+                config.max_retries,
+                config.rewrite_includes_only,
+                &config.net,
+            )
+            .await;
+            let dist_client = try_or_retry_later!(
+                dist_client.context("failure during remote execution client creation")
+            );
+            use crate::dist::Client;
+            return match dist_client.get_status().await {
+                Ok(_) => {
+                    info!("Successfully created remote execution client");
+                    DistClientState::Some(Box::new(config), Arc::new(dist_client))
+                }
+                Err(e) => {
+                    warn!("Could not query the remote execution service: {e:#}");
+                    DistClientState::RetryCreateAt(
+                        Box::new(config),
+                        Instant::now() + DIST_CLIENT_RECREATE_TIMEOUT,
+                    )
+                }
+            };
+        }
+
         match config.scheduler_url {
             Some(ref addr) => {
                 let url = addr.to_url();
@@ -1324,6 +1388,10 @@ where
                 toolchain_cache_size: 0,
                 toolchains: vec![],
                 rewrite_includes_only: false,
+                #[cfg(feature = "dist-client-reapi")]
+                reapi: Default::default(),
+                #[cfg(not(feature = "dist-client-reapi"))]
+                dist_reapi_url_set: false,
             }),
             dist_client,
         )));

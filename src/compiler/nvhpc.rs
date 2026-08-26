@@ -245,6 +245,7 @@ impl CCompilerImpl for Nvhpc {
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
         rewrite_includes_only: bool,
+        stage_sources: bool,
         _hash_key: &str,
     ) -> Result<(
         impl CompileCommandImpl,
@@ -259,6 +260,7 @@ impl CCompilerImpl for Nvhpc {
             env_vars,
             self.kind(),
             rewrite_includes_only,
+            stage_sources,
         )
     }
 }

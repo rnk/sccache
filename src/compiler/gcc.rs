@@ -238,6 +238,7 @@ impl CCompilerImpl for Gcc {
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
         rewrite_includes_only: bool,
+        stage_sources: bool,
         _hash_key: &str,
     ) -> Result<(
         impl CompileCommandImpl,
@@ -252,6 +253,7 @@ impl CCompilerImpl for Gcc {
             env_vars,
             self.kind(),
             rewrite_includes_only,
+            stage_sources,
         )
     }
 }
@@ -1371,6 +1373,140 @@ pub async fn parse_dependencies<P: AsRef<Path>>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The compiler's *implicit* system include directories, discovered by asking
+/// it, and cached for the lifetime of the sccache daemon.
+///
+/// Staging sources means the remote compiler does its own header lookup, and
+/// its built-in search path is a list of absolute directories that only make
+/// sense on this machine. Left alone, a worker would search its own container
+/// image for `<type_traits>` instead of the headers we staged. So the search
+/// path is reproduced explicitly: `-nostdinc` drops the compiler's built-in
+/// list, and each discovered directory is passed back as `-isystem`, in order.
+/// The remote execution client then rewrites those that we ship to paths
+/// inside the action's input root.
+///
+/// The directories are found by asking the compiler twice and subtracting:
+/// once normally, and once with `-nostdinc`. The difference is exactly the
+/// implicit list, which avoids having to know which of the user's own flags
+/// were include paths.
+///
+/// This costs two compiler invocations, so the result is memoized in the
+/// daemon, keyed by the compiler binary and the flags that can change the
+/// answer (`--sysroot`, `--gcc-toolchain`, `-stdlib=`, `-m32`, ...). A build
+/// pays for it once, not once per translation unit -- the same reason the
+/// daemon caches toolchain hashes and per-file content digests rather than
+/// recomputing them for all fifty thousand compiles in a build.
+#[cfg(feature = "dist-client")]
+static SYSTEM_INCLUDE_DIRS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<u64, std::sync::Arc<Vec<PathBuf>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(feature = "dist-client")]
+fn system_include_dirs(
+    executable: &Path,
+    language: &str,
+    probe_args: &[OsString],
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> std::sync::Arc<Vec<PathBuf>> {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    executable.hash(&mut hasher);
+    language.hash(&mut hasher);
+    probe_args.hash(&mut hasher);
+    // The compiler binary itself can be replaced under us during a long-lived
+    // daemon's life; size and mtime are the same cheap staleness check the
+    // preprocessor dependency cache uses.
+    if let Ok(meta) = fs::metadata(executable) {
+        meta.len().hash(&mut hasher);
+        if let Ok(mtime) = meta.modified() {
+            mtime.hash(&mut hasher);
+        }
+    }
+    let key = hasher.finish();
+
+    if let Some(dirs) = SYSTEM_INCLUDE_DIRS.lock().unwrap().get(&key) {
+        return dirs.clone();
+    }
+
+    let probe = |extra: Option<&str>| -> Vec<PathBuf> {
+        let mut command = std::process::Command::new(executable);
+        command
+            .current_dir(cwd)
+            .env_clear()
+            .envs(env_vars.iter().cloned());
+        if let Some(extra) = extra {
+            command.arg(extra);
+        }
+        command.args(probe_args);
+        // `-E -v` on an empty file prints the search list and compiles nothing.
+        // `-x` is required: without it the empty file has no recognisable
+        // extension, the driver treats it as a linker input, and no search
+        // list is printed at all.
+        command.args(["-x", language, "-E", "-v", "-o"]);
+        command.arg(if cfg!(windows) { "NUL" } else { "/dev/null" });
+        command.arg(if cfg!(windows) { "NUL" } else { "/dev/null" });
+
+        let Ok(output) = command.output() else {
+            return Vec::new();
+        };
+        parse_include_search_list(&String::from_utf8_lossy(&output.stderr))
+    };
+
+    let all = probe(None);
+    let explicit = probe(Some("-nostdinc"));
+    let dirs: Vec<PathBuf> = all
+        .into_iter()
+        .filter(|dir| !explicit.contains(dir))
+        .collect();
+
+    if dirs.is_empty() {
+        warn!(
+            "Could not determine the system include directories for {}; \
+             remote compilation of unpreprocessed sources may not find system headers",
+            executable.display()
+        );
+    } else {
+        debug!(
+            "System include directories for {}: {dirs:?}",
+            executable.display()
+        );
+    }
+
+    let dirs = std::sync::Arc::new(dirs);
+    SYSTEM_INCLUDE_DIRS
+        .lock()
+        .unwrap()
+        .insert(key, dirs.clone());
+    dirs
+}
+
+/// Pull the `#include <...>` search list out of `-E -v` output.
+#[cfg(feature = "dist-client")]
+fn parse_include_search_list(stderr: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut in_list = false;
+    for line in stderr.lines() {
+        if line.starts_with("#include <...> search starts here:") {
+            in_list = true;
+        } else if line.starts_with("End of search list.") {
+            break;
+        } else if in_list {
+            let dir = Path::new(line.trim());
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            // The compiler prints these unresolved, e.g.
+            // `/usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15`.
+            // Resolve them so they match the paths the inputs were staged at.
+            dirs.push(dir.canonicalize().unwrap_or_else(|_| dir.to_owned()));
+        }
+    }
+    dirs
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn generate_compile_commands(
     path_transformer: &mut dist::PathTransformer,
     executable: &Path,
@@ -1379,6 +1515,7 @@ pub fn generate_compile_commands(
     env_vars: &[(OsString, OsString)],
     kind: CCompilerKind,
     rewrite_includes_only: bool,
+    stage_sources: bool,
 ) -> Result<(
     SingleCompileCommand,
     Option<dist::CompileCommand>,
@@ -1460,6 +1597,14 @@ pub fn generate_compile_commands(
     //    output is parsed by tools like CMake and must reflect the local toolchain
     // 2. ClangCUDA cannot be dist-compiled because Clang has separate host and
     //    device preprocessor outputs and cannot compile preprocessed CUDA files.
+    // `stage_sources` only applies where sccache would otherwise have sent a
+    // preprocessed blob. Languages that skip C preprocessing -- CudaFE, Ptx and
+    // Cubin, i.e. the cicc/cudafe/ptxas sub-actions of an nvcc compile -- already
+    // name their original input, and preprocessing is a structural part of that
+    // model, so they are deliberately left alone.
+    #[cfg(feature = "dist-client")]
+    let stage_sources = stage_sources && parsed_args.language.needs_c_preprocessing();
+
     let dist_command = if has_verbose_flag || parsed_args.language == Language::Cuda {
         None
     } else {
@@ -1474,7 +1619,10 @@ pub fn generate_compile_commands(
                     let mut language = language.map(|lang| lang.to_owned());
 
                     // https://gcc.gnu.org/onlinedocs/gcc-4.9.0/gcc/Overall-Options.html
-                    if !rewrite_includes_only && !parsed_args.language.is_c_like_header() {
+                    if !stage_sources
+                        && !rewrite_includes_only
+                        && !parsed_args.language.is_c_like_header()
+                    {
                         if let Some(processed_lang) =
                             parsed_args.language.to_c_preprocessed_language()
                         {
@@ -1500,9 +1648,49 @@ pub fn generate_compile_commands(
                     }
 
                     arguments.extend(dist::osstrings_to_strings(&parsed_args.arch_args)?);
+
+                    if stage_sources {
+                        // The remote compiler preprocesses for itself, so it
+                        // needs the include paths and macro definitions that
+                        // the preprocessed form had already baked in.
+                        arguments
+                            .extend(dist::osstrings_to_strings(&parsed_args.preprocessor_args)?);
+
+                        // Reproduce the compiler's built-in include search path
+                        // explicitly. Without this the worker resolves
+                        // `<type_traits>` against its own container image
+                        // rather than the headers we staged, because a
+                        // compiler's implicit search directories are absolute.
+                        // `--sysroot` is not enough on its own: clang locates
+                        // the libstdc++ headers by way of the GCC installation
+                        // directory, which a sysroot switch does not relocate.
+                        let probe_args = parsed_args
+                            .arch_args
+                            .iter()
+                            .chain(parsed_args.preprocessor_args.iter())
+                            .chain(common_args.iter())
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let system_dirs = system_include_dirs(
+                            executable,
+                            language.as_deref().unwrap_or("c++"),
+                            &probe_args,
+                            cwd,
+                            env_vars,
+                        );
+                        if !system_dirs.is_empty() {
+                            arguments.push("-nostdinc".into());
+                            for dir in system_dirs.iter() {
+                                arguments.push(format!("-isystem{}", path_to_string(dir).ok()?));
+                            }
+                        }
+                    }
+
                     arguments.extend(dist::osstrings_to_strings(&common_args)?);
 
-                    if let CCompilerKind::Gcc = kind {
+                    if let CCompilerKind::Gcc = kind
+                        && !stage_sources
+                    {
                         // From https://gcc.gnu.org/onlinedocs/gcc/Preprocessor-Options.html:
                         //
                         // -fdirectives-only
@@ -1566,9 +1754,7 @@ pub fn generate_compile_commands(
                     arguments.push(os_str_to_string(&parsed_args.compilation_flag).ok()?);
 
                     arguments.push(
-                        parsed_args
-                            .language
-                            .needs_c_preprocessing()
+                        (!stage_sources && parsed_args.language.needs_c_preprocessing())
                             .then(|| path_transformer.with_dist_extension(input))
                             .as_deref()
                             .or(Some(input))
@@ -3133,6 +3319,122 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_command_stages_preprocessed_by_default() {
+        let f = TestFixture::new();
+        let parsed_args = ParsedArguments {
+            input: "foo.cpp".into(),
+            language: Language::Cxx,
+            compilation_flag: "-c".into(),
+            outputs: vec![(
+                "obj",
+                ArtifactDescriptor {
+                    path: "foo.o".into(),
+                    optional: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            preprocessor_args: ovec!["-I/proj/include", "-DFOO=1"],
+            ..Default::default()
+        };
+        let mut path_transformer = dist::PathTransformer::new();
+        let (_, dist_command, _) = generate_compile_commands(
+            &mut path_transformer,
+            &f.bins[0],
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            CCompilerKind::Gcc,
+            false,
+            /* stage_sources */ false,
+        )
+        .unwrap();
+
+        let args = dist_command.unwrap().arguments;
+        // The remote action compiles the preprocessed copy...
+        assert!(args.iter().any(|a| a.ends_with("foo.dist.cpp")), "{args:?}");
+        assert!(args.contains(&"c++-cpp-output".to_owned()), "{args:?}");
+        assert!(args.contains(&"-fpreprocessed".to_owned()), "{args:?}");
+        // ...so it needs no include paths or macro definitions.
+        assert!(!args.contains(&"-I/proj/include".to_owned()), "{args:?}");
+        assert!(!args.contains(&"-DFOO=1".to_owned()), "{args:?}");
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_command_stages_sources() {
+        let f = TestFixture::new();
+        let parsed_args = ParsedArguments {
+            input: "foo.cpp".into(),
+            language: Language::Cxx,
+            compilation_flag: "-c".into(),
+            outputs: vec![(
+                "obj",
+                ArtifactDescriptor {
+                    path: "foo.o".into(),
+                    optional: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            preprocessor_args: ovec!["-I/proj/include", "-DFOO=1"],
+            ..Default::default()
+        };
+        let mut path_transformer = dist::PathTransformer::new();
+        let (_, dist_command, _) = generate_compile_commands(
+            &mut path_transformer,
+            &f.bins[0],
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            CCompilerKind::Gcc,
+            false,
+            /* stage_sources */ true,
+        )
+        .unwrap();
+
+        let args = dist_command.unwrap().arguments;
+        // The remote action compiles the original source...
+        assert!(args.iter().any(|a| a.ends_with("foo.cpp")), "{args:?}");
+        assert!(!args.iter().any(|a| a.contains(".dist.")), "{args:?}");
+        assert!(!args.contains(&"c++-cpp-output".to_owned()), "{args:?}");
+        assert!(!args.contains(&"-fpreprocessed".to_owned()), "{args:?}");
+        // ...so it must be told how to preprocess it.
+        assert!(args.contains(&"-I/proj/include".to_owned()), "{args:?}");
+        assert!(args.contains(&"-DFOO=1".to_owned()), "{args:?}");
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_parse_include_search_list() {
+        // Real `clang++ -E -v` output, trimmed.
+        let stderr = "\
+ignoring nonexistent directory \"/nope\"
+#include \"...\" search starts here:
+#include <...> search starts here:
+ /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15
+ /opt/toolchain/lib/clang/22/include
+ /usr/include
+End of search list.
+some trailing noise
+";
+        let dirs = parse_include_search_list(stderr);
+        // Non-existent paths cannot be canonicalized and are kept verbatim, so
+        // compare on the trailing component that identifies each entry.
+        let names: Vec<String> = dirs
+            .iter()
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names[0].ends_with("include/c++/15"), "{names:?}");
+        assert!(names[1].ends_with("clang/22/include"), "{names:?}");
+        assert!(names[2].ends_with("/usr/include"), "{names:?}");
+        // The quoted-include section and surrounding noise are ignored.
+        assert!(!names.iter().any(|n| n.contains("nope")), "{names:?}");
+    }
+
+    #[test]
     fn test_compile_simple() {
         let creator = new_creator();
         let f = TestFixture::new();
@@ -3168,6 +3470,7 @@ mod test {
             f.tempdir.path(),
             &[],
             CCompilerKind::Gcc,
+            false,
             false,
         )
         .unwrap();
@@ -3218,6 +3521,7 @@ mod test {
             &[],
             CCompilerKind::Gcc,
             false,
+            false,
         )
         .unwrap();
         // -v should never generate a dist_command
@@ -3265,6 +3569,7 @@ mod test {
             &[],
             CCompilerKind::Gcc,
             false,
+            false,
         )
         .unwrap();
         // --verbose should never generate a dist_command
@@ -3292,6 +3597,7 @@ mod test {
             f.tempdir.path(),
             &[],
             CCompilerKind::Clang,
+            false,
             false,
         )
         .unwrap();

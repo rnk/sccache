@@ -1,0 +1,9 @@
+[package]
+name = "reapi-gen"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+protox = "0.7"
+prost-build = "0.13"
+tonic-build = { version = "0.13", default-features = false, features = ["prost"] }

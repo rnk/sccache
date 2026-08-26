@@ -245,6 +245,7 @@ struct CCompilation<T: CommandCreatorSync, I: CCompilerImpl> {
     cwd: PathBuf,
     env_vars: Vec<(OsString, OsString)>,
     rewrite_includes_only: bool,
+    stage_sources: bool,
 }
 
 /// Supported C compilers.
@@ -443,6 +444,7 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
         rewrite_includes_only: bool,
+        stage_sources: bool,
         hash_key: &str,
     ) -> Result<(
         impl CompileCommandImpl,
@@ -858,6 +860,7 @@ where
         env_vars: Vec<(OsString, OsString)>,
         _pool: &tokio::runtime::Handle,
         rewrite_includes_only: bool,
+        stage_sources: bool,
         storage: Arc<dyn Storage>,
         cache_control: CacheControl,
     ) -> Result<(
@@ -901,6 +904,7 @@ where
                         is_locally_preprocessed: false,
                         parsed_args: self.parsed_args,
                         rewrite_includes_only,
+                        stage_sources,
                         service: service.to_owned(),
                     }),
                     weak_toolchain_key,
@@ -970,6 +974,7 @@ where
                             is_locally_preprocessed: false,
                             parsed_args: self.parsed_args,
                             rewrite_includes_only,
+                            stage_sources,
                             service: service.to_owned(),
                         }),
                         weak_toolchain_key,
@@ -1054,6 +1059,7 @@ where
                     is_locally_preprocessed: true,
                     parsed_args: self.parsed_args,
                     rewrite_includes_only,
+                    stage_sources,
                     service: service.to_owned(),
                 }),
                 weak_toolchain_key,
@@ -1469,6 +1475,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<T,
         &self,
         path_transformer: &mut dist::PathTransformer,
         rewrite_includes_only: bool,
+        stage_sources: bool,
         hash_key: &str,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
@@ -1492,6 +1499,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<T,
                 cwd,
                 env_vars,
                 rewrite_includes_only,
+                stage_sources,
                 hash_key,
             )
             .map(|(command, dist_command, cacheable)| {
@@ -1604,8 +1612,12 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> pkg::InputsPackager for CCompilati
             env_vars,
             mut parsed_args,
             rewrite_includes_only,
+            stage_sources,
             ..
         } = *self;
+
+        // Only meaningful where a preprocessed blob would otherwise be sent.
+        let stage_sources = stage_sources && parsed_args.language.needs_c_preprocessing();
 
         // Workaround for nvc++ 26.3:
         // Remove `--nvcchost` from the preprocessor call that creates
@@ -1662,23 +1674,41 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> pkg::InputsPackager for CCompilati
             // Find symlinks and simplify the input path first
             let input_path = cwd.join(&parsed_args.input);
             let input_path = simplifier.simplify(&input_path)?;
-            let dist_path = if !parsed_args.language.needs_c_preprocessing() {
-                input_path.clone()
+
+            if stage_sources {
+                // The remote action compiles the original source, which is
+                // already staged via `extra_dist_files` along with every file
+                // the preprocessor opened, so the preprocessed blob would be
+                // dead weight. It is a large blob -- for a typical LLVM
+                // translation unit it is around half of the entire payload and
+                // duplicates content the dependency files already carry -- and
+                // dropping it is the point of this mode.
+                //
+                // The preprocessor still ran, because its dependency list is
+                // what tells us which files to stage. Deriving that list from
+                // the preprocessor cache manifest instead, and skipping the
+                // preprocess entirely on a direct-mode hit, is the natural
+                // follow-up.
+                drop(preprocessor_output);
             } else {
-                pt.with_dist_extension(&input_path)
-            };
+                let dist_path = if !parsed_args.language.needs_c_preprocessing() {
+                    input_path.clone()
+                } else {
+                    pt.with_dist_extension(&input_path)
+                };
 
-            let dist_path = pt
-                .as_dist(&dist_path)
-                .with_context(|| format!("Unable to transform input path {input_path:?}"))?;
+                let dist_path = pt
+                    .as_dist(&dist_path)
+                    .with_context(|| format!("Unable to transform input path {input_path:?}"))?;
 
-            // Add the preprocessor output to the tar archive
-            let (mut header, dist_path) = pkg::make_tar_header(&input_path, &dist_path)?;
-            // The current size is from the non-preprocessed path, so set the actual size.
-            header.set_size(preprocessor_output.len() as u64);
-            header.set_cksum();
-            builder.append_data(&mut header, dist_path, &preprocessor_output[..])?;
-            drop(preprocessor_output);
+                // Add the preprocessor output to the tar archive
+                let (mut header, dist_path) = pkg::make_tar_header(&input_path, &dist_path)?;
+                // The current size is from the non-preprocessed path, so set the actual size.
+                header.set_size(preprocessor_output.len() as u64);
+                header.set_cksum();
+                builder.append_data(&mut header, dist_path, &preprocessor_output[..])?;
+                drop(preprocessor_output);
+            }
 
             // Simplify and transform the extra files first, so we record
             // intermediate directories and any traversed symlinks. Those
