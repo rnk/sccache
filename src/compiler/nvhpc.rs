@@ -96,6 +96,7 @@ impl CCompilerImpl for Nvhpc {
 
         let initialize_cmd_and_args = || {
             let mut command = creator.clone().new_command_sync(executable);
+            command.no_jobserver();
             command.args(&parsed_args.preprocessor_args);
             command.args(&parsed_args.common_args);
             command.arg("-x").arg(language).arg(&parsed_args.input);

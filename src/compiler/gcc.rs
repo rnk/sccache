@@ -910,6 +910,8 @@ where
 {
     trace!("preprocess");
     let mut cmd = creator.clone().new_command_sync(executable);
+    // A preprocessor is not a jobserver client; don't pay a fork to share one.
+    cmd.no_jobserver();
     preprocess_cmd(
         &mut cmd,
         parsed_args,

@@ -331,6 +331,8 @@ where
     T: CommandCreatorSync,
 {
     let mut cmd = creator.clone().new_command_sync(executable);
+    // A preprocessor is not a jobserver client; don't pay a fork to share one.
+    cmd.no_jobserver();
     cmd.arg("-E")
         .arg(&parsed_args.input)
         .args(&parsed_args.dependency_args)

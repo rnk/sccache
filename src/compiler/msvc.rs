@@ -195,6 +195,7 @@ where
         .context("Failed to write temporary file")?;
 
     let mut cmd = creator.new_command_sync(&exe);
+    cmd.no_jobserver();
     // clang.exe on Windows reports the same set of built-in preprocessor defines as clang-cl,
     // but it doesn't accept MSVC commandline arguments unless you pass --driver-mode=cl.
     // clang-cl.exe will accept this argument as well, so always add it in this case.
@@ -1008,6 +1009,8 @@ where
     T: CommandCreatorSync,
 {
     let mut cmd = creator.clone().new_command_sync(executable);
+    // A preprocessor is not a jobserver client; don't pay a fork to share one.
+    cmd.no_jobserver();
     preprocess_cmd(
         &mut cmd,
         parsed_args,
