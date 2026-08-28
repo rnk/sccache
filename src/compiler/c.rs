@@ -32,7 +32,7 @@ use crate::util::{
 use async_trait::async_trait;
 use fs_err as fs;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::hash::Hash;
@@ -1256,9 +1256,29 @@ struct CInputsPackager {
     extra_hash_files: Vec<PathBuf>,
 }
 
+/// The inputs a job needs, worked out once and then serialized either as a tar
+/// or as a list of individually-addressed entries.
+///
+/// Splitting the computation from the serialization is what lets the same
+/// staging logic feed both `write_inputs` and `list_inputs`, so the two
+/// representations cannot drift apart and describe different trees.
 #[cfg(feature = "dist-client")]
-impl pkg::InputsPackager for CInputsPackager {
-    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer> {
+struct StagedInputs {
+    /// Content that exists only in memory: the preprocessed source.
+    blob: Option<(PathBuf, Vec<u8>)>,
+    /// Intermediate directories, which must come before the files under them.
+    dirs: BTreeMap<PathBuf, PathBuf>,
+    /// Symlink dist path -> target, which must come before anything that
+    /// traverses them.
+    symlinks: BTreeMap<PathBuf, PathBuf>,
+    /// Real files: dist path -> where to read them locally.
+    files: BTreeMap<PathBuf, PathBuf>,
+}
+
+#[cfg(feature = "dist-client")]
+impl CInputsPackager {
+    #[allow(clippy::boxed_local)] // Box<Self> mirrors the InputsPackager methods.
+    fn stage(self: Box<Self>) -> Result<(StagedInputs, dist::PathTransformer)> {
         let CInputsPackager {
             input_path,
             mut path_transformer,
@@ -1267,51 +1287,186 @@ impl pkg::InputsPackager for CInputsPackager {
             extra_hash_files,
         } = *self;
 
-        let mut builder = tar::Builder::new(wtr);
+        let mut dirs_set = BTreeSet::new();
+        let mut symlinks = BTreeMap::new();
+        let mut files = BTreeMap::new();
+        let mut simplifier = pkg::SimplifyPath {
+            resolved_symlinks: Some(&mut symlinks),
+            dirs: Some(&mut dirs_set),
+        };
 
-        {
-            let input_path = pkg::simplify_path(&input_path)?;
-            let dist_input_path = path_transformer.as_dist(&input_path).with_context(|| {
-                format!("unable to transform input path {}", input_path.display())
-            })?;
+        let input_path = simplifier.simplify(&input_path)?;
+        let dist_input_path = path_transformer
+            .as_dist(&input_path)
+            .with_context(|| format!("unable to transform input path {}", input_path.display()))?;
+        let blob = Some((
+            pkg::tar_safe_path(PathBuf::from(dist_input_path)),
+            preprocessed_input,
+        ));
 
-            let mut file_header = pkg::make_tar_header(&input_path, &dist_input_path)?;
-            file_header.set_size(preprocessed_input.len() as u64); // The metadata is from non-preprocessed
-            file_header.set_cksum();
-            builder.append(&file_header, preprocessed_input.as_slice())?;
-        }
-
-        for input_path in extra_hash_files.iter().chain(extra_dist_files.iter()) {
-            let input_path = pkg::simplify_path(input_path)?;
+        // Simplify and transform the extra files first, so intermediate
+        // directories and any traversed symlinks are recorded. Those must be
+        // staged before the files that reach through them.
+        for src_path in extra_hash_files.iter().chain(extra_dist_files.iter()) {
+            let src_path = simplifier.simplify(src_path)?;
 
             if !super::CAN_DIST_DYLIBS
-                && input_path
+                && src_path
                     .extension()
                     .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION)
             {
                 bail!(
                     "Cannot distribute dylib input {} on this platform",
-                    input_path.display()
+                    src_path.display()
                 )
             }
 
-            let dist_input_path = path_transformer.as_dist(&input_path).with_context(|| {
-                format!("unable to transform input path {}", input_path.display())
+            let dist_path = path_transformer.as_dist(&src_path).with_context(|| {
+                format!("unable to transform input path {}", src_path.display())
             })?;
-
-            let mut file = io::BufReader::new(fs::File::open(&input_path)?);
-            let mut output = vec![];
-            io::copy(&mut file, &mut output)?;
-
-            let mut file_header = pkg::make_tar_header(&input_path, &dist_input_path)?;
-            file_header.set_size(output.len() as u64);
-            file_header.set_cksum();
-            builder.append(&file_header, &*output)?;
+            files.insert(pkg::tar_safe_path(PathBuf::from(dist_path)), src_path);
         }
 
-        // Finish archive
+        let to_dist = |path: &Path, transformer: &mut dist::PathTransformer| -> Result<PathBuf> {
+            let dist = transformer
+                .as_dist(path)
+                .with_context(|| format!("unable to transform path {}", path.display()))?;
+            Ok(pkg::tar_safe_path(PathBuf::from(dist)))
+        };
+
+        let dirs = dirs_set
+            .into_iter()
+            .map(|dir| Ok((to_dist(&dir, &mut path_transformer)?, dir)))
+            // The filesystem root is a directory too, and it maps to the empty
+            // path once the leading slash is stripped. Both a tar entry and an
+            // REv2 `Directory` name something *inside* the root, so there is
+            // nothing to emit for the root itself.
+            .filter(
+                |entry| !matches!(entry, Ok((dist_path, _)) if dist_path.as_os_str().is_empty()),
+            )
+            .collect::<Result<BTreeMap<_, _>>>()?;
+
+        let symlinks = symlinks
+            .into_iter()
+            .map(|(from, to)| {
+                // The target stays absolute: an sccache-dist worker unpacks
+                // into a chroot-like root, so an absolute target resolves.
+                // Clients that need root-relative targets (REv2 has no
+                // chroot) re-anchor them when they build the input root.
+                Ok((to_dist(&from, &mut path_transformer)?, to))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+
+        Ok((
+            StagedInputs {
+                blob,
+                dirs,
+                symlinks,
+                files,
+            },
+            path_transformer,
+        ))
+    }
+}
+
+#[cfg(feature = "dist-client")]
+impl StagedInputs {
+    fn write_tar(self, wtr: &mut dyn io::Write) -> Result<()> {
+        let StagedInputs {
+            blob,
+            dirs,
+            symlinks,
+            files,
+        } = self;
+
+        let mut builder = tar::Builder::new(wtr);
+
+        // Order matters: a tar is unpacked in sequence, so anything a later
+        // entry reaches through has to already exist.
+        dirs.into_iter()
+            .try_for_each(|(tar_path, dir_path)| builder.append_dir(tar_path, dir_path))
+            .context("Failed adding intermediate directories to archive")?;
+
+        symlinks
+            .into_iter()
+            .try_for_each(|(from_path, to_path)| {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(0);
+                header.set_mtime(0);
+                header.set_entry_type(tar::EntryType::Symlink);
+                builder.append_link(&mut header, from_path, to_path)
+            })
+            .context("Failed adding symlinks to archive")?;
+
+        for (tar_path, src_path) in files {
+            builder.append_path_with_name(src_path, tar_path)?;
+        }
+
+        if let Some((dist_path, data)) = blob {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder.append_data(&mut header, dist_path, &data[..])?;
+        }
+
         let _ = builder.into_inner();
+        Ok(())
+    }
+
+    fn into_entries(self) -> Vec<pkg::InputEntry> {
+        let StagedInputs {
+            blob,
+            dirs,
+            symlinks,
+            files,
+        } = self;
+
+        // Same order as `write_tar`, so both descriptions of the tree are
+        // built from the same sequence.
+        let mut entries = Vec::with_capacity(dirs.len() + symlinks.len() + files.len() + 1);
+        entries.extend(
+            dirs.into_keys()
+                .map(|dist_path| pkg::InputEntry::Dir { dist_path }),
+        );
+        entries.extend(
+            symlinks
+                .into_iter()
+                .map(|(dist_path, target)| pkg::InputEntry::Symlink { dist_path, target }),
+        );
+        entries.extend(
+            files
+                .into_iter()
+                .map(|(dist_path, src_path)| pkg::InputEntry::File {
+                    dist_path,
+                    src_path,
+                }),
+        );
+        if let Some((dist_path, data)) = blob {
+            entries.push(pkg::InputEntry::Blob { dist_path, data });
+        }
+        entries
+    }
+}
+
+#[cfg(feature = "dist-client")]
+impl pkg::InputsPackager for CInputsPackager {
+    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer> {
+        let (staged, path_transformer) = self.stage()?;
+        staged.write_tar(wtr)?;
         Ok(path_transformer)
+    }
+
+    /// C and C++ inputs are ordinary files on disk, so they can be named
+    /// rather than copied through an archive.
+    fn can_list_inputs(&self) -> bool {
+        true
+    }
+
+    fn list_inputs(self: Box<Self>) -> Result<(Vec<pkg::InputEntry>, dist::PathTransformer)> {
+        let (staged, path_transformer) = self.stage()?;
+        Ok((staged.into_entries(), path_transformer))
     }
 }
 

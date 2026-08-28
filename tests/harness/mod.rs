@@ -190,6 +190,8 @@ pub fn sccache_client_cfg(
             toolchains: vec![],
             toolchain_cache_size: TC_CACHE_SIZE,
             rewrite_includes_only: false, // TODO
+            #[cfg(feature = "dist-client-reapi")]
+            reapi: Default::default(),
         },
         server_startup_timeout_ms: None,
         basedirs: vec![],

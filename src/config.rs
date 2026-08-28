@@ -26,6 +26,7 @@ use serde::{
 };
 #[cfg(test)]
 use serial_test::serial;
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -760,6 +761,182 @@ impl Default for DistAuth {
     }
 }
 
+/// How the compiler reaches the remote execution worker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReapiToolchainMode {
+    /// Ship the packaged toolchain to the worker as part of the action's input
+    /// root, and invoke it through a path relative to the working directory.
+    ///
+    /// This requires a *relocatable* compiler: one that resolves its own
+    /// resources relative to `argv[0]`/`/proc/self/exe` rather than by absolute
+    /// path, and that does not exec helper binaries (`cc1plus`, `as`) by
+    /// absolute path. Clang satisfies this; GCC does not.
+    #[default]
+    Inputs,
+    /// Assume the compiler already exists in the worker's container image at
+    /// the same absolute path it has locally, and send no toolchain at all.
+    /// This is what `recc`-style setups usually do.
+    Image,
+}
+
+/// Configuration for distributing compilations over the Bazel Remote Execution
+/// v2 API instead of to an sccache-dist scheduler.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct ReapiConfig {
+    /// Endpoint of the remote execution service, e.g.
+    /// `grpc://localhost:50051` or `grpcs://remote.example.com:443`.
+    /// When unset, REv2 support is inactive and sccache uses `scheduler_url`.
+    pub url: Option<String>,
+    /// REv2 instance name. Many servers use the empty string.
+    pub instance_name: String,
+    /// How the compiler reaches the worker.
+    pub toolchain: ReapiToolchainMode,
+    /// Platform properties attached to every action, e.g. `OSFamily = "Linux"`
+    /// or `container-image = "docker://..."`.
+    pub platform: BTreeMap<String, String>,
+    /// Extra gRPC metadata sent with every request, e.g. `authorization` for
+    /// services that sit behind an authenticating proxy, or the routing
+    /// headers some deployments expect. Names are lowercased; a value here
+    /// overrides the token passed via `SCCACHE_DIST_TOKEN`.
+    pub headers: BTreeMap<String, String>,
+    /// Per-action execution timeout, in seconds.
+    pub action_timeout_secs: u64,
+    /// Ask the server to skip its action cache lookup. sccache's own object
+    /// cache is normally consulted first, so a remote action cache hit is only
+    /// possible when the two disagree; leaving the lookup enabled is free.
+    pub skip_cache_lookup: bool,
+    /// Ask the server not to cache the action result at all.
+    pub do_not_cache: bool,
+    /// Environment variables to forward to the remote action.
+    ///
+    /// Deliberately an allowlist rather than the client's whole environment:
+    /// forwarding everything would leak secrets to the worker and would give
+    /// every developer a different action digest for identical work, making
+    /// the server's action cache useless. Compiling preprocessed source needs
+    /// almost nothing from the environment.
+    pub env_passthrough: Vec<String>,
+}
+
+/// Hand-written so header *values* never reach a log.
+///
+/// `authorization` lives in this map, and `Config` is `Debug`-formatted in
+/// several diagnostic paths -- a failing test assertion printed a live
+/// credential in full before this existed. Names are kept, since knowing
+/// *which* headers are set is the useful part of the diagnostic.
+impl std::fmt::Debug for ReapiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReapiConfig")
+            .field("url", &self.url)
+            .field("instance_name", &self.instance_name)
+            .field("toolchain", &self.toolchain)
+            .field("platform", &self.platform)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .keys()
+                    .map(|name| format!("{name}=<redacted>"))
+                    .collect::<Vec<_>>(),
+            )
+            .field("action_timeout_secs", &self.action_timeout_secs)
+            .field("skip_cache_lookup", &self.skip_cache_lookup)
+            .field("do_not_cache", &self.do_not_cache)
+            .field("env_passthrough", &self.env_passthrough)
+            .finish()
+    }
+}
+
+impl ReapiConfig {
+    pub fn with_env_or_config(self) -> Self {
+        Self {
+            url: env::var("SCCACHE_DIST_REAPI_URL").ok().or(self.url),
+            instance_name: env::var("SCCACHE_DIST_REAPI_INSTANCE").unwrap_or(self.instance_name),
+            toolchain: env::var("SCCACHE_DIST_REAPI_TOOLCHAIN")
+                .ok()
+                .and_then(|val| match val.to_ascii_lowercase().as_str() {
+                    "inputs" => Some(ReapiToolchainMode::Inputs),
+                    "image" => Some(ReapiToolchainMode::Image),
+                    _ => {
+                        warn!(
+                            "Ignoring unrecognized SCCACHE_DIST_REAPI_TOOLCHAIN={val:?}, \
+                             expected \"inputs\" or \"image\""
+                        );
+                        None
+                    }
+                })
+                .unwrap_or(self.toolchain),
+            platform: env::var("SCCACHE_DIST_REAPI_PLATFORM")
+                .ok()
+                .map(|val| {
+                    // "name=value,name=value"
+                    val.split(',')
+                        .filter(|kv| !kv.trim().is_empty())
+                        .filter_map(|kv| {
+                            kv.split_once('=')
+                                .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+                        })
+                        .collect()
+                })
+                .unwrap_or(self.platform),
+            headers: env::var("SCCACHE_DIST_REAPI_HEADERS")
+                .ok()
+                .map(|val| {
+                    // "name=value,name=value". Header values rarely contain
+                    // commas; those that do need the config file instead.
+                    val.split(',')
+                        .filter(|kv| !kv.trim().is_empty())
+                        .filter_map(|kv| {
+                            kv.split_once('=')
+                                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
+                        })
+                        .collect()
+                })
+                .unwrap_or(self.headers),
+            action_timeout_secs: number_from_env_var("SCCACHE_DIST_REAPI_ACTION_TIMEOUT")
+                .map(|val| val.unwrap_or(self.action_timeout_secs))
+                .unwrap_or(self.action_timeout_secs),
+            skip_cache_lookup: bool_from_env_var("SCCACHE_DIST_REAPI_SKIP_CACHE_LOOKUP")
+                .map(|val| val.unwrap_or(self.skip_cache_lookup))
+                .unwrap_or(self.skip_cache_lookup),
+            do_not_cache: bool_from_env_var("SCCACHE_DIST_REAPI_DO_NOT_CACHE")
+                .map(|val| val.unwrap_or(self.do_not_cache))
+                .unwrap_or(self.do_not_cache),
+            env_passthrough: env::var("SCCACHE_DIST_REAPI_ENV_PASSTHROUGH")
+                .ok()
+                .map(|val| {
+                    val.split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or(self.env_passthrough),
+        }
+    }
+}
+
+impl Default for ReapiConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            instance_name: String::new(),
+            toolchain: ReapiToolchainMode::default(),
+            platform: Default::default(),
+            headers: Default::default(),
+            action_timeout_secs: 600,
+            skip_cache_lookup: false,
+            do_not_cache: false,
+            // `SOURCE_DATE_EPOCH` is the one variable that routinely changes
+            // compiler output (it seeds `__DATE__`/`__TIME__`), so leaving it
+            // behind would produce objects that differ from a local build.
+            env_passthrough: vec!["SOURCE_DATE_EPOCH".to_owned()],
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
@@ -774,6 +951,9 @@ pub struct DistConfig {
     #[serde(deserialize_with = "deserialize_size_from_str")]
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
+    /// Bazel Remote Execution v2. When `reapi.url` is set, sccache
+    /// distributes to a generic REv2 service instead of to `scheduler_url`.
+    pub reapi: ReapiConfig,
 }
 
 impl Default for DistConfig {
@@ -785,6 +965,7 @@ impl Default for DistConfig {
             toolchains: Default::default(),
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
+            reapi: Default::default(),
         }
     }
 }
@@ -2966,6 +3147,7 @@ key_prefix = "cosprefix"
                 toolchains: vec![],
                 toolchain_cache_size: 5368709120,
                 rewrite_includes_only: false,
+                reapi: Default::default(),
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],

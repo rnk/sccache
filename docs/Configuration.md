@@ -39,6 +39,30 @@ cache_dir = "/home/user/.cache/sccache-dist-client"
 type = "token"
 token = "secrettoken"
 
+# Bazel Remote Execution v2, as an alternative to sccache-dist. Requires
+# building with the `dist-client-reapi` feature. When `url` is set it takes
+# precedence over `scheduler_url`. See docs/RemoteExecutionAPI.md.
+#[dist.reapi]
+#url = "grpcs://remote.example.com:443"
+#instance_name = "default"
+## "inputs" ships the compiler in the action's input root (needs a
+## relocatable compiler); "image" assumes it is already in the worker image.
+#toolchain = "inputs"
+#action_timeout_secs = 600
+#env_passthrough = ["SOURCE_DATE_EPOCH"]
+
+# Platform properties, matched against what the workers advertise.
+#[dist.reapi.platform]
+#OSFamily = "Linux"
+#container-image = "docker://example.com/build-image@sha256:..."
+
+# Extra gRPC metadata sent with every request. These map one-to-one onto
+# Bazel's `--remote_header=` flags, which is the quickest way to find the
+# values a given deployment wants. A value here overrides the token from
+# [dist.auth].
+#[dist.reapi.headers]
+#authorization = "Basic <base64 of user:password>"
+
 # Multi-level cache configuration
 # Define cache levels in order (fast to slow).
 # Each level must be separately configured below.

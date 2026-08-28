@@ -34,6 +34,8 @@ mod cache;
 pub mod client_auth;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod http;
+#[cfg(feature = "dist-client-reapi")]
+pub mod reapi;
 #[cfg(test)]
 mod test;
 
@@ -484,7 +486,11 @@ impl From<ProcessOutput> for process::Output {
 #[serde(deny_unknown_fields)]
 pub struct OutputData(Vec<u8>, u64);
 impl OutputData {
-    #[cfg(any(feature = "dist-server", all(feature = "dist-client", test)))]
+    #[cfg(any(
+        feature = "dist-server",
+        feature = "dist-client-reapi",
+        all(feature = "dist-client", test)
+    ))]
     pub fn try_from_reader<R: Read>(r: R) -> io::Result<Self> {
         use flate2::Compression;
         use flate2::read::ZlibEncoder as ZlibReadEncoder;

@@ -160,6 +160,8 @@ pub struct DistClientConfig {
     toolchain_cache_size: u64,
     toolchains: Vec<config::DistToolchainConfig>,
     rewrite_includes_only: bool,
+    #[cfg(feature = "dist-client-reapi")]
+    reapi: config::ReapiConfig,
 }
 
 #[cfg(feature = "dist-client")]
@@ -220,6 +222,8 @@ impl DistClientContainer {
             toolchain_cache_size: config.dist.toolchain_cache_size,
             toolchains: config.dist.toolchains.clone(),
             rewrite_includes_only: config.dist.rewrite_includes_only,
+            #[cfg(feature = "dist-client-reapi")]
+            reapi: config.dist.reapi.clone(),
         };
         let state = Self::create_state(config);
         let state = pool.block_on(state);
@@ -389,6 +393,34 @@ impl DistClientContainer {
                 }
             }};
         }
+        // A configured REv2 endpoint takes precedence: the two are alternative
+        // ways to distribute the same compilation, and having both set is a
+        // configuration to resolve rather than to combine.
+        #[cfg(feature = "dist-client-reapi")]
+        if config.reapi.url.is_some() {
+            let url = config.reapi.url.clone().unwrap_or_default();
+            info!("Enabling remote execution (REAPI v2) to {url}");
+            let auth_token = match &config.auth {
+                config::DistAuth::Token { token } => Some(token.to_owned()),
+                _ => None,
+            };
+            let dist_client = dist::reapi::Client::new(
+                config.reapi.clone(),
+                &config.cache_dir.join("client"),
+                config.toolchain_cache_size,
+                &config.toolchains,
+                auth_token,
+                config.rewrite_includes_only,
+                &config.pool,
+            )
+            .await;
+            let dist_client = try_or_retry_later!(
+                dist_client.context("failure during remote execution client creation")
+            );
+            info!("Successfully created remote execution client");
+            return DistClientState::Some(Box::new(config), Arc::new(dist_client));
+        }
+
         match config.scheduler_url {
             Some(ref addr) => {
                 let url = addr.to_url();
@@ -1089,6 +1121,8 @@ where
                     toolchain_cache_size: 0,
                     toolchains: vec![],
                     rewrite_includes_only: false,
+                    #[cfg(feature = "dist-client-reapi")]
+                    reapi: Default::default(),
                 }),
                 dist_client,
             ))),

@@ -30,8 +30,56 @@ pub trait ToolchainPackager: Send {
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()>;
 }
 
+/// One thing a job needs staged, named by where it must appear in the job's
+/// filesystem.
+///
+/// This is the same information a tar entry carries, minus the bytes: a
+/// `File` says *where to find* the content rather than embedding a copy of
+/// it. That distinction is the entire point. A client that content-addresses
+/// each input separately can hash the file in place -- and, crucially, can
+/// remember that hash across jobs -- whereas an archive forces every byte to
+/// be copied through it on every single job, which defeats any memoization.
+///
+/// Paths are the same root-relative form [`tar_safe_path`] produces, so the
+/// two representations describe identical trees.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputEntry {
+    /// A file that exists on this machine and can be read on demand.
+    File {
+        dist_path: PathBuf,
+        src_path: PathBuf,
+    },
+    /// Content that exists only in memory. Preprocessed source is the only
+    /// producer, so this variant disappears with the preprocessed staging mode.
+    Blob {
+        dist_path: PathBuf,
+        data: Vec<u8>,
+    },
+    Symlink {
+        dist_path: PathBuf,
+        target: PathBuf,
+    },
+    Dir {
+        dist_path: PathBuf,
+    },
+}
+
 pub trait InputsPackager: Send {
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer>;
+
+    /// Can this packager enumerate its inputs without building an archive?
+    ///
+    /// Asked before [`Self::list_inputs`] because both it and `write_inputs`
+    /// consume the packager, so the choice has to be made up front.
+    fn can_list_inputs(&self) -> bool {
+        false
+    }
+
+    /// Enumerate the inputs directly. Only called when
+    /// [`Self::can_list_inputs`] is true.
+    fn list_inputs(self: Box<Self>) -> Result<(Vec<InputEntry>, dist::PathTransformer)> {
+        bail!("This packager cannot enumerate inputs without an archive")
+    }
 }
 
 pub trait OutputsRepackager {
@@ -63,7 +111,7 @@ mod toolchain_imp {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod toolchain_imp {
-    use super::SimplifyPath;
+    use super::{SimplifyPath, tar_safe_path};
     use fs_err as fs;
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -219,17 +267,11 @@ mod toolchain_imp {
         fn tarify_path(&mut self, path: &Path) -> Result<PathBuf> {
             SimplifyPath {
                 resolved_symlinks: Some(&mut self.symlinks),
+                dirs: None,
             }
             .simplify(path)
             .map(tar_safe_path)
         }
-    }
-
-    /// Strip a leading slash, if any.
-    fn tar_safe_path(path: PathBuf) -> PathBuf {
-        path.strip_prefix(Component::RootDir)
-            .map(ToOwned::to_owned)
-            .unwrap_or(path)
     }
 
     // The dynamic linker is the only thing that truly knows how dynamic libraries will be
@@ -411,6 +453,16 @@ mod toolchain_imp {
     }
 }
 
+/// Strip a leading slash, if any.
+///
+/// tar entry paths, and REv2 input-root paths, are both relative to the root
+/// of the tree being described; sccache's dist paths are absolute.
+pub fn tar_safe_path(path: PathBuf) -> PathBuf {
+    path.strip_prefix(Component::RootDir)
+        .map(ToOwned::to_owned)
+        .unwrap_or(path)
+}
+
 pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
     let metadata_res = fs::metadata(src);
 
@@ -462,12 +514,21 @@ pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
 pub fn simplify_path(path: &Path) -> Result<PathBuf> {
     SimplifyPath {
         resolved_symlinks: None,
+        dirs: None,
     }
     .simplify(path)
 }
 
-struct SimplifyPath<'a> {
+pub(crate) struct SimplifyPath<'a> {
     pub resolved_symlinks: Option<&'a mut std::collections::BTreeMap<PathBuf, PathBuf>>,
+    /// Every intermediate directory walked through on the way to the path.
+    ///
+    /// A tar is unpacked in order, so directories have to be created before
+    /// the files inside them; a Merkle input root has a stronger requirement
+    /// still, since a directory that nothing else creates simply will not
+    /// exist on the worker. Collecting them here is the only place that has
+    /// the information.
+    pub dirs: Option<&'a mut std::collections::BTreeSet<PathBuf>>,
 }
 
 impl SimplifyPath<'_> {
@@ -476,6 +537,12 @@ impl SimplifyPath<'_> {
         for component in path.components() {
             match component {
                 c @ Component::RootDir | c @ Component::Prefix(_) | c @ Component::Normal(_) => {
+                    if let Some(dirs) = self.dirs.as_mut()
+                        && !final_path.as_os_str().is_empty()
+                        && final_path.is_dir()
+                    {
+                        dirs.insert(final_path.clone());
+                    }
                     final_path.push(c);
                     if self.resolved_symlinks.is_some() && final_path.is_symlink() {
                         let parent = final_path.parent().expect("symlinks have parents");
