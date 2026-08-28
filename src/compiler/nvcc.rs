@@ -201,7 +201,6 @@ impl CCompilerImpl for Nvcc {
 
         let initialize_cmd_and_args = || {
             let mut command = creator.clone().new_command_sync(&resolved_executable);
-            command.no_jobserver();
             command
                 .current_dir(cwd)
                 .env_clear()
@@ -967,7 +966,6 @@ where
     let resolved_executable = resolve_compiler_avoiding_wrapper(executable, env_vars);
 
     let mut nvcc_dryrun_cmd = creator.clone().new_command_sync(&resolved_executable);
-    nvcc_dryrun_cmd.no_jobserver();
 
     nvcc_dryrun_cmd
         .args(&[arguments, &["--dryrun".into(), "--keep".into()][..]].concat())

@@ -910,8 +910,6 @@ where
 {
     trace!("preprocess");
     let mut cmd = creator.clone().new_command_sync(executable);
-    // A preprocessor is not a jobserver client; don't pay a fork to share one.
-    cmd.no_jobserver();
     preprocess_cmd(
         &mut cmd,
         parsed_args,
@@ -1001,6 +999,8 @@ where
         arguments,
         env_vars: env_vars.to_owned(),
         cwd: cwd.to_owned(),
+        // Not a jobserver client.
+        share_jobserver: false,
     };
 
     #[cfg(not(feature = "dist-client"))]

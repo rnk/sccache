@@ -111,13 +111,13 @@ pub trait RunCommand: fmt::Debug + Send {
     fn stdout(&mut self, cfg: Stdio) -> &mut Self;
     /// Set the process' stderr from `cfg`.
     fn stderr(&mut self, cfg: Stdio) -> &mut Self;
-    /// Don't hand sccache's jobserver to this child.
+    /// Hand sccache's jobserver down to this child.
     ///
-    /// Sharing the jobserver costs a `fork` instead of a `posix_spawn` (see
-    /// [`AsyncCommand::spawn`]), so it is only worth doing for a child that
-    /// actually implements the protocol. Defaults to sharing, so forgetting
-    /// this call costs performance rather than correctness.
-    fn no_jobserver(&mut self) -> &mut Self {
+    /// Only worth doing for a child that implements the protocol -- in
+    /// practice `rustc`, which reads `CARGO_MAKEFLAGS`. It is not free: see
+    /// [`AsyncCommand::spawn`] for why sharing costs a `fork` instead of a
+    /// `posix_spawn`.
+    fn share_jobserver(&mut self) -> &mut Self {
         self
     }
     /// Execute the process and return a process object.
@@ -197,7 +197,7 @@ impl AsyncCommand {
         AsyncCommand {
             inner: Some(Command::new(program)),
             jobserver,
-            share_jobserver: true,
+            share_jobserver: false,
         }
     }
 
@@ -257,8 +257,8 @@ impl RunCommand for AsyncCommand {
         self.inner().stderr(cfg);
         self
     }
-    fn no_jobserver(&mut self) -> &mut AsyncCommand {
-        self.share_jobserver = false;
+    fn share_jobserver(&mut self) -> &mut AsyncCommand {
+        self.share_jobserver = true;
         self
     }
     async fn spawn(&mut self) -> Result<Child> {
@@ -271,7 +271,11 @@ impl RunCommand for AsyncCommand {
         // makes `std` fall back from `posix_spawn` to `fork`+`exec`. Forking
         // duplicates the page tables of a server process whose whole job is to
         // hold a large cache, and the child throws that copy away microseconds
-        // later in `exec`. Only pay it for children that speak the protocol.
+        // later in `exec`.
+        //
+        // Almost nothing sccache spawns can use a jobserver: preprocessors,
+        // version probes and C/C++ compilers all ignore it. So the default is
+        // not to share, and the callers that spawn `rustc` ask for it.
         if self.share_jobserver {
             self.jobserver.configure(&mut inner);
         }
@@ -703,8 +707,8 @@ mod test {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let mut cmd = creator.new_command("/bin/sh");
         cmd.args(&["-c", "printf %s \"$CARGO_MAKEFLAGS\""]);
-        if !share {
-            cmd.no_jobserver();
+        if share {
+            cmd.share_jobserver();
         }
         let output: std::process::Output = runtime
             .block_on(async { crate::util::run_input_output(cmd, None).await })
@@ -714,19 +718,19 @@ mod test {
 
     #[test]
     #[cfg(unix)]
-    fn jobserver_is_shared_by_default() {
+    fn jobserver_is_withheld_by_default() {
         assert!(
-            child_sees_cargo_makeflags(true),
-            "a child should inherit the jobserver unless it opts out"
+            !child_sees_cargo_makeflags(false),
+            "a child should not inherit the jobserver unless it asks"
         );
     }
 
     #[test]
     #[cfg(unix)]
-    fn no_jobserver_withholds_it() {
+    fn share_jobserver_hands_it_over() {
         assert!(
-            !child_sees_cargo_makeflags(false),
-            "no_jobserver() should leave the child without CARGO_MAKEFLAGS"
+            child_sees_cargo_makeflags(true),
+            "share_jobserver() should give the child CARGO_MAKEFLAGS"
         );
     }
 }

@@ -310,8 +310,6 @@ where
     T: CommandCreatorSync,
 {
     let mut preprocess = creator.clone().new_command_sync(executable);
-    // A preprocessor is not a jobserver client; don't pay a fork to share one.
-    preprocess.no_jobserver();
     preprocess
         .arg("-E")
         .arg(&parsed_args.input)
@@ -340,7 +338,6 @@ where
 
     if let Some(ref depfile) = parsed_args.depfile {
         let mut generate_depfile = creator.clone().new_command_sync(executable);
-        generate_depfile.no_jobserver();
         generate_depfile
             .arg("-Em")
             .arg("-o")
@@ -394,6 +391,8 @@ fn generate_compile_commands(
         arguments,
         env_vars: env_vars.to_owned(),
         cwd: cwd.to_owned(),
+        // Not a jobserver client.
+        share_jobserver: false,
     };
 
     Ok((command, None, Cacheable::Yes))
