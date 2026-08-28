@@ -728,7 +728,11 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 Err(_) => {
                     let runtime = new_client_runtime()?;
                     let storage = storage_from_config(config, runtime.handle()).ok();
-                    runtime.block_on(ServerInfo::new(ServerStats::default(), storage.as_deref()))?
+                    runtime.block_on(ServerInfo::new(
+                        ServerStats::default(),
+                        storage.as_deref(),
+                        "unknown (no server running)".to_string(),
+                    ))?
                 }
             };
             match fmt {

@@ -196,6 +196,10 @@ impl DistClientContainer {
 
     pub async fn reset_state(&self) {}
 
+    pub async fn describe(&self) -> String {
+        "disabled (built without the dist-client feature)".to_string()
+    }
+
     pub async fn get_status(&self) -> DistInfo {
         DistInfo::Disabled("dist-client feature not selected".to_string())
     }
@@ -251,6 +255,33 @@ impl DistClientContainer {
                 );
             }
             DistClientState::Disabled => (),
+        }
+    }
+
+    /// A one-line summary of what this server will do with a compilation,
+    /// from local state only -- no round trip to the scheduler.
+    ///
+    /// A server that is *not* distributing looks exactly like one that is:
+    /// builds still succeed, and the distributed-compile counters simply stay
+    /// at zero because nothing was ever attempted. That is easy to reach by
+    /// accident, because a server started without the environment or config
+    /// that would have set up distribution -- which any client will do
+    /// automatically if no server is running yet -- silently becomes a
+    /// local-only server. Reporting this in `--show-stats` makes the state
+    /// visible in the command people already run.
+    pub async fn describe(&self) -> String {
+        let guard = self.state.lock().await;
+        match &*guard {
+            DistClientState::Disabled => "disabled".to_string(),
+            DistClientState::FailWithMessage(_, msg) => format!("enabled, not usable: {msg}"),
+            DistClientState::RetryCreateAt(_, time) => format!(
+                "enabled, not connected, retrying in {:.1}s",
+                time.duration_since(Instant::now()).as_secs_f32()
+            ),
+            DistClientState::Some(cfg, _) => match cfg.scheduler_url.as_ref() {
+                Some(url) => format!("sccache-dist: {}", url.to_url()),
+                None => "enabled".to_string(),
+            },
         }
     }
 
@@ -1141,7 +1172,8 @@ where
     /// Get info and stats about the cache.
     async fn get_info(&self) -> Result<ServerInfo> {
         let stats = self.stats.lock().await.clone();
-        ServerInfo::new(stats, Some(&*self.storage)).await
+        let distribution = self.dist_client.describe().await;
+        ServerInfo::new(stats, Some(&*self.storage), distribution).await
     }
 
     /// Zero stats about the cache.
@@ -1816,6 +1848,10 @@ pub struct ServerInfo {
     pub use_preprocessor_cache_mode: bool,
     pub version: String,
     pub basedirs: Vec<String>,
+    /// What the server will do with a compilation: distribute it, or not.
+    /// See [`DistClientContainer::describe`].
+    #[serde(default)]
+    pub distribution: String,
 }
 
 /// Status of the dist client.
@@ -2116,7 +2152,11 @@ fn set_percentage_stat(
 }
 
 impl ServerInfo {
-    pub async fn new(stats: ServerStats, storage: Option<&dyn Storage>) -> Result<Self> {
+    pub async fn new(
+        stats: ServerStats,
+        storage: Option<&dyn Storage>,
+        distribution: String,
+    ) -> Result<Self> {
         let cache_location;
         let use_preprocessor_cache_mode;
         let cache_size;
@@ -2156,12 +2196,19 @@ impl ServerInfo {
             use_preprocessor_cache_mode,
             version,
             basedirs,
+            distribution,
         })
     }
 
     /// Print info to stdout in a human-readable format.
     pub fn print(&self, advanced: bool) {
         let (name_width, stat_width) = self.stats.print(&mut StdoutServerStatsWriter, advanced);
+        println!(
+            "{:<name_width$} {}",
+            "Distribution",
+            self.distribution,
+            name_width = name_width
+        );
         println!(
             "{:<name_width$} {}",
             "Cache location",
